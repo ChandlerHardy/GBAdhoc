@@ -96,6 +96,11 @@ static void gpsp_apply_sound_rate(const char *value, retro_environment_t reinit_
 #define FRAMESKIP_MAX 30
 
 u32 skip_next_frame                          = 0;
+/* Frontend-forced frameskip: -1 = none (the frameskip policy decides), 0 = draw,
+ * 1 = skip.  Set before retro_run by GBAdhoc's fast-forward draw gate
+ * (docs/FF-PRESETS.md); it never changes emulation, only whether this frame is
+ * rendered/captured -- exactly what the policies above already do. */
+int frontend_skip_override                  = -1;
 static frameskip_type current_frameskip_type = no_frameskip;
 static u32 frameskip_threshold               = 0;
 static u32 frameskip_interval                = 0;
@@ -492,6 +497,17 @@ static void video_run(void)
 u32 netplay_num_clients = 0, netplay_client_id = 0;
 static retro_netpacket_send_t netpacket_send_fn_ptr = NULL;
 static retro_netpacket_poll_receive_t netpacket_pollrcv_fn_ptr = NULL;
+
+#ifdef GBA_LINK
+/* gbalink_core.c: the end of retro_run for a machine stepped by the link
+ * pair -- its audio and picture (both are no-ops for the headless partner,
+ * whose callbacks discard them and whose frames are skipped). */
+void gbalink_lr_frame_end(void)
+{
+   audio_run();
+   video_run();
+}
+#endif
 
 void netpacket_poll_receive() {
   if (netpacket_pollrcv_fn_ptr)
@@ -1522,6 +1538,9 @@ void retro_run(void)
       }
    }
 
+   if (frontend_skip_override >= 0)
+      skip_next_frame = (u32)frontend_skip_override;
+
    /* If frameskip settings have changed, update
     * frontend audio latency */
    if (update_audio_latency)
@@ -1535,7 +1554,10 @@ void retro_run(void)
    cph_t = core_phase_now(CORE_PHASE_COARSE);
    #ifdef HAVE_DYNAREC
    if (dynarec_enable)
+   {
       execute_arm_translate(execute_cycles);
+      DRPH_SET(DRPH_RETRO);
+   }
    else
    #endif
    {

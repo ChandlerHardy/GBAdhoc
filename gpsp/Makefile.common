@@ -31,6 +31,10 @@ SOURCES_C := $(CORE_DIR)/main.c \
              $(LIBRETRO_COMM_DIR)/time/rtime.c \
              $(LIBRETRO_COMM_DIR)/vfs/vfs_implementation.c
 
+ifeq ($(GBA_LINK), 1)
+  SOURCES_C += $(CORE_DIR)/gbalink_core.c
+endif
+
 ifeq ($(HAVE_DYNAREC), 1)
   SOURCES_C += $(CORE_DIR)/cpu_threaded.c
   ifeq ($(CPU_ARCH), x86_32)

@@ -22,6 +22,7 @@
 
 #include <stdio.h>
 #include <string.h>
+#include <strings.h>
 #include <malloc.h>
 
 #include "ui_psp.h"
@@ -37,6 +38,10 @@
 #include "fe_evt.h"
 #include "fe_host.h"
 #include "transport_adhoc.h"
+#include "ambient_look.h"
+#include "room_label.h"
+#include "link_games.h"
+#include "fe_linkmode.h"
 
 /* ----- theme (libretro RGB565) ------------------------------------------- */
 /* Themed palette (RGB565, R in the high bits — rgb565_to_abgr converts for
@@ -170,6 +175,61 @@ static const ui_skin *skin_of(int console)
 /* The active console's accent; the browser's fourth colour macro. */
 #define C_CON (skin_of(g_pcfg.console)->accent)
 
+/* ----- the header row: browser shells and the loading screen -----------
+ * ONE geometry, so the wordmark and the console card never move between
+ * the browser and ROM load (docs/UI-OVERLAY.md §12.3).  The card is the
+ * rightmost thing in the row, on the header's 460 margin; the browser keeps
+ * its TRIANGLE hint left of it (TRIANGLE switches console) and the loading
+ * screen keeps its busy ring in that place.
+ * The wordmark's 24 rows are centred on the card's 20: 7 + 12 = 9 + 10. */
+#define HDR_LOGO_X   20
+#define HDR_LOGO_Y   7
+#define HDR_CARD_R   460     /* the card's right edge                      */
+#define HDR_CARD_Y   9
+#define HDR_CARD_H   20
+#define HDR_TEXT_Y   11      /* a line of vid_text in the header row       */
+#define HDR_RING_DX  13      /* ring centre, left of the card's left edge  */
+
+static int hdr_card_w(const ui_skin *s)
+{
+   return 8 + vid_text_w(s->id) + 8;
+}
+
+/* The console card: a translucent plate in the console colour, its name,
+ * and the palette as a 2 px stripe along the bottom.  `scale` 256 = 1:1;
+ * the TRIANGLE flare lands it at 1.35x (g_fx_badge).  Returns the card's
+ * left edge at 1:1, which is where the TRIANGLE hint / busy ring hang. */
+static int hdr_card(const ui_skin *s, int scale)
+{
+   int bw = hdr_card_w(s), x = HDR_CARD_R - bw, k;
+   int sw = (bw * scale) >> 8, sh = (HDR_CARD_H * scale) >> 8;
+   int bx = x + bw / 2 - sw / 2, by = HDR_CARD_Y + HDR_CARD_H / 2 - sh / 2;
+   vid_rect(bx, by, sw, sh, s->accent, g_pcfg.theme == 1 ? 36 : 48);
+   for (k = 0; k < s->pal_n; k++)
+      vid_rect(bx + (k * sw) / s->pal_n, by + sh - 2,
+               ((k + 1) * sw) / s->pal_n - (k * sw) / s->pal_n, 2,
+               s->pal[k], 255);
+   vid_text(x + 8, HDR_TEXT_Y, s->id, s->accent);
+   return x;
+}
+
+/* The busy ring, eight dots chasing at 10 Hz, in the TRIANGLE hint's place
+ * left of the card. */
+static void hdr_ring(int card_x, unsigned now, uint16_t col)
+{
+   static const signed char ring[8][2] = {
+      {0,-7}, {5,-5}, {7,0}, {5,5}, {0,7}, {-5,5}, {-7,0}, {-5,-5}
+   };
+   int i, cx = card_x - HDR_RING_DX, cy = HDR_CARD_Y + HDR_CARD_H / 2;
+   for (i = 0; i < 8; i++)
+      vid_rect(cx + ring[i][0] - 1, cy + ring[i][1] - 1, 3, 3, col,
+               50 + 25 * ((i + 8 - (now / 100000) % 8) % 8));
+}
+
+/* "Quit to game list": the hold and the crossfade (ui_return_*, below). */
+static void ret_scan_tick(void);
+static int  g_ret_on;
+
 /* a -> b by t/256, per channel.  The GE has no text alpha (the font is a
  * coverage texture modulated by an opaque vertex colour), so text that has
  * to fade is drawn in a colour walked toward the background instead. */
@@ -187,7 +247,7 @@ static uint16_t mix565(uint16_t a, uint16_t b, int t)
 
 /* ----- state -------------------------------------------------------------- */
 enum { SCR_MENU, SCR_SETTINGS, SCR_WIRELESS, SCR_SCAN, SCR_MGIFT,
-       SCR_STATE_SLOTS };
+       SCR_STATE_SLOTS, SCR_CONTROLS, SCR_HOST, SCR_JOINASK };
 
 static int g_active;
 static int g_screen;
@@ -196,10 +256,14 @@ static int g_settings_dirty;
 static int g_set_scroll;      /* SETTINGS list scroll, px (see set_row_y) */
 static char g_state_base[PSP_FILE_PATH_CAP];
 static int g_state_slot = 1;
-static int g_state_save_mode;
 static int g_browser_state_open;
 static int g_ui_shell;                    /* 0 = Shelf, 1 = Marquee */
 static int g_browser_state_slot = 1;
+/* Shelf delete (docs/CONTROL-REMAP.md section 11): the slot whose delete is
+ * waiting for X (0 = none), and the panel's one-line report of the last one,
+ * kept until the next press. */
+static int  g_shelf_del;
+static char g_shelf_note[32];
 /* State-shelf slide, 0 (closed) .. PANEL_FRAMES (open), eased at draw time.
  * It was a linear 26 px/frame step that also stat()ed all five slots and
  * read a thumbnail from the stick on the same frames -- Memory Stick I/O
@@ -218,6 +282,53 @@ static int g_rep_timer;
 
 static char g_join_group[9];
 
+/* ---- the overlay's state (docs/UI-OVERLAY.md; drawn by ov_*, below) ---- */
+#define OV_OPEN_FRAMES 8       /* the menu's opening transition          */
+#define OV_SCRIM       170     /* menu, slots, wireless                  */
+#define OV_SCRIM_DENSE 200     /* settings, controls: long lists         */
+#define OV_RAMP_Y      (VID_SCR_H - 120)
+#define OV_PLATE_Y     (VID_SCR_H - FTR_H)
+
+static const uint16_t *g_ov_frame;          /* the snapshot, or NULL      */
+static int   g_ov_fw = 240, g_ov_fh = 160;   /* its size in texels         */
+static uint16_t *g_ov_full;                 /* harness: 480x272 at 512    */
+static uint16_t *g_ov_thumbs;               /* 5 x 64x64, or NULL         */
+static int   g_ov_browse;                   /* browser Settings: art bake */
+static int   g_ov_open_k = OV_OPEN_FRAMES;   /* frames into the transition */
+static int   g_ov_linked;                   /* a session is up            */
+static char  g_ov_title[100];               /* the game's name            */
+/* Per slot: 0 no state, 1 a state (no preview), 2 a state and its preview.
+ * Filled ONCE when the slots screen opens -- never per frame: a stat per
+ * slot per frame is Memory Stick I/O inside the draw loop. */
+static unsigned char g_ov_slot[PSP_STATE_SLOT_COUNT];
+/* Each state's time, "3 Oct 2026, 14:32", from the same stat (st_mtime): no
+ * extra I/O and no new bytes on the card.  "" = empty slot. */
+static char g_ov_stamp[PSP_STATE_SLOT_COUNT][24];
+static int  g_ov_used;                      /* slots holding a state      */
+/* THE SAVE STATES PAGE (docs/UI-OVERLAY.md section 13).  A question on the
+ * plate -- 0 none, SLOT_ASK_DELETE or SLOT_ASK_OVERWRITE -- for the slot
+ * g_slot_ask_n; while it is up X answers it and any other key keeps the
+ * slot.  The plate that reports what happened is cleared by the next key. */
+enum { SLOT_ASK_DELETE = 1, SLOT_ASK_OVERWRITE = 2 };
+static int  g_slot_ask;
+static int  g_slot_ask_n;
+static char g_slot_note[48];
+static int  g_slot_saving;                  /* slot a UI_ACT_SAVESTATE is for */
+static int  g_slots_dirty;                  /* rescan on the next frame   */
+/* The full preview: ONE slot's .shot, read lazily into the VRAM texture
+ * (vid_shot_tex) once the cursor has rested OV_SHOT_DWELL frames -- more
+ * than the d-pad's 5-frame repeat, so a held d-pad never reads. */
+#define OV_SHOT_DWELL 6
+static int  g_ov_shot_slot = -1;            /* slot index the texture holds */
+static int  g_ov_shot_w, g_ov_shot_h;       /* 240x160 or 160x144          */
+static int  g_ov_dwell;                     /* frames the cursor has rested */
+/* A read was tried and there is no usable .shot (a 3.1 state): the panel
+ * says so under the 2x thumbnail.  Reset by every scan. */
+static unsigned char g_ov_shot_none[PSP_STATE_SLOT_COUNT];
+static int  g_shot_probe;                   /* harness: price the read once */
+
+
+
 void ui_set_state_base(const char *slot1_path)
 {
    if (slot1_path)
@@ -235,6 +346,29 @@ int ui_state_slot(void)
 static char g_scan_groups[8][9];
 static int  g_scan_count = -1;   /* -1 = not scanned yet */
 
+/* ---- link mode (docs/GBA-LINK-UI.md) -------------------------------------
+ * The running game as the Wireless menus need it (ui_set_game), the
+ * per-game override file (ui_linkmode_load; BSS, like the favourites), and
+ * the session as main_psp.c reports it (ui_set_link). */
+static char g_game_code[5];          /* GBA header code, "" on GB/GBC     */
+static char g_game_gbtitle[17];      /* GB cartridge title                 */
+static char g_game_key[FE_LINKMODE_NAME];  /* linkmode.txt key             */
+static int  g_cable_ready;           /* this boot can host by cable        */
+static fe_linkmode g_lm;             /* linkmode.txt, ~13 KB BSS           */
+static char g_lm_dir[144];           /* where it lives (roms/)             */
+static int  g_lm_loaded;
+static int  g_host_cable;            /* the last Host's mode               */
+static ui_link_view g_link;          /* the session, per frame             */
+static char g_link_room[ROOM_LABEL_CAP];
+static char g_link_game[64];
+static char g_scan_note[96];         /* the scan list's plate, or ""       */
+static char g_ask_group[2][9];       /* Join room N found both: cable, adapter */
+/* Browser Settings: the highlighted game's key and code (read once when
+ * the page opens; "" = no game highlighted). */
+static char g_bset_key[FE_LINKMODE_NAME];
+static char g_bset_code[5];
+static int  g_bset_have;
+
 /* main_psp.c: re-applies the session chip after the OSD toggle changes. */
 extern void osd_session_chip_refresh(void);
 
@@ -243,39 +377,203 @@ typedef struct { unsigned pad; unsigned char hold, gap; } demo_step;
 #define DEMO_DUMP 0xFFFFFFFFu
 static const demo_step demo_script[] = {
    { 0,               30, 0 },   /* settle on menu     */
-   { DEMO_DUMP,        1, 0 },   /* GE dump of menu    */
-   { PSP_CTRL_DOWN,    2, 4 },   /* -> Save state      */
-   { PSP_CTRL_CROSS,   2, 5 },   /* open save slots    */
+   { DEMO_DUMP,        1, 0 },   /* ge_ui_0: the menu  */
+   { PSP_CTRL_DOWN,    2, 4 },   /* -> Save states     */
+   { PSP_CTRL_CROSS,   2, 5 },   /* open the page (slot 1) */
    { PSP_CTRL_DOWN,    2, 4 },   /* -> slot 2          */
-   { PSP_CTRL_CROSS,   2, 10 },  /* save slot 2        */
-   { PSP_CTRL_DOWN,    2, 4 },   /* -> Save state      */
-   { PSP_CTRL_DOWN,    2, 4 },   /* -> Load state      */
-   { PSP_CTRL_CROSS,   2, 5 },   /* open load slots    */
-   { PSP_CTRL_DOWN,    2, 4 },   /* -> slot 2          */
-   { PSP_CTRL_CROSS,   2, 10 },  /* load slot 2        */
-   { PSP_CTRL_DOWN,    2, 4 },   /* -> Save state      */
-   { PSP_CTRL_DOWN,    2, 4 },   /* -> Load state      */
+   { PSP_CTRL_DOWN,    2, 4 },   /* -> slot 3          */
+   { 0,               10, 0 },   /* rest: the dwell's read lands */
+   { DEMO_DUMP,        1, 0 },   /* ge_ui_1: slot 3 (fixtures: .thumb only) */
+   { PSP_CTRL_DOWN,    2, 4 },   /* -> slot 4 (empty)  */
+   { DEMO_DUMP,        1, 0 },   /* ge_ui_2: the empty slot */
+   { PSP_CTRL_SQUARE,  2, 14 },  /* save slot 4: the page stays */
+   { DEMO_DUMP,        1, 0 },   /* ge_ui_3: "Slot 4 saved", its picture */
+   { PSP_CTRL_UP,      2, 4 },   /* -> slot 3          */
+   { PSP_CTRL_TRIANGLE, 2, 4 },  /* delete?            */
+   { DEMO_DUMP,        1, 0 },   /* ge_ui_4: the delete question */
+   { PSP_CTRL_CIRCLE,  2, 4 },   /* keep it            */
+   { PSP_CTRL_DOWN,    2, 4 },   /* -> slot 4          */
+   { PSP_CTRL_SQUARE,  2, 4 },   /* overwrite?         */
+   { DEMO_DUMP,        1, 0 },   /* ge_ui_5: the overwrite question */
+   { PSP_CTRL_CIRCLE,  2, 4 },   /* keep it            */
+   { PSP_CTRL_CIRCLE,  2, 8 },   /* back to the menu (cursor -> Resume) */
+   { PSP_CTRL_DOWN,    2, 4 },   /* -> Save states     */
    { PSP_CTRL_DOWN,    2, 4 },   /* -> Wireless        */
    { PSP_CTRL_DOWN,    2, 4 },   /* -> Settings        */
    { PSP_CTRL_CROSS,   2, 8 },   /* enter settings     */
-   /* Settings now starts at Room code; move through Session overlay to
-    * Video scale and cycle through all three scale modes. */
+   /* Settings now starts at Room; move through Link mode and Session
+    * overlay to Video scale and cycle through all three scale modes. */
+   { PSP_CTRL_DOWN,    2, 4 },   /* -> Link mode       */
    { PSP_CTRL_DOWN,    2, 4 },   /* -> Session overlay */
    { PSP_CTRL_DOWN,    2, 4 },   /* -> Video scale     */
    { PSP_CTRL_RIGHT,   2, 4 },   /* cycle scale        */
-   { DEMO_DUMP,        1, 0 },   /* GE dump of settings*/
+   { DEMO_DUMP,        1, 0 },   /* ge_ui_6: settings  */
    { PSP_CTRL_RIGHT,   2, 4 },
    { PSP_CTRL_RIGHT,   2, 4 },
    { PSP_CTRL_CIRCLE,  2, 8 },   /* back to menu (cursor -> Resume) */
-   { PSP_CTRL_DOWN,    2, 4 },   /* -> Save state      */
-   { PSP_CTRL_DOWN,    2, 4 },   /* -> Load state      */
+   { PSP_CTRL_DOWN,    2, 4 },   /* -> Save states     */
    { PSP_CTRL_DOWN,    2, 4 },   /* -> Wireless        */
    { PSP_CTRL_CROSS,   2, 8 },   /* enter wireless     */
-   { DEMO_DUMP,        1, 0 },   /* GE dump wireless   */
+   { DEMO_DUMP,        1, 0 },   /* ge_ui_7: wireless  */
    { PSP_CTRL_CIRCLE,  2, 8 },   /* back (cursor -> Resume) */
-   { PSP_CTRL_CROSS,   2, 8 },   /* resume             */
+   { PSP_CTRL_DOWN,    2, 4 },   /* -> Save states     */
+   { PSP_CTRL_CROSS,   2, 5 },   /* open the page (slot 1) */
+   { PSP_CTRL_DOWN,    2, 4 },   /* -> slot 2          */
+   { PSP_CTRL_DOWN,    2, 4 },   /* -> slot 3          */
+   { PSP_CTRL_DOWN,    2, 4 },   /* -> slot 4, saved above */
+   { PSP_CTRL_CROSS,   2, 10 },  /* load it: the menu closes (demo ends) */
 };
+/* ui_controls_demo=1: Settings > Controls end to end (docs/CONTROL-REMAP.md).
+ * Cursor arithmetic assumes the harness build's table (no catch self-test
+ * row).  Every step is a real pad press through the same capture code a
+ * player's thumb drives. */
+static const demo_step ctl_demo_script[] = {
+   { 0,               30, 0 },   /* settle on menu                        */
+   { PSP_CTRL_DOWN,    2, 4 },   /* -> Save states                        */
+   { PSP_CTRL_DOWN,    2, 4 },   /* -> Wireless                           */
+   { PSP_CTRL_DOWN,    2, 4 },   /* -> Settings                           */
+   { PSP_CTRL_CROSS,   2, 8 },   /* enter settings (cursor: Room)    */
+   { PSP_CTRL_UP,      2, 6 },   /* wraps to the last row: Controls       */
+   { DEMO_DUMP,        1, 0 },   /* ge_ctl_0: Settings, Controls row      */
+   { PSP_CTRL_CROSS,   2, 10 },  /* open Controls (cursor: A)             */
+   { DEMO_DUMP,        1, 0 },   /* ge_ctl_1: the default table           */
+   { PSP_CTRL_DOWN,    2, 4 },   /* B                                     */
+   { PSP_CTRL_DOWN,    2, 4 },   /* L                                     */
+   { PSP_CTRL_DOWN,    2, 4 },   /* R                                     */
+   { PSP_CTRL_DOWN,    2, 4 },   /* Start                                 */
+   { PSP_CTRL_DOWN,    2, 4 },   /* Select                                */
+   { PSP_CTRL_DOWN,    2, 4 },   /* Up                                    */
+   { PSP_CTRL_DOWN,    2, 4 },   /* Down                                  */
+   { PSP_CTRL_DOWN,    2, 4 },   /* Left                                  */
+   { PSP_CTRL_DOWN,    2, 4 },   /* Right                                 */
+   { PSP_CTRL_DOWN,    2, 4 },   /* Fast-forward (top of SHORTCUTS)       */
+   { PSP_CTRL_DOWN,    2, 4 },   /* Video preset                          */
+   { PSP_CTRL_SQUARE,  2, 8 },   /* unbind it: Triangle no longer resizes */
+   { DEMO_DUMP,        1, 0 },   /* ge_ctl_2: Video preset = none         */
+   { PSP_CTRL_DOWN,    2, 4 },   /* Quick save                            */
+   { PSP_CTRL_DOWN,    2, 4 },   /* Quick load                            */
+   { PSP_CTRL_DOWN,    2, 4 },   /* Screenshot                            */
+   { PSP_CTRL_CROSS,   2, 12 },  /* capture...                            */
+   { DEMO_DUMP,        1, 0 },   /* ge_ctl_3: the capture prompt          */
+   { PSP_CTRL_LTRIGGER | PSP_CTRL_RTRIGGER, 8, 10 },  /* a chord: L+R    */
+   { DEMO_DUMP,        1, 0 },   /* ge_ctl_4: Screenshot = L+R            */
+   { PSP_CTRL_UP,      2, 4 },   /* Quick load                            */
+   { PSP_CTRL_UP,      2, 4 },   /* Quick save                            */
+   { PSP_CTRL_UP,      2, 4 },   /* Video preset                          */
+   { PSP_CTRL_UP,      2, 4 },   /* Fast-forward                          */
+   { PSP_CTRL_UP,      2, 4 },   /* Right                                 */
+   { PSP_CTRL_UP,      2, 4 },   /* Left                                  */
+   { PSP_CTRL_UP,      2, 4 },   /* Down                                  */
+   { PSP_CTRL_UP,      2, 4 },   /* Up                                    */
+   { PSP_CTRL_UP,      2, 4 },   /* Select                                */
+   { PSP_CTRL_UP,      2, 4 },   /* Start                                 */
+   { PSP_CTRL_UP,      2, 4 },   /* R                                     */
+   { PSP_CTRL_UP,      2, 4 },   /* L                                     */
+   { PSP_CTRL_UP,      2, 4 },   /* B                                     */
+   { PSP_CTRL_UP,      2, 4 },   /* A                                     */
+   { PSP_CTRL_CROSS,   2, 12 },  /* capture A...                          */
+   { PSP_CTRL_SQUARE,  4, 10 },  /* ...Square: steals Fast-forward        */
+   { DEMO_DUMP,        1, 0 },   /* ge_ctl_5: the steal, and its note     */
+   { PSP_CTRL_UP,      2, 6 },   /* wraps to Reset (fixed rows skipped)   */
+   { PSP_CTRL_CROSS,   2, 6 },   /* arm                                   */
+   { DEMO_DUMP,        1, 0 },   /* ge_ctl_6: confirm prompt              */
+   { PSP_CTRL_CROSS,   2, 8 },   /* reset                                 */
+   { DEMO_DUMP,        1, 0 },   /* ge_ctl_7: back to the defaults        */
+   /* The design's two states, exactly (docs/UI-OVERLAY.md): capture on
+    * Fast-forward, then the conflict when Triangle is taken from another
+    * row.  Then both rows are put back. */
+   { PSP_CTRL_DOWN,    2, 4 },   /* wraps to A                            */
+   { PSP_CTRL_RIGHT,   2, 4 },   /* across the columns: Fast-forward      */
+   { PSP_CTRL_CROSS,   2, 12 },  /* capture Fast-forward...               */
+   { DEMO_DUMP,        1, 0 },   /* ge_ctl_8: the capture chip and plate  */
+   { PSP_CTRL_TRIANGLE, 4, 10 }, /* ...Triangle: taken from Video preset  */
+   { DEMO_DUMP,        1, 0 },   /* ge_ctl_9: the conflict plate          */
+   { PSP_CTRL_TRIANGLE, 2, 6 },  /* Fast-forward back to its default      */
+   { PSP_CTRL_DOWN,    2, 4 },   /* Video preset (the plate is read)      */
+   { PSP_CTRL_TRIANGLE, 2, 6 },  /* back to Triangle                      */
+   { PSP_CTRL_LEFT,    2, 4 },   /* across, same row: B                   */
+   { DEMO_DUMP,        1, 0 },   /* ge_ctl_10: defaults, cursor on B      */
+   { PSP_CTRL_CIRCLE,  2, 8 },   /* back to Settings                      */
+   { PSP_CTRL_CIRCLE,  2, 8 },   /* back to the menu (cursor: Resume)     */
+   { PSP_CTRL_CROSS,   2, 8 },   /* resume                                */
+};
+
+/* ui_controls_demo=3: the menu-button toggle (docs/CONTROL-REMAP.md section
+ * 10).  From A, UP wraps to Reset and UP again lands on Menu: the fixed
+ * Home/Quit row between them is not a stop. */
+static const demo_step cth_demo_script[] = {
+   { 0,               30, 0 },   /* settle on menu                        */
+   { PSP_CTRL_DOWN,    2, 4 },   /* -> Save states                        */
+   { PSP_CTRL_DOWN,    2, 4 },   /* -> Wireless                           */
+   { PSP_CTRL_DOWN,    2, 4 },   /* -> Settings                           */
+   { PSP_CTRL_CROSS,   2, 8 },   /* enter settings                        */
+   { PSP_CTRL_UP,      2, 6 },   /* wraps to Controls                     */
+   { PSP_CTRL_CROSS,   2, 10 },  /* open Controls (cursor: A)             */
+   { PSP_CTRL_UP,      2, 4 },   /* wraps to Reset                        */
+   { PSP_CTRL_UP,      2, 4 },   /* Menu (Home/Quit is not a stop)        */
+   { DEMO_DUMP,        1, 0 },   /* ge_cth_0: the value on the card       */
+   { PSP_CTRL_CROSS,   2, 8 },   /* flip it                               */
+   { DEMO_DUMP,        1, 0 },   /* ge_cth_1: flipped, and its plate      */
+   { PSP_CTRL_DOWN,    2, 4 },   /* Reset (the plate is read)             */
+   { PSP_CTRL_UP,      2, 4 },   /* Menu again                            */
+   { DEMO_DUMP,        1, 0 },   /* ge_cth_2: the footer for this row     */
+   { PSP_CTRL_CIRCLE,  2, 8 },   /* back to Settings: saves               */
+   { DEMO_DUMP,        1, 0 },   /* ge_cth_3: Button mapping custom/default */
+   { PSP_CTRL_CIRCLE,  2, 8 },   /* back to the menu                      */
+   { PSP_CTRL_CROSS,   2, 8 },   /* resume                                */
+};
+
+/* ui_controls_demo=4: delete a save state in game (section 11). */
+static const demo_step del_demo_script[] = {
+   { 0,               30, 0 },   /* settle on menu                        */
+   { PSP_CTRL_DOWN,    2, 4 },   /* -> Save states                        */
+   { PSP_CTRL_CROSS,   2, 8 },   /* open the page (cursor: slot 1)        */
+   { DEMO_DUMP,        1, 0 },   /* ge_del_0: empty slot 1, no triangle   */
+   { PSP_CTRL_DOWN,    2, 4 },   /* -> slot 2                             */
+   { PSP_CTRL_SQUARE,  2, 12 },  /* save slot 2 (the page stays)          */
+   { DEMO_DUMP,        1, 0 },   /* ge_del_1: slot 2 saved, its plate     */
+   { PSP_CTRL_TRIANGLE, 2, 6 },  /* ask                                   */
+   { DEMO_DUMP,        1, 0 },   /* ge_del_2: the question on the plate   */
+   { PSP_CTRL_CIRCLE,  2, 6 },   /* keep it: O answers, it does not leave */
+   { DEMO_DUMP,        1, 0 },   /* ge_del_3: still saved, still here     */
+   { PSP_CTRL_TRIANGLE, 2, 6 },  /* ask again                             */
+   { PSP_CTRL_CROSS,   2, 10 },  /* delete                                */
+   { DEMO_DUMP,        1, 0 },   /* ge_del_4: slot 2 empty, the report    */
+   { PSP_CTRL_TRIANGLE, 2, 6 },  /* on an empty slot: nothing to ask      */
+   { DEMO_DUMP,        1, 0 },   /* ge_del_5: no question                 */
+   { PSP_CTRL_CIRCLE,  2, 8 },   /* back to the menu                      */
+   { PSP_CTRL_CROSS,   2, 8 },   /* resume                                */
+};
+
+/* ui_controls_demo=2 (with browser=1): the same page reached from the ROM
+ * browser's START settings, which run their own loop (browser_settings). */
+static const demo_step ctl_bdemo_script[] = {
+   { 0,               20, 0 },   /* settle on settings (cursor: Room) */
+   { PSP_CTRL_UP,      2, 6 },   /* wraps to Controls                      */
+   { DEMO_DUMP,        1, 0 },   /* ge_ctlb_0: browser settings            */
+   { PSP_CTRL_CROSS,   2, 10 },  /* open Controls                          */
+   { DEMO_DUMP,        1, 0 },   /* ge_ctlb_1: the page, from the browser  */
+   { PSP_CTRL_CIRCLE,  2, 8 },   /* back to settings                       */
+   { PSP_CTRL_CIRCLE,  2, 8 },   /* back to the browser                    */
+};
+
+/* ui_controls_demo=5 / harness inproc_via_menu: the player's own way out,
+ * Quit to game list from the menu (docs/INPROC-RETURN.md). */
+static const demo_step quit_demo_script[] = {
+   { 0,               20, 0 },   /* settle on menu                        */
+   { PSP_CTRL_DOWN,    2, 4 },   /* -> Save states (one row since 3.5)    */
+   { PSP_CTRL_DOWN,    2, 4 },   /* -> Wireless                           */
+   { PSP_CTRL_DOWN,    2, 4 },   /* -> Settings                           */
+   { PSP_CTRL_DOWN,    2, 4 },   /* -> Quit to game list                  */
+   { DEMO_DUMP,        1, 0 },   /* ge_quit_0: the menu, on the row       */
+   { PSP_CTRL_CROSS,   2, 4 },   /* quit                                  */
+};
+
+static const demo_step *g_demo_steps = demo_script;
+static int g_demo_len = (int)(sizeof(demo_script) / sizeof(demo_script[0]));
+static const char *g_demo_prefix = "ge_ui";
 static int g_demo_on = -1;       /* -1 idle, else script index */
+static int g_demo_dump_pending;  /* a DEMO_DUMP waits for the frame's draw */
 static int g_demo_phase;         /* frames left in hold(+)/gap(-) */
 
 /* Asset-shoot arm (README screenshots): when set, the ROM browser dumps the
@@ -296,9 +594,62 @@ void ui_set_theme_black(int b) { if (b >= 0) g_theme_black = b ? 1 : 0; }
 
 void ui_demo_start(void)
 {
+   g_demo_steps = demo_script;
+   g_demo_len = (int)(sizeof(demo_script) / sizeof(demo_script[0]));
+   g_demo_prefix = "ge_ui";
    g_demo_on = 0;
    g_demo_phase = 0;
    fe_evt("ui_demo_start");
+}
+
+static int g_ctl_bdemo;        /* 1 = armed for the browser, 2 = pick next */
+void ui_controls_browser_demo(void) { g_ctl_bdemo = 1; }
+
+static void ctl_bdemo_start(void)
+{
+   g_demo_steps = ctl_bdemo_script;
+   g_demo_len = (int)(sizeof(ctl_bdemo_script) / sizeof(ctl_bdemo_script[0]));
+   g_demo_prefix = "ge_ctlb";
+   g_demo_on = 0;
+   g_demo_phase = 0;
+   fe_evt("ui_demo_start script=controls_browser");
+}
+
+void ui_controls_demo_start(void)
+{
+   g_demo_steps = ctl_demo_script;
+   g_demo_len = (int)(sizeof(ctl_demo_script) / sizeof(ctl_demo_script[0]));
+   g_demo_prefix = "ge_ctl";
+   g_demo_on = 0;
+   g_demo_phase = 0;
+   fe_evt("ui_demo_start script=controls");
+}
+
+void ui_home_demo_start(int which)
+{
+   if (which == 5)
+   {
+      g_demo_steps = quit_demo_script;
+      g_demo_len = (int)(sizeof(quit_demo_script) /
+                         sizeof(quit_demo_script[0]));
+      g_demo_prefix = "ge_quit";
+   }
+   else if (which == 4)
+   {
+      g_demo_steps = del_demo_script;
+      g_demo_len = (int)(sizeof(del_demo_script) / sizeof(del_demo_script[0]));
+      g_demo_prefix = "ge_del";
+   }
+   else
+   {
+      g_demo_steps = cth_demo_script;
+      g_demo_len = (int)(sizeof(cth_demo_script) / sizeof(cth_demo_script[0]));
+      g_demo_prefix = "ge_cth";
+   }
+   g_demo_on = 0;
+   g_demo_phase = 0;
+   fe_evt("ui_demo_start script=%s", which == 5 ? "quit" :
+          which == 4 ? "delete" : "menu_button");
 }
 
 int ui_demo_running(void)
@@ -311,22 +662,21 @@ static unsigned demo_pad(void)
    const demo_step *s;
    if (g_demo_on < 0)
       return 0;
-   if (g_demo_on >= (int)(sizeof(demo_script) / sizeof(demo_script[0])))
+   if (g_demo_on >= g_demo_len)
    {
       g_demo_on = -1;
       fe_evt("ui_demo_done");
       return 0;
    }
-   s = &demo_script[g_demo_on];
+   s = &g_demo_steps[g_demo_on];
    if (s->pad == DEMO_DUMP)
    {
-      extern char g_dir_base[];
-      static int dump_n;
-      char gp[176];
-      snprintf(gp, sizeof(gp), "%s/log/ge_ui_%d.bmp", g_dir_base, dump_n);
-      if (vid_dump_ge(gp) == 0)
-         fe_evt("ge_dump file=ge_ui_%d.bmp ui=1", dump_n);
-      dump_n++;
+      /* Taken AFTER this frame is drawn (demo_dump_flush), so the dump is
+       * exactly the frame the script reached -- with triple buffering the
+       * buffer about to be drawn into still holds the frame from three
+       * presents ago, which matters once a screen animates (the capture
+       * chip's pulse, the menu's opening). */
+      g_demo_dump_pending = 1;
       g_demo_on++;
       g_demo_phase = 0;
       return 0;
@@ -344,6 +694,31 @@ static unsigned demo_pad(void)
    if (g_demo_phase == 0)
       g_demo_on++;
    return 0;
+}
+
+/* The deferred DEMO_DUMP: call once the frame is drawn, before the swap. */
+static void demo_dump_named(const char *name)
+{
+   extern char g_dir_base[];
+   char gp[176];
+   snprintf(gp, sizeof(gp), "%s/log/%s.bmp", g_dir_base, name);
+   if (vid_dump_ge(gp) == 0)
+      fe_evt("ge_dump file=%s.bmp ui=1", name);
+}
+
+static int ctl_cap_timer(void);         /* the Controls capture clock */
+
+static void demo_dump_flush(void)
+{
+   static int dump_n;
+   char nm[48];
+   if (!g_demo_dump_pending)
+      return;
+   g_demo_dump_pending = 0;
+   snprintf(nm, sizeof(nm), "%s_%d", g_demo_prefix, dump_n++);
+   demo_dump_named(nm);
+   if (ctl_cap_timer() >= 0)
+      fe_evt("ge_dump_capture timer=%d", ctl_cap_timer());
 }
 
 /* ----- helpers ------------------------------------------------------------ */
@@ -375,11 +750,38 @@ static int g_profile_at_open;
  * Returns 0 to resume, 1 to leave for the game list. */
 
 static void footer(const char *hint);   /* defined with the other chrome */
+static void ctl_page_reset(void);       /* Settings > Controls state */
+static void ov_slots_scan(void);        /* the overlay, below */
+static void ov_slots_stat(void);
+/* main_psp.c: the power switch waits while the page reads the stick
+ * outside the loop's park point (see power_cb there). */
+void pwr_hold(const char *why);
+void pwr_release(void);
+static void ov_shot_probe(void);
+static void ov_title_take(void);
 extern volatile int g_running;          /* main_psp exit flag (HOME) */
+
+/* Harness `wake_shot = N`: the wake overlay GE-dumps its third frame to
+ * log/ge_wake.bmp and continues by itself (docs/UI-OVERLAY.md: the overlay
+ * shares the menu's compositing path, so both are checked together). */
+static int g_wake_shot;
+void ui_wake_shot_arm(void) { g_wake_shot = 1; }
+
+/* Harness `sleep_sim_choice` (main_psp.c sleep simulator): the overlay's
+ * answer, 0 Continue / 1 Quit to game list, pressed on its 30th frame as the
+ * player would (selection, then X); -1 = the real pad only. */
+#ifdef GPSP_PERF_RIG
+static int g_wake_inject = -1;
+void ui_wake_inject(int choice) { g_wake_inject = choice; }
+#else
+void ui_wake_inject(int choice) { (void)choice; }
+#endif
 
 int ui_wake_menu(const uint16_t *frame, int frame_w, int frame_h,
                  const char *game)
 {
+   int shot_frames = 0, inj_frames = 0;
+   (void)inj_frames;
    static const char *lbl[2] = { "Continue", "Quit to game list" };
    const int LX = 20;                 /* wordmark + title margin */
    int sel = 0, first = 1;
@@ -424,6 +826,13 @@ int ui_wake_menu(const uint16_t *frame, int frame_w, int frame_h,
        * switch, they have not chosen anything yet. */
       if (first)
          { edges = 0; first = 0; }
+#ifdef GPSP_PERF_RIG
+      if (g_wake_inject >= 0 && ++inj_frames == 30)
+      {
+         sel = g_wake_inject ? 1 : 0;
+         edges = PSP_CTRL_CROSS;
+      }
+#endif
 
       if (edges & (PSP_CTRL_UP | PSP_CTRL_DOWN))
          sel ^= 1;
@@ -448,8 +857,9 @@ int ui_wake_menu(const uint16_t *frame, int frame_w, int frame_h,
        *    -- a stack of rects bands badly at 565 (see vid_gradient_a). */
       vid_gradient_a(0, VID_SCR_H - 120, VID_SCR_W, 120, C_BG_BOT, 0, 165);
 
-      /* 3. Identity, hard into the top-left corner. */
-      vid_logo(LX, 18, C_TITLE, 255);
+      /* 3. Identity, hard into the top-left corner.  y 17: the 151x24
+       *    wordmark keeps the 130x22 one's centre row (29). */
+      vid_logo(LX, 17, C_TITLE, 255);
       if (title[0])
          vid_text(LX + 2, 48, title, C_DIM);
 
@@ -464,8 +874,10 @@ int ui_wake_menu(const uint16_t *frame, int frame_w, int frame_h,
          int w  = vid_text_w(lbl[i]) + 40;
          if (i == sel)
          {
-            vid_rect(0, ry - 6, w, FE_FONT_H + 12, C_ACCENT, 40);
-            vid_rect(0, ry - 6, 4, FE_FONT_H + 12, C_ACCENT, 255);
+            /* Cap height centred (vid_band_y), like every overlay band. */
+            int by = vid_band_y(ry, FE_FONT_H + 12);
+            vid_rect(0, by, w, FE_FONT_H + 12, C_ACCENT, 40);
+            vid_rect(0, by, 4, FE_FONT_H + 12, C_ACCENT, 255);
          }
          vid_text(18, ry, lbl[i], i == sel ? C_SEL : C_ITEM);
       }
@@ -475,6 +887,12 @@ int ui_wake_menu(const uint16_t *frame, int frame_w, int frame_h,
       footer("X select     O resume     DPAD change");
 
       vid_overlay_end();
+      if (g_wake_shot && ++shot_frames == 3)
+      {
+         g_wake_shot = 0;
+         demo_dump_named("ge_wake");
+         return 0;
+      }
       sceDisplayWaitVblankStart();
       vid_swap();
    }
@@ -483,21 +901,36 @@ int ui_wake_menu(const uint16_t *frame, int frame_w, int frame_h,
 
 void ui_open(void)
 {
+   ctl_page_reset();
    g_active = 1;
    g_screen = SCR_MENU;
    g_cursor = 0;
+   g_ov_open_k = 0;              /* the opening transition (screen_menu) */
+   ov_title_take();
    g_prev_pad = 0xFFFFFFFFu;   /* swallow the opening chord */
-   fe_evt("ui_open");
+   {
+      /* "n of 5 used" beside Save states: five stats, once, with the core
+       * paused -- before the opening transition, never inside it. */
+      unsigned t0 = sceKernelGetSystemTimeLow();
+      ov_slots_stat();
+      FE_EVT_ONLY(t0);
+      fe_evt("ui_open slots_used=%d stat_us=%u", g_ov_used,
+             (unsigned)(sceKernelGetSystemTimeLow() - t0));
+   }
 }
 
 void ui_close(void)
 {
+   /* Back to the game, maybe after a state load: an ambient snapshot (no
+    * art, "art, else game") is retaken from what is on screen now. */
+   vid_ambient_resnap();
    if (g_settings_dirty)
    {
       pcfg_save();
       g_settings_dirty = 0;
    }
    g_active = 0;
+   ctl_page_reset();
    if (g_demo_on >= 0)
    {
       /* The demo's final Resume closes the UI mid-script by design. */
@@ -512,10 +945,21 @@ int ui_active(void)
    return g_active;
 }
 
+int ui_home_press(void)
+{
+   if (!g_active || g_screen != SCR_MENU || ui_capturing() ||
+       ui_demo_running())
+      return 0;
+   fe_evt("ui_home_close");
+   ui_close();
+   return 1;
+}
+
 static void screen_to(int scr)
 {
    static const char *names[] __attribute__((unused)) =
-      { "menu", "settings", "wireless", "scan", "mystery_gift", "state_slots" };
+      { "menu", "settings", "wireless", "scan", "mystery_gift", "state_slots",
+        "controls", "host", "join_ask" };
    if (g_screen != scr && g_settings_dirty)
    {
       pcfg_save();
@@ -523,10 +967,18 @@ static void screen_to(int scr)
    }
    g_screen = scr;
    g_cursor = 0;
+   ctl_page_reset();             /* no capture survives a screen change */
+   g_slot_ask = 0;               /* nor a delete/overwrite question */
+   g_slot_note[0] = '\0';
    if (scr == SCR_SETTINGS)
    {
       g_profile_at_open = g_pcfg.me_mode;
       g_set_scroll = 0;
+   }
+   if (scr == SCR_STATE_SLOTS)
+   {
+      ov_slots_scan();
+      ov_shot_probe();
    }
    fe_evt("ui_screen name=%s", names[scr]);
 }
@@ -558,6 +1010,8 @@ static unsigned pad_edges(unsigned pad)
 
 /* Full-page background + header bar.  `right` (optional) is right-aligned
  * in the header — room code, game count, session state. */
+static void page_header(const char *title, const char *right);
+
 static void page(const char *title, const char *right)
 {
    g_thm = (g_pcfg.theme == 1) ? &THM_LIGHT : &THM_DARK;
@@ -567,6 +1021,13 @@ static void page(const char *title, const char *right)
       vid_rect(0, 0, VID_SCR_W, VID_SCR_H, 0x0000, 255);
    else
       vid_rect(0, 0, VID_SCR_W, VID_SCR_H, C_BG_TOP, 255);
+   page_header(title, right);
+}
+
+/* The header bar alone, for a page whose background is a picture. */
+static void page_header(const char *title, const char *right)
+{
+   g_thm = (g_pcfg.theme == 1) ? &THM_LIGHT : &THM_DARK;
    vid_rect(0, 0, VID_SCR_W, HDR_H, C_HDR_TOP, 255);
    vid_rect(0, HDR_H, VID_SCR_W, 1, C_ACCENT, 255);
    vid_text_hd(14, (HDR_H - FE_FONT_H) / 2 - 2, title, C_TITLE);
@@ -582,22 +1043,402 @@ static void footer(const char *hint)
    vid_text_center(VID_SCR_H - FTR_H + 2, hint, C_DIM);
 }
 
-/* One list row.  Selection is an accent edge bar + a soft fill, which reads
- * as "modern" at 480x272 far better than v1's full-row alpha slab. */
-static void row(int x, int y, int w, int selected, int enabled,
-                const char *label, const char *value)
+/* ===== THE OVERLAY: Fable's Direction A (docs/UI-OVERLAY.md) ==============
+ *
+ * The wake-from-sleep screen's language, extended to every in-game screen:
+ * the game frame stays up at full fidelity behind a scrim, the wordmark sits
+ * hard in the top-left, the selection bleeds off the left edge, and a ramp
+ * out of the bottom edge gives the footer something solid.  No panel is ever
+ * drawn; the picture is the backdrop.
+ *
+ * The numbers are the design's (builds/menu-mockups/mockups.py, class
+ * Overlay), drawn through the same primitives the design model renders with,
+ * so a GE dump can be compared with the model pixel for pixel
+ * (tools/ui_model/).
+ *
+ * MEMORY.  Nothing here allocates.  The frame is the wake snapshot
+ * (main_psp.c, the netdrv arena's tail) taken at menu_open(); the slot
+ * thumbnails are five 64x64 textures from the same tail.  Either may be
+ * NULL -- then the screen falls back to a flat page / empty plates. */
+static void clip_title(char *t, int px);    /* with the browser, below    */
+
+void ui_set_backdrop(const uint16_t *frame, int w, int h)
 {
-   if (selected)
-   {
-      vid_rect(x, y - 1, w, FE_FONT_H + 2, C_ACCENT, 36);
-      vid_rect(x, y - 1, 3, FE_FONT_H + 2, C_ACCENT, 255);
-   }
-   vid_text(x + 12, y, label, enabled ? (selected ? C_SEL : C_ITEM)
-                                      : C_DIM);
-   if (value)
-      vid_text(x + w - 10 - vid_text_w(value), y, value,
-               enabled ? (selected ? C_VALUE : C_ACCENT_DK) : C_DIM);
+   g_ov_frame = frame;
+   g_ov_fw = w > 0 ? w : 240;
+   g_ov_fh = h > 0 ? h : 160;
 }
+
+void ui_set_thumb_buffer(uint16_t *buf)
+{
+   g_ov_thumbs = buf;
+}
+
+/* Harness only (reached through the ini a release build cannot read): a raw
+ * 480x272 PSP-5650 picture, drawn 1:1 behind the menu in place of the game,
+ * so the design model can be given the very same backdrop. */
+void ui_backdrop_inject(const char *rel)
+{
+   extern char g_dir_base[];
+   char path[176];
+   SceUID fd;
+   int y, ok = 1;
+   snprintf(path, sizeof(path), "%s/%s", g_dir_base, rel);
+   fd = sceIoOpen(path, PSP_O_RDONLY, 0);
+   if (fd < 0)
+   {
+      fe_evt("ui_backdrop file=%s MISSING", rel);
+      return;
+   }
+   g_ov_full = (uint16_t *)memalign(64, 512 * 512 * 2);
+   if (!g_ov_full)
+   {
+      sceIoClose(fd);
+      fe_evt("ui_backdrop file=%s NO_MEMORY", rel);
+      return;
+   }
+   memset(g_ov_full, 0, 512 * 512 * 2);
+   for (y = 0; y < VID_SCR_H && ok; y++)
+      ok = sceIoRead(fd, g_ov_full + y * 512, VID_SCR_W * 2) ==
+           VID_SCR_W * 2;
+   sceIoClose(fd);
+   sceKernelDcacheWritebackRange(g_ov_full, 512 * 512 * 2);
+   fe_evt("ui_backdrop file=%s ok=%d", rel, ok);
+}
+
+static void ov_theme(void)
+{
+   g_thm = (g_pcfg.theme == 1) ? &THM_LIGHT : &THM_DARK;
+}
+
+/* The game's name from the ROM it was booted from (the state base is the
+ * ROM path with its extension replaced), directories and extensions off.
+ * The region tag stays: two dumps of one game differ by exactly that. */
+static void ov_title_take(void)
+{
+   const char *src = g_state_base[0] ? g_state_base : g_pcfg.last_rom;
+   const char *b = strrchr(src, '/');
+   char *dot;
+   int pass;
+   size_t n;
+   src = b ? b + 1 : src;
+   n = strlen(src);
+   if (n >= sizeof(g_ov_title))        /* clip_title trims it to fit anyway */
+      n = sizeof(g_ov_title) - 1;
+   memcpy(g_ov_title, src, n);
+   g_ov_title[n] = 0;
+   /* "Game.st0", "Game.gb.st0", "Game.gba": up to two extensions. */
+   for (pass = 0; pass < 2; pass++)
+   {
+      dot = strrchr(g_ov_title, '.');
+      if (!dot || dot == g_ov_title)
+         break;
+      if (pass == 1 && strcasecmp(dot, ".gb") && strcasecmp(dot, ".gbc") &&
+          strcasecmp(dot, ".gba"))
+         break;
+      *dot = '\0';
+   }
+   clip_title(g_ov_title, 436);
+}
+
+/* The picture, held back by a scrim, then the ramp out of the bottom edge
+ * (the wake overlay's own three layers). */
+static void ov_backdrop(int scrim)
+{
+   ov_theme();
+   if (g_ov_browse)
+   {
+      /* Settings from the ROM browser: no game frame exists, so the
+       * selected game's ambient bake stands in for it -- the loading
+       * screen's "L2" background (browser_settings baked it once).  No
+       * art: the console's palette ramp, which is a page already and so
+       * takes no scrim (the loading screen draws text straight onto it). */
+      vid_rect(0, 0, VID_SCR_W, VID_SCR_H,
+               g_theme_black ? 0x0000 : C_BG_TOP, 255);
+      if (!vid_ambient_image(0, 0, VID_SCR_W, VID_SCR_H, 255))
+      {
+         vid_gradient_a(0, 0, VID_SCR_W, VID_SCR_H,
+                        skin_of(g_pcfg.console)->pal[0],
+                        g_pcfg.theme == 1 ? LOAD_PAL_RAMP_LIGHT
+                                          : LOAD_PAL_RAMP_DARK, 0);
+         scrim = 0;
+      }
+   }
+   else if (g_ov_full)
+      vid_image_px(0, 0, VID_SCR_W, VID_SCR_H, g_ov_full, 512, 512);
+   else if (g_ov_frame)
+   {
+      vid_image_screen(g_ov_frame, 256, 256, g_ov_fw, g_ov_fh, 255);
+   }
+   else
+   {
+      /* Nothing to show (no snapshot memory): the flat page. */
+      vid_rect(0, 0, VID_SCR_W, VID_SCR_H,
+               g_theme_black ? 0x0000 : C_BG_BOT, 255);
+      scrim = 0;
+   }
+   if (scrim > 0)
+      vid_rect(0, 0, VID_SCR_W, VID_SCR_H, C_BG_BOT, scrim);
+   vid_gradient_a(0, OV_RAMP_Y, VID_SCR_W, VID_SCR_H - OV_RAMP_Y, C_BG_BOT,
+                  0, 165);
+}
+
+/* The menu header's right-hand cluster: console badge, the room ("Room 7",
+ * room_label.h) -- or LINKED during a session.  The ONLY place the menus
+ * name the room in their header (3.1 also printed the raw group id on a
+ * line under it in Settings and Wireless: the same text twice). */
+static int ov_cluster_text(const char *room);
+static void ov_cluster(void)
+{
+   char lbl[ROOM_LABEL_CAP];
+   /* A cable host waiting for the other PSP reads HOSTING (docs/
+    * GBA-LINK-UI.md); any other session, LINKED. */
+   ov_cluster_text(g_link.state == UI_LINK_HOSTING ? "HOSTING" :
+                   g_ov_linked ? "LINKED"
+                               : room_label(g_pcfg.group, lbl, sizeof(lbl)));
+}
+
+/* The cluster with its text given; returns the badge's left edge (where the
+ * LINKING screen's busy ring hangs). */
+static int ov_cluster_text(const char *room)
+{
+   const ui_skin *s = skin_of(g_pcfg.console);
+   const int y = 19;
+   int x = 460, bw, k;
+   x -= vid_text_w(room);
+   vid_text(x, y + 2, room, C_DIM);
+   x -= 12;
+   bw = 8 + vid_text_w(s->id) + 8;
+   x -= bw;
+   vid_rect(x, y, bw, 20, C_CON, g_pcfg.theme == 1 ? 36 : 48);
+   for (k = 0; k < s->pal_n; k++)
+      vid_rect(x + (k * bw) / s->pal_n, y + 18,
+               ((k + 1) * bw) / s->pal_n - (k * bw) / s->pal_n, 2,
+               s->pal[k], 255);
+   vid_text(x + 8, y + 2, s->id, C_CON);
+   return x;
+}
+
+/* Wordmark hard top-left; an hd screen title after it; the game's name
+ * under it; the cluster top-right. */
+static void ov_head(const char *sub, const char *title)
+{
+   /* y 17: the 151x24 wordmark centred where the 130x22 one was (row 29,
+    * the cluster's centre); the title follows its width. */
+   vid_logo(20, 17, C_TITLE, 255);
+   if (title)
+      vid_text_hd(20 + VID_LOGO_W + 14, 16, title, C_SEL);
+   if (sub && sub[0])
+      vid_text(22, 48, sub, C_DIM);
+   ov_cluster();
+}
+
+static void ov_text_right(int xr, int y, const char *s, uint16_t c);
+
+/* The busy ring left of the console badge (the loading screen's, on the
+ * Overlay's header row: centre row 29). */
+static void ov_ring(int badge_x)
+{
+   static const signed char ring[8][2] = {
+      {0,-7}, {5,-5}, {7,0}, {5,5}, {0,7}, {-5,5}, {-7,0}, {-5,-5}
+   };
+   unsigned phase = ((unsigned)sceKernelGetSystemTimeLow() / 100000u) % 8u;
+   int i, cx = badge_x - HDR_RING_DX, cy = 29;
+   for (i = 0; i < 8; i++)
+      vid_rect(cx + ring[i][0] - 1, cy + ring[i][1] - 1, 3, 3, C_TITLE,
+               50 + 25 * (int)(((unsigned)i + 8u - phase) % 8u));
+}
+
+/* THE LINKING SCREEN (ui_psp.h; docs/GBA-LINK-UI.md): one screen for every
+ * mode and both consoles, title LINKING, the busy ring left of the console
+ * badge as on the loading screen.  Line 1 says what is happening, line 2
+ * the step (its amount on the right), the 3 px bar in the console colour
+ * is the loading screen's bar.  A failure replaces the two lines and the
+ * footer becomes O back. */
+void ui_linking_draw(const ui_linking_view *v)
+{
+   char sub[100], lbl[ROOM_LABEL_CAP];
+   int bx;
+   if (!v)
+      return;
+   vid_overlay_begin(1);
+   g_ov_browse = 0;
+   ov_backdrop(OV_SCRIM);
+   vid_logo(20, 17, C_TITLE, 255);
+   vid_text_hd(20 + VID_LOGO_W + 14, 16, "LINKING", C_SEL);
+   snprintf(sub, sizeof(sub), "%s", v->game ? v->game : g_ov_title);
+   clip_title(sub, 436);
+   if (sub[0])
+      vid_text(22, 48, sub, C_DIM);
+   bx = ov_cluster_text(v->room && v->room[0]
+                           ? v->room
+                           : room_label(g_pcfg.group, lbl, sizeof(lbl)));
+   if (v->busy && !v->fail)
+      ov_ring(bx);
+   if (v->fail)
+   {
+      if (v->l1)
+         vid_text(22, 72, v->l1, C_VALUE);
+      if (v->l2)
+         vid_text(22, 72 + FE_FONT_H + 2, v->l2, C_DIM);
+      footer(v->footer ? v->footer : VID_GLYPH_O " back");
+   }
+   else
+   {
+      if (v->l1)
+         vid_text(22, 72, v->l1, C_ITEM);
+      if (v->l2)
+         vid_text(22, 72 + FE_FONT_H + 2, v->l2, C_DIM);
+      if (v->amount)
+         ov_text_right(460, 72 + FE_FONT_H + 2, v->amount, C_DIM);
+      if (v->frac >= 0)
+      {
+         int f = v->frac > 1000 ? 1000 : v->frac;
+         vid_rect(20, 116, 440, 3, C_ACCENT_DK, 160);
+         if (f > 0)
+            vid_rect(20, 116, 440 * f / 1000, 3, C_CON, 255);
+      }
+      if (v->l3)
+         vid_text(22, 130, v->l3, C_DIM);
+      footer(v->footer ? v->footer : VID_GLYPH_O " cancel");
+   }
+   vid_overlay_end();
+}
+
+/* The selection: a soft fill and a 4 px edge, flush to the screen's left
+ * edge so it bleeds off it rather than floating (the wake overlay's).
+ * `y` is the ROW'S TEXT y: the band is placed so the text's cap height sits
+ * in its optical centre (vid_band_y; docs/UI-OVERLAY.md §10).  The design's
+ * `y - 4` centred the 16 px line box instead, which left the letters 1.5 px
+ * low in a 24 px band and, in Settings' 20 px one, resting on its floor. */
+static void ov_band(int y, int w, int h)
+{
+   int by = vid_band_y(y, h);
+   vid_rect(0, by, w, h, C_ACCENT, 40);
+   vid_rect(0, by, 4, h, C_ACCENT, 255);
+}
+
+static void ov_text_right(int xr, int y, const char *s, uint16_t c)
+{
+   vid_text(xr - vid_text_w(s), y, s, c);
+}
+
+/* The footer's stand-in when the page has something to SAY (capture,
+ * conflict, a refusal): one plate across the bottom edge. */
+static void ov_plate(const char *msg)
+{
+   vid_rect(0, OV_PLATE_Y, VID_SCR_W, FTR_H, C_ACCENT, 40);
+   vid_text_center(OV_PLATE_Y + 2, msg, C_SEL);
+}
+
+/* ---- chips: the Controls page's one new idiom ---------------------------
+ * A plate CHIP_H tall, text inset 6 px, in four states:
+ *   bound   C_ACCENT at alpha 40 (28 light), C_SEL text
+ *   locked  C_CARD, C_DIM text (a fixed chord is ONE chip: START+SELECT)
+ *   blank   1 px C_DIM outline at alpha 160 around the word "none"
+ *   capture 1 px C_CON outline around "press...", alpha-pulsed */
+enum { CHIP_BOUND, CHIP_LOCKED, CHIP_BLANK, CHIP_CAPTURE };
+#define CHIP_H 16
+
+static int chip_w(const char *label)
+{
+   return 12 + vid_text_w(label);
+}
+
+static void ov_outline(int x, int y, int w, int h, uint16_t c, int a)
+{
+   vid_rect(x, y, w, 1, c, a);
+   vid_rect(x, y + h - 1, w, 1, c, a);
+   vid_rect(x, y, 1, h, c, a);
+   vid_rect(x + w - 1, y, 1, h, c, a);
+}
+
+/* `y` is the row's TEXT y, as for every other row element; the plate is
+ * placed around it with the cap height centred (vid_band_y). */
+static int chip(int x, int y, const char *label, int kind, int alpha)
+{
+   int w = chip_w(label);
+   int ty = y;
+   y = vid_band_y(ty, CHIP_H);
+   switch (kind)
+   {
+   case CHIP_BOUND:
+      vid_rect(x, y, w, CHIP_H, C_ACCENT, g_pcfg.theme == 1 ? 28 : 40);
+      vid_text(x + 6, ty, label, C_SEL);
+      break;
+   case CHIP_LOCKED:
+      vid_rect(x, y, w, CHIP_H, C_CARD, 255);
+      vid_text(x + 6, ty, label, C_DIM);
+      break;
+   case CHIP_BLANK:
+      ov_outline(x, y, w, CHIP_H, C_DIM, 160);
+      vid_text(x + 6, ty, label, C_DIM);
+      break;
+   default:
+      ov_outline(x, y, w, CHIP_H, C_CON, alpha);
+      vid_text(x + 6, ty, label, C_CON);
+      break;
+   }
+   return w;
+}
+
+/* Chips joined by '+' in C_DIM; an empty chord is the "none" outline. */
+static int combo_w(const char *const *parts, int n)
+{
+   int i, w = 0;
+   if (!n)
+      return chip_w("none");
+   for (i = 0; i < n; i++)
+      w += chip_w(parts[i]);
+   return w + (n - 1) * (vid_text_w("+") + 8);
+}
+
+static int combo_right(int xr, int y, const char *const *parts, int n,
+                       int kind, int alpha)
+{
+   int w = combo_w(parts, n), x = xr - w, i;
+   if (!n)
+   {
+      chip(x, y, "none", CHIP_BLANK, 160);
+      return w;
+   }
+   for (i = 0; i < n; i++)
+   {
+      if (i)
+      {
+         vid_text(x + 4, y, "+", C_DIM);
+         x += vid_text_w("+") + 8;
+      }
+      x += chip(x, y, parts[i], kind, alpha);
+   }
+   return w;
+}
+
+/* A 2 px scrollbar: C_CARD track, C_ACCENT_DK thumb (the design's
+ * scrollbar(): top h*pos/total, length max(8, h*view/total)). */
+static void ov_scrollbar(int x, int y, int h, int pos, int view, int total)
+{
+   int ty, th;
+   if (total <= view || total <= 0)
+      return;
+   ty = h * pos / total;
+   th = h * view / total;
+   if (th < 8)
+      th = 8;
+   vid_rect(x, y, 2, h, C_CARD, 255);
+   vid_rect(x, y + ty, 2, th, C_ACCENT_DK, 255);
+}
+
+/* Button words for the menu, in ctl_button_order() order: the face buttons
+ * as the baked glyphs (tools/bake_font.py EXTRAS), the rest spelled the way
+ * the rest of the UI spells them.  CONFIG.INI uses ctl_map.c's own words. */
+static const char *const CTL_UI_NAMES[CTL_NBUTTONS] = {
+   "SELECT", "START", "L", "R", "UP", "DOWN", "LEFT", "RIGHT",
+   VID_GLYPH_TRI, VID_GLYPH_O, VID_GLYPH_X, VID_GLYPH_SQ
+};
+
+static ui_action screen_controls(unsigned edges, unsigned pad);
+static ui_action screen_state_slots(unsigned edges);
 
 /* ----- settings screen ---------------------------------------------------- */
 
@@ -615,35 +1456,81 @@ static void row(int x, int y, int w, int selected, int enabled,
  * against, and it is the only renderer that exists under PPSSPP, which has no
  * Media Engine.  `me_mode` also survives as a config.ini key so a bug report
  * can still be bisected without a special build.  Only the menu row is gone. */
-enum { SET_HDR_WL, SET_ROOM, SET_OSD,
-       SET_HDR_VID, SET_SCALE, SET_FILTER, SET_THEME, SET_SHELL,
-       SET_HDR_GAME, SET_FFMULT, SET_FFMODE, SET_ABMAP, SET_FPS, SET_GBPAL,
+/* DISPLAY is PER CONSOLE (docs/DISPLAY-FEATURES.md): its rows edit the
+ * profile of the console in context -- the running game's, or in the
+ * browser the console TRIANGLE last switched to -- and its header says
+ * which.  Everything else on this screen is global. */
+enum { SET_HDR_WL, SET_ROOM, SET_LINKMODE, SET_OSD,
+       SET_HDR_VID, SET_SCALE, SET_FILTER, SET_AMBIENT, SET_GBPAL,
+       SET_HDR_UI, SET_THEME, SET_SHELL,
+       SET_HDR_GAME, SET_FFMULT, SET_FFMODE, SET_FPS,
+       SET_HDR_CTL, SET_CONTROLS,
        SET_COUNT };
 
 static const struct { unsigned char header; const char *label; } set_rows[SET_COUNT] = {
    { 1, "WIRELESS" },
-   { 0, "Room code" },
+   { 0, "Room" },
+   /* Link Cable / Wireless Adapter, PER GAME (docs/GBA-LINK-UI.md): the
+    * design puts it here, between Room and Session overlay. */
+   { 0, "Link mode" },
    { 0, "Session overlay" },
-   { 1, "VIDEO" },
+   { 1, "DISPLAY" },              /* + " (GBA)" etc., drawn per console */
    { 0, "Video scale" },
    { 0, "Video filter" },
+   { 0, "Ambient bars" },
+   { 0, "GB palette" },
+   { 1, "INTERFACE" },
    { 0, "Theme" },
    { 0, "Menu style" },
    { 1, "GAMEPLAY" },
    { 0, "Fast-forward" },
    { 0, "FF button (Square)" },
-   { 0, "A/B buttons" },
+   /* "A/B buttons" (3.0's btn_swap) was here.  Button mapping does the same
+    * and more, and an old swapped config is converted into bind_a/bind_b at
+    * load (ctl_load_ini), so the row went.  Rows are walked by count: the
+    * harness walkers only ever cross rows ABOVE this point, or wrap UP to
+    * Button mapping, so none of their arithmetic moved. */
    { 0, "FPS counter" },
-   { 0, "GB palette" },
+   /* Last, so every row above keeps its position (the harness ui_demo walks
+    * this list by count).  X opens the page; it is not a value to cycle. */
+   { 1, "CONTROLS" },
+   { 0, "Button mapping" },
 };
+
+/* A GBA profile has no DMG palette: the row stays visible, greyed, and the
+ * cursor steps over it. */
+static int linkmode_row_enabled(void);
+static int set_row_enabled(int idx)
+{
+   if (idx == SET_GBPAL)
+      return pcfg_display_console() != FE_CONSOLE_GBA;
+   if (idx == SET_LINKMODE)
+      return linkmode_row_enabled();
+   return 1;
+}
 
 /* The list outgrew the page when "Menu style" landed.  The pitch has
  * already been shaved twice (see below), so instead the page scrolls:
  * rows keep their absolute layout and the whole column is shifted by
  * one offset, which keeps each section header travelling with its
  * items. */
-#define SET_VIEW_TOP  (HDR_H + 4)
+/* The overlay's viewport (docs/UI-OVERLAY.md): under the wordmark and the
+ * room code, clipped by the GE scissor, with a 2 px scrollbar at x=470. */
+#define SET_VIEW_TOP  76
 #define SET_VIEW_BOT  244
+/* The cursor row's band (set_item): 20 rows on a 16 px pitch, cap height
+ * centred, so it spans the row's text y .. y+19 (vid_band_y). */
+#define SET_BAND_W    460
+#define SET_BAND_H    20
+
+/* The lowest row the cursor row's band reaches: what the scroll has to keep
+ * inside the viewport.  The text box (y + FE_FONT_H) was the old measure,
+ * from when the band sat ABOVE the text; now the band is the lower edge. */
+static int set_row_bot(int y)
+{
+   int b = vid_band_y(y, SET_BAND_H) + SET_BAND_H;
+   return b > y + FE_FONT_H ? b : y + FE_FONT_H;
+}
 
 static int set_row_y(int idx)
 {
@@ -651,9 +1538,11 @@ static int set_row_y(int idx)
     * row paid for one of the Theme/FPS additions (O exits, it was pure
     * redundancy) and the pixel budget paid for the other: headers advance
     * 19 px, items 16.  Last row lands at y=235, text ends at 251 — 1 px
-    * clear of the footer.  The selection fill (FE_FONT_H+2 tall) now grazes
-    * the next row by 1 px; at alpha 36 it does not read. */
-   int y = HDR_H + 4, i;
+    * clear of the footer.  (History: the page now scrolls, see above.)  The
+    * selection band is SET_BAND_H = 20 on this 16 px pitch, so it covers
+    * the 4 empty top rows of the next row's line box and the previous row's
+    * descender tips (y+16..y+17); no capital of a neighbour is under it. */
+   int y = SET_VIEW_TOP, i;
    for (i = 0; i < idx; i++)
       y += set_rows[i].header ? (FE_FONT_H + 3) : FE_FONT_H;
    return y;
@@ -663,7 +1552,7 @@ static void set_cursor_step(int dir)
 {
    do
       g_cursor = (g_cursor + SET_COUNT + dir) % SET_COUNT;
-   while (set_rows[g_cursor].header);
+   while (set_rows[g_cursor].header || !set_row_enabled(g_cursor));
 }
 
 /* Follow the cursor, and pull the section header in with the first item
@@ -671,8 +1560,8 @@ static void set_cursor_step(int dir)
 static void set_scroll_follow(void)
 {
    int top = set_row_y(g_cursor);
-   int bot = top + FE_FONT_H;
-   int max = set_row_y(SET_COUNT - 1) + FE_FONT_H - SET_VIEW_BOT;
+   int bot = set_row_bot(top);
+   int max = set_row_bot(set_row_y(SET_COUNT - 1)) - SET_VIEW_BOT;
 
    if (g_cursor > 0 && set_rows[g_cursor - 1].header)
       top = set_row_y(g_cursor - 1);
@@ -688,6 +1577,327 @@ static void set_scroll_follow(void)
       g_set_scroll = 0;
 }
 
+/* ----- link mode (docs/GBA-LINK-UI.md) -------------------------------------
+ *
+ * THE GAME DECIDES (link_games.h), the player overrides it per game
+ * (fe_linkmode.h, roms/linkmode.txt), and the Wireless menus only ever ask
+ * the HOST, and only for a game that links both ways. */
+
+/* The file's text, for its one read and each write (BSS, never the heap). */
+static char g_lm_text[FE_LINKMODE_MAX * (FE_LINKMODE_NAME + 12)];
+
+static int lm_path(char *out, size_t cap)
+{
+   int n;
+   if (!g_lm_dir[0])
+      return -1;
+   n = snprintf(out, cap, "%s/linkmode.txt", g_lm_dir);
+   return (n > 0 && (size_t)n < cap) ? 0 : -1;
+}
+
+void ui_linkmode_load(const char *rom_dir)
+{
+   char *text = g_lm_text;
+   char path[PSP_FILE_PATH_CAP];
+   SceUID fd;
+   int len = 0;
+   if (!rom_dir)
+      return;
+   snprintf(g_lm_dir, sizeof(g_lm_dir), "%s", rom_dir);
+   fe_linkmode_clear(&g_lm);
+   if (lm_path(path, sizeof(path)) == 0 &&
+       (fd = sceIoOpen(path, PSP_O_RDONLY, 0)) >= 0)
+   {
+      len = sceIoRead(fd, text, sizeof(g_lm_text));
+      sceIoClose(fd);
+      if (len > 0)
+         fe_linkmode_parse(&g_lm, text, (size_t)len);
+   }
+   g_lm_loaded = 1;
+   fe_evt("linkmode_load n=%u bytes=%d", g_lm.n, len);
+}
+
+static int lm_save(void)
+{
+   char *text = g_lm_text;
+   char path[PSP_FILE_PATH_CAP];
+   size_t n = fe_linkmode_serialise(&g_lm, text, sizeof(g_lm_text));
+   SceUID fd;
+   int rc = 0;
+   if (n >= sizeof(g_lm_text) || lm_path(path, sizeof(path)) != 0)
+      return -1;
+   fd = sceIoOpen(path, PSP_O_WRONLY | PSP_O_CREAT | PSP_O_TRUNC, 0777);
+   if (fd < 0 || sceIoWrite(fd, text, (int)n) != (int)n)
+      rc = -1;
+   if (fd >= 0)
+      sceIoClose(fd);
+   fe_evt("linkmode_save n=%u rc=%d", g_lm.n, rc);
+   return rc;
+}
+
+void ui_set_game(const char *gba_code, const char *gb_title, const char *key,
+                 int cable_ready)
+{
+   snprintf(g_game_code, sizeof(g_game_code), "%.4s",
+            gba_code ? gba_code : "");
+   snprintf(g_game_gbtitle, sizeof(g_game_gbtitle), "%.16s",
+            gb_title ? gb_title : "");
+   snprintf(g_game_key, sizeof(g_game_key), "%s", key ? key : "");
+   g_cable_ready = cable_ready;
+   ov_title_take();                 /* the LINKING screen's game line */
+   fe_evt("link_game code=%s key=\"%s\" table=%d override=%d cable_ready=%d",
+          g_game_code, g_game_key, link_game_mode(g_game_code),
+          fe_linkmode_get(&g_lm, g_game_key), cable_ready);
+}
+
+/* The game Settings > Link mode edits: the running one, or in the browser
+ * the highlighted one (browser_settings filled g_bset_*). */
+static int lm_target(const char **key, const char **code)
+{
+   if (g_ov_browse)
+   {
+      *key = g_bset_key;
+      *code = g_bset_code;
+      return g_bset_have && g_pcfg.console == FE_CONSOLE_GBA;
+   }
+   *key = g_game_key;
+   *code = g_game_code;
+   return pcfg_display_console() == FE_CONSOLE_GBA && g_game_key[0];
+}
+
+static int linkmode_row_enabled(void)
+{
+   const char *k, *c;
+   return lm_target(&k, &c);
+}
+
+static const char *linkmode_value(void)
+{
+   const char *k, *c;
+   int ov;
+   if (!lm_target(&k, &c))
+      return g_ov_browse && g_pcfg.console == FE_CONSOLE_GBA ? "pick a game"
+           : pcfg_display_console() != FE_CONSOLE_GBA ? "Link Cable"
+                                                      : "Auto";
+   ov = fe_linkmode_get(&g_lm, k);
+   if (ov == FE_LM_CABLE)
+      return "Link Cable";
+   if (ov == FE_LM_ADAPTER)
+      return "Wireless Adapter";
+   switch (link_game_mode(c))
+   {
+   case LINK_ADAPTER: return "Auto: Wireless Adapter";
+   case LINK_BOTH:    return "Auto: ask";
+   default:           return "Auto: Link Cable";
+   }
+}
+
+/* Auto -> Link Cable -> Wireless Adapter -> Auto (dir < 0 the other way). */
+static void linkmode_cycle(int dir)
+{
+   const char *k, *c;
+   int ov;
+   if (!lm_target(&k, &c))
+      return;
+   ov = (fe_linkmode_get(&g_lm, k) + 3 + (dir < 0 ? -1 : 1)) % 3;
+   if (fe_linkmode_set(&g_lm, k, ov) != 0)
+      osd_toast("The link mode list is full");
+   else
+      (void)lm_save();
+   fe_evt("linkmode_set key=\"%s\" mode=%d", k, ov);
+}
+
+/* What Host does for the running game (ui_psp.h). */
+int ui_host_mode(void)
+{
+   int m;
+   if (g_pcfg.console != FE_CONSOLE_GBA)
+      return UI_HOST_CABLE;                    /* the GB link is a cable */
+   m = fe_linkmode_effective(link_game_mode(g_game_code),
+                             fe_linkmode_get(&g_lm, g_game_key));
+   if (!g_cable_ready)
+      return UI_HOST_ADAPTER;                  /* no mirror in this boot */
+   return m == LINK_ADAPTER ? UI_HOST_ADAPTER
+        : m == LINK_BOTH    ? UI_HOST_ASK : UI_HOST_CABLE;
+}
+
+int ui_link_mode_for(const char *code, const char *key)
+{
+   return fe_linkmode_effective(link_game_mode(code),
+                                fe_linkmode_get(&g_lm, key));
+}
+
+int ui_host_cable(void)
+{
+   return g_host_cable;
+}
+
+void ui_set_link(const ui_link_view *v)
+{
+   if (!v)
+   {
+      memset(&g_link, 0, sizeof(g_link));
+      return;
+   }
+   g_link = *v;
+   snprintf(g_link_room, sizeof(g_link_room), "%s", v->room ? v->room : "");
+   snprintf(g_link_game, sizeof(g_link_game), "%s", v->game ? v->game : "");
+   g_link.room = g_link_room;
+   g_link.game = g_link_game;
+}
+
+/* Which kinds of room this game can join (Join follows the host's room;
+ * the override only widens what an adapter/cable-only game may enter, so a
+ * hack the table gets wrong is not locked out). */
+static int join_can_cable(void)
+{
+   if (g_pcfg.console != FE_CONSOLE_GBA)
+      return 1;
+   return g_cable_ready &&
+          (link_game_mode(g_game_code) != LINK_ADAPTER ||
+           fe_linkmode_get(&g_lm, g_game_key) == FE_LM_CABLE);
+}
+
+static int join_can_adapter(void)
+{
+   if (g_pcfg.console != FE_CONSOLE_GBA)
+      return 0;
+   return !g_cable_ready || link_game_mode(g_game_code) != LINK_CABLE ||
+          fe_linkmode_get(&g_lm, g_game_key) == FE_LM_ADAPTER;
+}
+
+/* A ROM file's name as a sentence wants it: "Advance Wars 2 - Black Hole
+ * Rising (USA)" -> "Advance Wars 2", "Pokemon - Crystal Version" ->
+ * "Pokemon Crystal" (the design's short form): the region tags go, and the
+ * part before " - " stays -- with the subtitle, minus " Version", when the
+ * part before is only the series name Pokemon. */
+static void short_game_name(const char *full, char *out, size_t cap)
+{
+   char t[100], *p, *sub = NULL;
+   size_t n;
+   snprintf(t, sizeof(t), "%s", full ? full : "");
+   p = strpbrk(t, "([");
+   if (p)
+      *p = '\0';
+   p = strstr(t, " - ");
+   if (p)
+   {
+      *p = '\0';
+      sub = p + 3;
+   }
+   for (n = strlen(t); n && t[n - 1] == ' '; n--)
+      t[n - 1] = '\0';
+   if (sub && !strcasecmp(t, "Pokemon"))
+   {
+      char *v = strstr(sub, " Version");
+      if (v)
+         *v = '\0';
+      for (n = strlen(sub); n && sub[n - 1] == ' '; n--)
+         sub[n - 1] = '\0';
+      snprintf(out, cap, "%s %s", t, sub);
+   }
+   else
+      snprintf(out, cap, "%s", t);
+}
+
+/* The game's name for screens: the table's, else the ROM's own, short. */
+static const char *own_game_name(void)
+{
+   static char nm[64];
+   const char *t = link_game_title(g_game_code);
+   if (t)
+      return t;
+   short_game_name(g_ov_title, nm, sizeof(nm));
+   return nm;
+}
+
+/* One scan row, decided: its columns and whether X joins it.  The plate
+ * (why not) is written when it cannot be joined. */
+typedef struct
+{
+   char mode[32], title[64], plate[96];
+   int ok;
+} scan_row;
+
+static void scan_row_decide(const char *group, scan_row *r)
+{
+   char room[ROOM_LABEL_CAP], code[5];
+   int num, kind = room_parse(group, &num, code), gba = g_pcfg.console ==
+                                                         FE_CONSOLE_GBA;
+   room_label(group, room, sizeof(room));
+   memset(r, 0, sizeof(*r));
+   r->ok = 1;
+   switch (kind)
+   {
+   case ROOM_ADAPTER:
+      if (gba)
+      {
+         snprintf(r->mode, sizeof(r->mode), "Wireless Adapter");
+         if (!join_can_adapter())
+         {
+            r->ok = 0;
+            snprintf(r->plate, sizeof(r->plate),
+                     "%s is a Wireless Adapter room. This game links by "
+                     "cable.", room);
+         }
+      }
+      else
+      {
+         /* An older (3.1 beta) GB-link host advertised GPSPnn too: let the
+          * handshake decide (owner, 2026-10-03). */
+         snprintf(r->mode, sizeof(r->mode), "older GBAdhoc");
+         snprintf(r->title, sizeof(r->title), "GB link or GBA adapter");
+      }
+      break;
+   case ROOM_CABLE_GBA:
+   {
+      const char *t = !strcmp(code, g_game_code) ? own_game_name()
+                                                 : link_game_title(code);
+      snprintf(r->mode, sizeof(r->mode), "Link Cable");
+      if (t)
+         snprintf(r->title, sizeof(r->title), gba ? "%.56s" : "%.50s (GBA)", t);
+      else
+         snprintf(r->title, sizeof(r->title), "another game (%s)", code);
+      if (!gba)
+      {
+         r->ok = 0;
+         snprintf(r->plate, sizeof(r->plate),
+                  "%s is a Game Boy Advance room.", room);
+      }
+      else if (strcmp(code, g_game_code) != 0)
+      {
+         char tt[64];
+         r->ok = 0;
+         snprintf(tt, sizeof(tt), "%.60s", t ? t : r->title);
+         clip_title(tt, 240);
+         snprintf(r->plate, sizeof(r->plate),
+                  t ? "%s is playing %s. Open it to join."
+                    : "%s is playing %s.", room, tt);
+      }
+      else if (!join_can_cable())
+      {
+         r->ok = 0;
+         snprintf(r->plate, sizeof(r->plate), g_cable_ready
+                  ? "%s is a Link Cable room. This game links by adapter."
+                  : "%s is a Link Cable room. Restart the game to link.",
+                  room);
+      }
+      break;
+   }
+   case ROOM_CABLE_GB:
+      snprintf(r->mode, sizeof(r->mode), "Link Cable");
+      snprintf(r->title, sizeof(r->title), "Game Boy / Color");
+      if (gba)
+      {
+         r->ok = 0;
+         snprintf(r->plate, sizeof(r->plate), "%s is a Game Boy room.", room);
+      }
+      break;
+   default:
+      break;                     /* verbatim; the handshake decides */
+   }
+}
+
 static int g_profile_changed;
 
 /* me_mode_name() was here.  It rendered the Media Engine row's value and
@@ -700,23 +1910,37 @@ static void settings_adjust(int id, int dir)
    {
    case SET_SCALE:
       g_pcfg.scale = (g_pcfg.scale + VID_SCALE_MODES + dir) % VID_SCALE_MODES;
+      pcfg_display_commit();
       vid_set_mode(g_pcfg.scale, g_pcfg.filter);
-      fe_evt("video_mode scale=%s filter=%s",
-             vid_scale_name(g_pcfg.scale), vid_filter_name(g_pcfg.filter));
+      fe_evt("video_mode scale=%s filter=%s profile=%s",
+             vid_scale_name(g_pcfg.scale), vid_filter_name(g_pcfg.filter),
+             pcfg_console_tag(pcfg_display_console()));
       break;
    case SET_FILTER:
-      g_pcfg.filter = !g_pcfg.filter;
+      /* nearest -> bilinear -> sharp bilinear (docs/SHARP-BILINEAR.md). */
+      g_pcfg.filter = (g_pcfg.filter + VID_FILTER_MODES + dir) %
+                      VID_FILTER_MODES;
+      pcfg_display_commit();
       vid_set_mode(g_pcfg.scale, g_pcfg.filter);
-      fe_evt("video_mode scale=%s filter=%s",
-             vid_scale_name(g_pcfg.scale), vid_filter_name(g_pcfg.filter));
+      fe_evt("video_mode scale=%s filter=%s profile=%s",
+             vid_scale_name(g_pcfg.scale), vid_filter_name(g_pcfg.filter),
+             pcfg_console_tag(pcfg_display_console()));
+      break;
+   case SET_AMBIENT:
+      g_pcfg.ambient = (g_pcfg.ambient + PCFG_AMB_MODES + dir) % PCFG_AMB_MODES;
+      pcfg_display_commit();
+      vid_ambient_mode(g_pcfg.ambient);
+      fe_evt("ambient_mode mode=%d profile=%s source=%d", g_pcfg.ambient,
+             pcfg_console_tag(pcfg_display_console()), vid_ambient_source());
       break;
    case SET_OSD:
       g_pcfg.osd_wireless = !g_pcfg.osd_wireless;
       osd_session_chip_refresh();
       break;
-   case SET_ABMAP:
-      g_pcfg.btn_swap = !g_pcfg.btn_swap;
-      break;
+   case SET_LINKMODE:
+      /* linkmode.txt, not CONFIG.INI: written here, at once */
+      linkmode_cycle(dir);
+      return;
    case SET_THEME:
       g_pcfg.theme = !g_pcfg.theme;   /* applies live — page() re-reads it */
       break;
@@ -729,10 +1953,14 @@ static void settings_adjust(int id, int dir)
    case SET_GBPAL:
    {
       /* Applies to a running GB game at once (and to the next boot); an
-       * out-of-range id read from config.ini counts as Auto (0). */
+       * out-of-range id read from config.ini counts as Auto (0).  Per
+       * console: GB and GBC keep their own; a GBA profile has none. */
       int n = fe_host_gb_palette_count();
       int cur = g_pcfg.gb_palette < n ? g_pcfg.gb_palette : 0;
+      if (!set_row_enabled(SET_GBPAL))
+         return;
       g_pcfg.gb_palette = (cur + n + dir) % n;
+      pcfg_display_commit();
       fe_host_gb_palette_set(g_pcfg.gb_palette);
       break;
    }
@@ -757,11 +1985,24 @@ static void settings_adjust(int id, int dir)
    g_settings_dirty = 1;
 }
 
+/* One settings row in the overlay: label at 30, value right-aligned at 440,
+ * the cursor row on the left-bleed band. */
+static void set_item(int y, int sel, int enabled, const char *label,
+                     const char *value)
+{
+   if (sel)
+      ov_band(y, SET_BAND_W, SET_BAND_H);
+   vid_text(30, y, label, enabled ? (sel ? C_SEL : C_ITEM) : C_DIM);
+   if (value)
+      ov_text_right(440, y, value,
+                    enabled ? (sel ? C_VALUE : C_ACCENT_DK) : C_DIM);
+}
+
 static ui_action screen_settings(unsigned edges)
 {
    int i;
 
-   if (set_rows[g_cursor].header)
+   if (set_rows[g_cursor].header || !set_row_enabled(g_cursor))
       g_cursor = SET_ROOM;
    if (edges & PSP_CTRL_UP)
       set_cursor_step(-1);
@@ -771,6 +2012,11 @@ static ui_action screen_settings(unsigned edges)
       settings_adjust(g_cursor, -1);
    if (edges & PSP_CTRL_RIGHT)
       settings_adjust(g_cursor, +1);
+   if ((edges & PSP_CTRL_CROSS) && g_cursor == SET_CONTROLS)
+   {
+      screen_to(SCR_CONTROLS);
+      return screen_controls(0, 0);   /* draw this frame as the new page */
+   }
    if (edges & PSP_CTRL_CROSS)
       settings_adjust(g_cursor, +1);
    if (edges & PSP_CTRL_CIRCLE)
@@ -785,66 +2031,111 @@ static ui_action screen_settings(unsigned edges)
       screen_to(SCR_MENU);
    }
 
-   page("SETTINGS", g_pcfg.group);
+   /* Scrim 200 over the frame (the browser's page, from START there): a
+    * long list needs more hold-back than the menu's 170. */
+   ov_backdrop(OV_SCRIM_DENSE);
+   ov_head(NULL, "SETTINGS");
    set_scroll_follow();
+   vid_clip(0, SET_VIEW_TOP - 2, VID_SCR_W, SET_VIEW_BOT - SET_VIEW_TOP + 4);
    for (i = 0; i < SET_COUNT; i++)
    {
       int y = set_row_y(i) - g_set_scroll;
-      if (y < SET_VIEW_TOP - 2 || y > SET_VIEW_BOT)
-         continue;
+      if (y + FE_FONT_H <= SET_VIEW_TOP - 2 || y >= SET_VIEW_BOT + 2)
+         continue;                /* wholly outside the scissor */
       if (set_rows[i].header)
       {
-         int lx = 24 + vid_text_w(set_rows[i].label) + FE_FONT_W;
-         vid_text(24, y, set_rows[i].label, C_ACCENT);
-         vid_rect(lx, y + FE_FONT_H / 2, 456 - lx, 1, C_ACCENT_DK, 120);
+         int lx = 20 + vid_text_w(set_rows[i].label) + FE_FONT_W;
+         vid_text(20, y, set_rows[i].label, C_ACCENT);
+         if (i == SET_HDR_VID)
+         {
+            /* Which profile these rows edit, in that console's own accent
+             * -- the colour its browser badge wears. */
+            char tag[12];
+            int tx = 20 + vid_text_w(set_rows[i].label) + 6;
+            snprintf(tag, sizeof(tag), "(%s)",
+                     pcfg_console_tag(pcfg_display_console()));
+            vid_text(tx, y, tag, skin_of(pcfg_display_console())->accent);
+            lx = tx + vid_text_w(tag) + FE_FONT_W;
+         }
+         vid_rect(lx, y + FE_FONT_H / 2, 440 - lx, 1, C_ACCENT_DK, 120);
          continue;
       }
       switch (i)
       {
       case SET_ROOM:
-         row(36, y, 408, g_cursor == i, 1, set_rows[i].label, g_pcfg.group);
+      {
+         char lbl[ROOM_LABEL_CAP];
+         set_item(y, g_cursor == i, 1, set_rows[i].label,
+                  room_label(g_pcfg.group, lbl, sizeof(lbl)));
+         break;
+      }
+      case SET_LINKMODE:
+         set_item(y, g_cursor == i, set_row_enabled(i), set_rows[i].label,
+                  linkmode_value());
          break;
       case SET_OSD:
-         row(36, y, 408, g_cursor == i, 1, set_rows[i].label,
+         set_item(y, g_cursor == i, 1, set_rows[i].label,
              g_pcfg.osd_wireless ? "shown" : "hidden");
          break;
       case SET_SCALE:
-         row(36, y, 408, g_cursor == i, 1, set_rows[i].label,
+         set_item(y, g_cursor == i, 1, set_rows[i].label,
              vid_scale_name(g_pcfg.scale));
          break;
       case SET_FILTER:
-         row(36, y, 408, g_cursor == i, 1, set_rows[i].label,
-             vid_filter_name(g_pcfg.filter));
+         /* 2x samples nearest whatever this says; say so. */
+         set_item(y, g_cursor == i, g_pcfg.scale != VID_SCALE_INT2,
+             set_rows[i].label,
+             g_pcfg.scale == VID_SCALE_INT2 ? "sharp (2x)"
+                                            : vid_filter_name(g_pcfg.filter));
+         break;
+      case SET_AMBIENT:
+         set_item(y, g_cursor == i, 1, set_rows[i].label,
+             pcfg_ambient_name(g_pcfg.ambient));
          break;
       case SET_FFMULT:
-         row(36, y, 408, g_cursor == i, 1, set_rows[i].label, pcfg_ff_name());
+         set_item(y, g_cursor == i, 1, set_rows[i].label, pcfg_ff_name());
          break;
       case SET_FFMODE:
-         row(36, y, 408, g_cursor == i, 1, set_rows[i].label,
+      {
+         /* Names the button it is about, which is no longer always
+          * Square; with the default binding this reads exactly as 3.0. */
+         char lbl[48], b[32];
+         unsigned ffb = g_pcfg.controls.bind[CTL_SC_FF];
+         if (ffb == CTL_SQUARE)
+            snprintf(lbl, sizeof(lbl), "%s", set_rows[i].label);
+         else
+         {
+            ctl_format(ffb, b, sizeof(b), CTL_UI_NAMES, "none");
+            snprintf(lbl, sizeof(lbl), "FF button (%s)", b);
+         }
+         set_item(y, g_cursor == i, 1, lbl,
              g_pcfg.ff_hold ? "hold" : "toggle");
          break;
-      case SET_ABMAP:
-         row(36, y, 408, g_cursor == i, 1, set_rows[i].label,
-             g_pcfg.btn_swap ? "A=X  B=O" : "A=O  B=X");
+      }
+      case SET_CONTROLS:
+         set_item(y, g_cursor == i, 1, set_rows[i].label,
+             ctl_is_default(&g_pcfg.controls)
+                ? "default" : "custom");
          break;
       case SET_THEME:
-         row(36, y, 408, g_cursor == i, 1, set_rows[i].label,
+         set_item(y, g_cursor == i, 1, set_rows[i].label,
              g_pcfg.theme ? "light" : "dark");
          break;
       case SET_SHELL:
-         row(36, y, 408, g_cursor == i, 1, set_rows[i].label,
+         set_item(y, g_cursor == i, 1, set_rows[i].label,
              g_pcfg.ui_shell ? "marquee" : "shelf");
          break;
       case SET_FPS:
-         row(36, y, 408, g_cursor == i, 1, set_rows[i].label,
+         set_item(y, g_cursor == i, 1, set_rows[i].label,
              g_pcfg.show_fps ? "on" : "off");
          break;
       case SET_GBPAL:
       {
          int gp = g_pcfg.gb_palette < fe_host_gb_palette_count()
                   ? g_pcfg.gb_palette : 0;
-         row(36, y, 408, g_cursor == i, 1, set_rows[i].label,
-             fe_host_gb_palette_name(gp));
+         int en = set_row_enabled(i);
+         set_item(y, g_cursor == i, en, set_rows[i].label,
+             en ? fe_host_gb_palette_name(gp) : "GB / GBC only");
          break;
       }
       }
@@ -853,54 +2144,770 @@ static ui_action screen_settings(unsigned edges)
     * sets g_profile_changed any more, so the branch could never be taken and
     * the text advertised a setting that no longer exists.  The mechanism
     * itself stays for the next setting that needs a reboot. */
-   footer("DPAD move/change   X select   O back");
+   vid_clip_off();
+   ov_scrollbar(470, SET_VIEW_TOP, SET_VIEW_BOT - SET_VIEW_TOP, g_set_scroll,
+                SET_VIEW_BOT - SET_VIEW_TOP,
+                set_row_bot(set_row_y(SET_COUNT - 1)) - SET_VIEW_TOP);
+   footer("DPAD move/change   " VID_GLYPH_X " select   " VID_GLYPH_O " back");
+   return UI_ACT_NONE;
+}
+
+/* ----- controls screen (Settings > Controls) ------------------------------
+ *
+ * docs/CONTROL-REMAP.md.  MODEL AND VIEW ARE SEPARATE: every rule -- what an
+ * action may be bound to, the conflict rule, the defaults, CONFIG.INI -- is
+ * ctl_map.c, which the host test exercises.  This section only walks rows,
+ * captures a press and draws, in the overlay's language (docs/UI-OVERLAY.md):
+ * two labelled columns, GAME BUTTONS and SHORTCUTS, each binding a row of
+ * CHIPS; the fixed chords are locked chips the cursor skips; what the page
+ * has to SAY (capture, a conflict, a refusal) is a plate where the footer
+ * was.
+ *
+ * LOCKOUT SAFETY.  Nothing on this page goes through a game binding: it is
+ * driven by the fixed menu keys (d-pad, X, O, and Square/Triangle as page
+ * actions), and it is opened through START+SELECT, which no binding can
+ * take.  Any mapping, however wrong, can be undone from here. */
+
+enum { CR_ACT, CR_FIXED, CR_RESET, CR_MENU };
+typedef struct
+{
+   unsigned char kind;
+   unsigned char col;      /* 0 GAME BUTTONS, 1 SHORTCUTS                   */
+   signed char   act;      /* CR_ACT: the ctl_map action                    */
+   const char   *label;    /* CR_FIXED / CR_RESET                           */
+   const char   *chord;    /* CR_FIXED: its one locked chip, forever        */
+} ctl_row;
+
+/* In CURSOR order, which is column-major: down the game buttons, then down
+ * the shortcuts -- the same sequence the single list had, so UP/DOWN walk
+ * every row exactly as before (and the harness walker's arithmetic holds).
+ * LEFT/RIGHT cross between the columns. */
+static const ctl_row CTL_ROWS[] = {
+   { CR_ACT, 0, CTL_GAME_A, NULL, NULL },
+   { CR_ACT, 0, CTL_GAME_B, NULL, NULL },
+   { CR_ACT, 0, CTL_GAME_L, NULL, NULL },
+   { CR_ACT, 0, CTL_GAME_R, NULL, NULL },
+   { CR_ACT, 0, CTL_GAME_START, NULL, NULL },
+   { CR_ACT, 0, CTL_GAME_SELECT, NULL, NULL },
+   { CR_ACT, 0, CTL_GAME_UP, NULL, NULL },
+   { CR_ACT, 0, CTL_GAME_DOWN, NULL, NULL },
+   { CR_ACT, 0, CTL_GAME_LEFT, NULL, NULL },
+   { CR_ACT, 0, CTL_GAME_RIGHT, NULL, NULL },
+   { CR_ACT, 1, CTL_SC_FF, NULL, NULL },
+   { CR_ACT, 1, CTL_SC_VIDEO, NULL, NULL },
+   { CR_ACT, 1, CTL_SC_SAVE, NULL, NULL },
+   { CR_ACT, 1, CTL_SC_LOAD, NULL, NULL },
+   { CR_ACT, 1, CTL_SC_SHOT, NULL, NULL },
+   { CR_ACT, 1, CTL_SC_PAUSE, NULL, NULL },
+   { CR_ACT, 1, CTL_SC_MGIFT, NULL, NULL },
+   { CR_ACT, 1, CTL_SC_CATCH, NULL, NULL },     /* bisect builds only */
+   /* The menu button is a TOGGLE, not a binding: START+SELECT (hold) or HOME
+    * (docs/CONTROL-REMAP.md section 10).  Nothing else can ever be chosen,
+    * so no value of it can lock the player out of this page. */
+   { CR_MENU, 1, -1, "Menu", NULL },
+   /* Fixed.  Its words follow the menu row: with the menu on HOME, what a
+    * player needs to read here is how to QUIT (ctl_fixed_row). */
+   { CR_FIXED, 1, -1, "Home", "HOME" },
+   { CR_RESET, 1, -1, "Reset to defaults", NULL },
+};
+#define CTL_ROWS_N ((int)(sizeof(CTL_ROWS) / sizeof(CTL_ROWS[0])))
+
+/* The two columns: x, width, title (the design's numbers). */
+static const struct { int x, w; const char *title; } CTL_COLS[2] = {
+   {  20, 170, "GAME BUTTONS" },
+   { 206, 254, "SHORTCUTS" },
+};
+/* Column titles at CTL_COL_Y; rows from CTL_ROW_Y0.  The design's 19 px
+ * pitch fits its eight rows a column; the real table has ten (the d-pad is
+ * remappable, and so is the pause screen), so the titles sit higher and the
+ * pitch is whatever lands the last row's chip by CTL_LAST_Y + CHIP_H --
+ * 18 px for ten rows, 19 at most, clear of the plate at 252. */
+#define CTL_COL_Y   48
+#define CTL_ROW_Y0  (CTL_COL_Y + 20)
+#define CTL_LAST_Y  230
+#define CTL_PITCH_MAX 19
+/* Capture gives up after ~5 s with nothing pressed.  A press is the only
+ * way to finish, because every button -- O included -- is a legal answer. */
+#define CTL_CAP_TIMEOUT 300
+/* The capture chip's pulse: alpha 255 -> 96 -> 255 every 48 frames. */
+#define CTL_PULSE_FRAMES 48
+
+static struct { int on, act, phase, timer; unsigned got; } g_cap;
+static int  g_ctl_reset_armed;
+static char g_ctl_note[112];
+
+int ui_capturing(void)
+{
+   return g_cap.on;
+}
+
+static int ctl_cap_timer(void)
+{
+   return g_cap.on ? g_cap.timer : -1;
+}
+
+static void ctl_page_reset(void)
+{
+   g_cap.on = 0;
+   g_ctl_reset_armed = 0;
+   g_ctl_note[0] = '\0';
+}
+
+static int ctl_row_shown(int i)
+{
+   return CTL_ROWS[i].kind != CR_ACT || ctl_available(CTL_ROWS[i].act);
+}
+
+static int ctl_row_stop(int i)
+{
+   return ctl_row_shown(i) &&
+          (CTL_ROWS[i].kind == CR_ACT || CTL_ROWS[i].kind == CR_RESET ||
+           CTL_ROWS[i].kind == CR_MENU);
+}
+
+/* Index of row i within its column, counting shown rows only. */
+static int ctl_row_pos(int idx)
+{
+   int i, n = 0;
+   for (i = 0; i < idx; i++)
+      if (CTL_ROWS[i].col == CTL_ROWS[idx].col && ctl_row_shown(i))
+         n++;
+   return n;
+}
+
+static int ctl_pitch(void)
+{
+   int n[2] = { 0, 0 }, i, most, p;
+   for (i = 0; i < CTL_ROWS_N; i++)
+      if (ctl_row_shown(i))
+         n[CTL_ROWS[i].col]++;
+   most = n[0] > n[1] ? n[0] : n[1];
+   if (most < 2)
+      return CTL_PITCH_MAX;
+   p = (CTL_LAST_Y - CTL_ROW_Y0) / (most - 1);
+   return p < CTL_PITCH_MAX ? p : CTL_PITCH_MAX;
+}
+
+static void ctl_cursor_step(int dir)
+{
+   int n = 0;
+   do
+      g_cursor = (g_cursor + CTL_ROWS_N + dir) % CTL_ROWS_N;
+   while (!ctl_row_stop(g_cursor) && ++n < CTL_ROWS_N);
+}
+
+/* LEFT/RIGHT: the other column, same row -- or the nearest stop to it,
+ * preferring the one above (the fixed rows are not stops). */
+static void ctl_cursor_cross(void)
+{
+   int col = !CTL_ROWS[g_cursor].col, pos = ctl_row_pos(g_cursor);
+   int best = -1, best_d = 1 << 20, i;
+   for (i = 0; i < CTL_ROWS_N; i++)
+   {
+      int d;
+      if (CTL_ROWS[i].col != col || !ctl_row_stop(i))
+         continue;
+      d = ctl_row_pos(i) - pos;
+      d = d < 0 ? -2 * d : 2 * d + 1;
+      if (d < best_d)
+      {
+         best_d = d;
+         best = i;
+      }
+   }
+   if (best >= 0)
+      g_cursor = best;
+}
+
+static void ctl_value(unsigned mask, char *b, size_t n)
+{
+   ctl_format(mask, b, n, CTL_UI_NAMES, "none");
+}
+
+/* The button names of `mask`, in ctl_button_order() order -- the order
+ * ctl_format() spells a chord in, so a chip row reads as the CONFIG.INI
+ * value does. */
+static int chord_parts(unsigned mask, const char **out)
+{
+   int i, n = 0;
+   for (i = 0; i < CTL_NBUTTONS; i++)
+      if (mask & ctl_button_order(i))
+         out[n++] = CTL_UI_NAMES[i];
+   return n;
+}
+
+/* The visible half of the conflict rule: whatever moved is said in words,
+ * on the plate.  A plain rebind needs no words -- its chip shows it. */
+static void ctl_note_result(int a, unsigned mask, int err, int stolen)
+{
+   char v[40];
+   const char *lbl = ctl_info(a)->label;
+   ctl_value(mask, v, sizeof(v));
+   if (err != CTL_OK)
+      snprintf(g_ctl_note, sizeof(g_ctl_note), "%s unchanged: %s", lbl,
+               ctl_error_text(err));
+   else if (stolen >= 0)
+      snprintf(g_ctl_note, sizeof(g_ctl_note),
+               "%s was %s  -  %s is now blank (disabled)", v,
+               ctl_info(stolen)->label, ctl_info(stolen)->label);
+   else
+      g_ctl_note[0] = '\0';
+}
+
+static void ctl_apply(int a, unsigned mask, const char *via)
+{
+   int stolen = -1, err = ctl_assign(&g_pcfg.controls, a, mask, &stolen);
+   ctl_note_result(a, mask, err, stolen);
+   if (err == CTL_OK)
+      g_settings_dirty = 1;
+   FE_EVT_ONLY(via);
+   fe_evt("ctl_bind key=%s mask=0x%04x err=%d stolen=%s via=%s",
+          ctl_info(a)->key, mask, err,
+          stolen >= 0 ? ctl_info(stolen)->key : "none", via);
+}
+
+static void ctl_capture_begin(int a)
+{
+   g_cap.on = 1;
+   g_cap.act = a;
+   g_cap.phase = 0;
+   g_cap.timer = 0;
+   g_cap.got = 0;
+   g_ctl_note[0] = '\0';
+   fe_evt("ctl_capture key=%s", ctl_info(a)->key);
+}
+
+/* One frame of capture.  Phase 0 waits for the X that opened it to come up;
+ * phase 1 listens; phase 2 collects every button held until ALL are released
+ * -- so a chord is captured whatever order its buttons went down in. */
+static void ctl_capture_step(unsigned pad)
+{
+   unsigned p = pad & CTL_ALL;
+
+   if (g_cap.phase == 0)
+   {
+      if (!p)
+         g_cap.phase = 1;
+   }
+   else if (g_cap.phase == 1)
+   {
+      if (p)
+      {
+         g_cap.phase = 2;
+         g_cap.got = p;
+      }
+   }
+   else
+      g_cap.got |= p;
+
+   if (g_cap.phase == 2)
+   {
+      /* Refused at once rather than on release: holding START+SELECT for
+       * 1.5 s is also the fixed "end the run" gesture (ADR-0057). */
+      if ((g_cap.got & CTL_MENU_CHORD) == CTL_MENU_CHORD)
+      {
+         ctl_note_result(g_cap.act, g_cap.got, CTL_E_RESERVED, -1);
+         g_cap.on = 0;
+      }
+      else if (!p)
+      {
+         ctl_apply(g_cap.act, g_cap.got, "capture");
+         g_cap.on = 0;
+      }
+      return;
+   }
+   if (++g_cap.timer >= CTL_CAP_TIMEOUT)
+   {
+      snprintf(g_ctl_note, sizeof(g_ctl_note), "%s unchanged: nothing pressed",
+               ctl_info(g_cap.act)->label);
+      g_cap.on = 0;
+   }
+}
+
+/* The capture chip's outline alpha this frame: a triangle wave from 255
+ * down to 96 and back, starting at full.  Steady while a chord is held. */
+static int ctl_pulse(void)
+{
+   int t = g_cap.timer % CTL_PULSE_FRAMES, half = CTL_PULSE_FRAMES / 2;
+   int tri = t < half ? t * 256 / half : (CTL_PULSE_FRAMES - t) * 256 / half;
+   if (g_cap.phase == 2)
+      return 255;
+   return 255 - ((255 - 96) * tri >> 8);
+}
+
+/* The capture plate.  Centred on the 5-second wording so the countdown's
+ * digit changing cannot shift the line a pixel. */
+static void ctl_capture_plate(void)
+{
+   const ctl_action_info *in = ctl_info(g_cap.act);
+   char t[112], v[40];
+   int secs = (CTL_CAP_TIMEOUT - g_cap.timer + 59) / 60;
+   const char *ask = (in->flags & CTL_F_GAME) ? "Press a button for"
+                                              : "Press a button or combo for";
+   vid_rect(0, OV_PLATE_Y, VID_SCR_W, FTR_H, C_ACCENT, 40);
+   if (g_cap.phase == 2)
+   {
+      ctl_value(g_cap.got, v, sizeof(v));
+      snprintf(t, sizeof(t), "%s      let go to set", v);
+      vid_text_center(OV_PLATE_Y + 2, t, C_SEL);
+      return;
+   }
+   /* "O cancel" is not offered: O is a legal answer (A is on O by
+    * default), so capture ends on any press or on the timeout. */
+   snprintf(t, sizeof(t), "%s %s      cancels in 5 s", ask, in->label);
+   {
+      int x = (VID_SCR_W - vid_text_w(t)) / 2;
+      snprintf(t, sizeof(t), "%s %s      cancels in %d s", ask, in->label,
+               secs);
+      vid_text(x, OV_PLATE_Y + 2, t, C_SEL);
+   }
+}
+
+/* A fixed row's label, chip and tag.  The "Home" row says what HOME does,
+ * which the menu toggle changes: with the menu on HOME it becomes the row
+ * that says how to QUIT, because the system's exit dialog is not on HOME in
+ * game any more.  Returns the label; chip/tag may be NULL. */
+static const char *ctl_fixed_row(const ctl_row *ri, const char **chip,
+                                 const char **tag)
+{
+   int quit = g_pcfg.controls.menu_home && ri->chord &&
+              strcmp(ri->chord, "HOME") == 0;
+   if (chip)
+      *chip = quit ? "START+SELECT" : ri->chord;
+   if (tag)
+      *tag = quit ? "hold 1.5 s" : "fixed";
+   return quit ? "Quit" : ri->label;
+}
+
+static ui_action screen_controls(unsigned edges, unsigned pad)
+{
+   const ctl_row *r;
+   const char *parts[CTL_NBUTTONS];
+   int i, c, pitch;
+
+   if (g_cap.on)
+   {
+      ctl_capture_step(pad);
+      edges = 0;                  /* capture owns the pad this frame */
+   }
+   if (!ctl_row_stop(g_cursor))
+      ctl_cursor_step(+1);
+   if (edges & (PSP_CTRL_UP | PSP_CTRL_DOWN | PSP_CTRL_LEFT | PSP_CTRL_RIGHT))
+   {
+      g_ctl_reset_armed = 0;
+      g_ctl_note[0] = '\0';       /* read; the plate gives the footer back */
+   }
+   if (edges & PSP_CTRL_UP)
+      ctl_cursor_step(-1);
+   if (edges & PSP_CTRL_DOWN)
+      ctl_cursor_step(+1);
+   if (edges & (PSP_CTRL_LEFT | PSP_CTRL_RIGHT))
+      ctl_cursor_cross();
+   r = &CTL_ROWS[g_cursor];
+
+   if (edges & PSP_CTRL_CIRCLE)
+   {
+      screen_to(SCR_SETTINGS);    /* saves the bindings if they changed */
+      g_cursor = SET_CONTROLS;
+      return screen_settings(0);
+   }
+   if (r->kind == CR_ACT)
+   {
+      if (edges & PSP_CTRL_CROSS)
+         ctl_capture_begin(r->act);
+      else if (edges & PSP_CTRL_SQUARE)
+         ctl_apply(r->act, 0, "none");
+      else if (edges & PSP_CTRL_TRIANGLE)
+         ctl_apply(r->act, ctl_default(r->act), "default");
+   }
+   else if (r->kind == CR_MENU &&
+            (edges & (PSP_CTRL_CROSS | PSP_CTRL_TRIANGLE)))
+   {
+      int was = g_pcfg.controls.menu_home;
+      g_pcfg.controls.menu_home = (edges & PSP_CTRL_CROSS)
+         ? (uint8_t)!was : (uint8_t)CTL_MENU_START_SELECT;
+      if (g_pcfg.controls.menu_home != was)
+         g_settings_dirty = 1;
+      snprintf(g_ctl_note, sizeof(g_ctl_note), "%s",
+               g_pcfg.controls.menu_home
+                  ? "In game HOME opens the menu  -  hold START+SELECT to quit"
+                  : "START+SELECT (hold) opens the menu  -  HOME is the system's");
+      fe_evt("ctl_menu_button value=%s",
+             ctl_menu_name(g_pcfg.controls.menu_home));
+   }
+   else if (r->kind == CR_RESET && (edges & PSP_CTRL_CROSS))
+   {
+      if (!g_ctl_reset_armed)
+      {
+         g_ctl_reset_armed = 1;
+         snprintf(g_ctl_note, sizeof(g_ctl_note),
+                  "Press " VID_GLYPH_X " again to reset every control");
+      }
+      else
+      {
+         ctl_reset(&g_pcfg.controls);
+         g_ctl_reset_armed = 0;
+         g_settings_dirty = 1;
+         snprintf(g_ctl_note, sizeof(g_ctl_note),
+                  "Every control is back to its default");
+         fe_evt("ctl_reset");
+      }
+   }
+
+   ov_backdrop(OV_SCRIM_DENSE);
+   ov_head(NULL, "CONTROLS");
+   pitch = ctl_pitch();
+   for (c = 0; c < 2; c++)
+   {
+      int cx = CTL_COLS[c].x, cw = CTL_COLS[c].w;
+      int lx = cx + vid_text_w(CTL_COLS[c].title) + FE_FONT_W;
+      vid_text(cx, CTL_COL_Y, CTL_COLS[c].title, C_ACCENT);
+      vid_rect(lx, CTL_COL_Y + FE_FONT_H / 2, cx + cw - 10 - lx, 1,
+               C_ACCENT_DK, 120);
+      for (i = 0; i < CTL_ROWS_N; i++)
+      {
+         const ctl_row *ri = &CTL_ROWS[i];
+         int y, sel = (i == g_cursor), xr = cx + cw - 10, n, w;
+         if (ri->col != c || !ctl_row_shown(i))
+            continue;
+         y = CTL_ROW_Y0 + ctl_row_pos(i) * pitch;
+         if (sel)
+         {
+            int by = vid_band_y(y, pitch + 1);
+            vid_rect(cx - 8, by, cw + 6, pitch + 1, C_ACCENT, 40);
+            vid_rect(cx - 8, by, 3, pitch + 1, C_ACCENT, 255);
+         }
+         vid_text(cx + 4, y,
+                  ri->kind == CR_ACT ? ctl_info(ri->act)->label :
+                  ri->kind == CR_FIXED ? ctl_fixed_row(ri, NULL, NULL)
+                                       : ri->label,
+                  ri->kind == CR_FIXED ? C_DIM : (sel ? C_SEL : C_ITEM));
+         switch (ri->kind)
+         {
+         case CR_FIXED:
+         {
+            const char *tag;
+            ctl_fixed_row(ri, &parts[0], &tag);
+            w = combo_right(xr, y, parts, 1, CHIP_LOCKED, 255);
+            ov_text_right(xr - w - 8, y, tag, C_DIM);
+            break;
+         }
+         case CR_MENU:
+            parts[0] = g_pcfg.controls.menu_home ? "HOME" : "START+SELECT";
+            w = combo_right(xr, y, parts, 1, CHIP_BOUND, 255);
+            ov_text_right(xr - w - 8, y,
+                          g_pcfg.controls.menu_home ? "in game" : "hold",
+                          C_DIM);
+            break;
+         case CR_ACT:
+            if (g_cap.on && g_cap.act == ri->act)
+            {
+               if (g_cap.phase == 2 && g_cap.got)
+                  n = chord_parts(g_cap.got, parts);
+               else
+               {
+                  parts[0] = "press...";
+                  n = 1;
+               }
+               combo_right(xr, y, parts, n, CHIP_CAPTURE, ctl_pulse());
+            }
+            else
+            {
+               n = chord_parts(g_pcfg.controls.bind[ri->act], parts);
+               combo_right(xr, y, parts, n, CHIP_BOUND, 255);
+            }
+            break;
+         default:
+            break;
+         }
+      }
+   }
+   /* An empty chip is never ambiguous: "blank = disabled" is in every
+    * footer, and the plates say why a chip just went blank. */
+   if (g_cap.on)
+      ctl_capture_plate();
+   else if (g_ctl_note[0])
+      ov_plate(g_ctl_note);
+   else if (r->kind == CR_RESET)
+      footer(VID_GLYPH_X " reset   " VID_GLYPH_O " back      blank = disabled");
+   else if (r->kind == CR_MENU)
+      footer(VID_GLYPH_X " change   " VID_GLYPH_TRI " default   "
+             VID_GLYPH_O " back");
+   else
+      footer(VID_GLYPH_X " rebind   " VID_GLYPH_SQ " none   "
+             VID_GLYPH_TRI " default   " VID_GLYPH_O " back      "
+             "blank = disabled");
    return UI_ACT_NONE;
 }
 
 /* ----- wireless screens --------------------------------------------------- */
+/* docs/GBA-LINK-UI.md (the design: builds/linkmode-mockups).  Three games,
+ * three menus, one layout: the Host row's value is the mode it will use,
+ * and the two explainer lines name the game and say the one thing the
+ * player must know.  Only a game that links both ways asks (SCR_HOST). */
 
 enum { WL_HOST, WL_SCAN, WL_JOINCODE, WL_MGIFT, WL_BACK, WL_COUNT };
 enum { WLS_DISCONNECT, WLS_BACK, WLS_COUNT };
 
+/* One wireless-family row: 22 px pitch from y=120, the band 300 wide,
+ * the value right-aligned at its end. */
+#define WL_ROW_Y0 120
+#define WL_STATUS_ROW_Y0 136     /* hosting / linked: under three lines  */
+static void wl_row_at_w(int y, int w, int sel, int enabled, const char *label,
+                        const char *value)
+{
+   if (sel)
+      ov_band(y, w, 24);
+   vid_text(18, y, label, enabled ? (sel ? C_SEL : C_ITEM) : C_DIM);
+   if (value)
+      ov_text_right(w, y, value, enabled ? C_ACCENT_DK : C_DIM);
+}
+
+static void wl_row_at(int y, int sel, int enabled, const char *label,
+                      const char *value)
+{
+   wl_row_at_w(y, 300, sel, enabled, label, value);
+}
+
+static void wl_row(int i, int sel, const char *label, const char *value)
+{
+   wl_row_at(WL_ROW_Y0 + i * 22, sel, 1, label, value);
+}
+
+/* The Wireless screen's rows for this console: GB/GBC has no Mystery Gift
+ * (a GBA cartridge feature).  Returns the count; ids[] gets WL_* in order. */
+static int wl_rows(int ids[WL_COUNT])
+{
+   int n = 0;
+   ids[n++] = WL_HOST;
+   ids[n++] = WL_SCAN;
+   ids[n++] = WL_JOINCODE;
+   if (g_pcfg.console == FE_CONSOLE_GBA)
+      ids[n++] = WL_MGIFT;
+   ids[n++] = WL_BACK;
+   return n;
+}
+
+/* "prefix<name>suffix", the name clipped so the line fits `px`. */
+static void wl_line_name(char *out, size_t cap, const char *prefix,
+                         const char *name, const char *suffix, int px)
+{
+   char nm[64];
+   int room = px - vid_text_w(prefix) - vid_text_w(suffix);
+   snprintf(nm, sizeof(nm), "%s", name && name[0] ? name : "this game");
+   if (room < 40)
+      room = 40;
+   clip_title(nm, room);
+   snprintf(out, cap, "%s%s%s", prefix, nm, suffix);
+}
+
+/* The two explainer lines and the Host row's value, by what Host will do. */
+static void wl_explain(char *l1, size_t c1, char *l2, size_t c2,
+                       const char **host_value)
+{
+   int ov = fe_linkmode_get(&g_lm, g_game_key);
+   if (g_pcfg.console != FE_CONSOLE_GBA)
+   {
+      wl_line_name(l1, c1, "Link Cable game. The other PSP needs ",
+                   own_game_name(), ",", 436);
+      snprintf(l2, c2, "or receives it over the link.");
+      *host_value = "Link Cable";
+      return;
+   }
+   switch (ui_host_mode())
+   {
+   case UI_HOST_CABLE:
+      wl_line_name(l1, c1, "Link Cable game: both PSPs need ",
+                   own_game_name(), " open.", 436);
+      snprintf(l2, c2, "%s", ov == FE_LM_CABLE
+               ? "Link mode: Link Cable (set in Settings).  2 players."
+               : "This game has no Wireless Adapter mode.  2 players.");
+      *host_value = "Link Cable";
+      break;
+   case UI_HOST_ASK:
+      snprintf(l1, c1, "This game links two ways. The host chooses; Join "
+               "follows.");
+      snprintf(l2, c2, "Both PSPs must be in the same room.");
+      *host_value = "Link Cable / Wireless Adapter";
+      break;
+   default:
+      snprintf(l1, c1, "Wireless Adapter game. Both PSPs need the same "
+               "room.");
+      snprintf(l2, c2, "%s", ov == FE_LM_ADAPTER
+               ? "Link mode: Wireless Adapter (set in Settings)."
+               : "The game decides who plays with whom.");
+      *host_value = "Wireless Adapter";
+      break;
+   }
+}
+
+/* Join room N (the Settings room).  A game that can only enter one kind of
+ * room joins that room's exact name; a game that can enter both (and every
+ * GB/GBC console, whose host's name carries ITS cartridge) scans first --
+ * screen_scan with g_scan_room set, which ends in scan_resolve_room: one
+ * found = join it, both = ask (owner, 2026-10-03), none = not found. */
+static int g_scan_room = -1;
+
+static ui_action wl_join_room(void)
+{
+   char grp[9];
+   int nn = room_number(g_pcfg.group), cab = join_can_cable(),
+       ada = join_can_adapter(), gba = g_pcfg.console == FE_CONSOLE_GBA;
+   if (nn < 0)
+   {
+      /* a hand-edited group: join it verbatim, as 3.1 did */
+      snprintf(g_join_group, sizeof(g_join_group), "%s", g_pcfg.group);
+      screen_to(SCR_MENU);
+      return UI_ACT_NET_JOIN;
+   }
+   if (gba && cab != ada)
+   {
+      char code[5];
+      room_code_gba(g_game_code, code);
+      room_make(cab ? ROOM_CABLE_GBA : ROOM_ADAPTER, nn, code, grp,
+                sizeof(grp));
+      snprintf(g_join_group, sizeof(g_join_group), "%s", grp);
+      screen_to(SCR_MENU);
+      return UI_ACT_NET_JOIN;
+   }
+   g_scan_count = -1;
+   screen_to(SCR_SCAN);
+   g_scan_room = nn;
+   return UI_ACT_NONE;
+}
+
+/* The scan Join room N asked for is in: decide (see wl_join_room). */
+static ui_action scan_resolve_room(int nn, int n)
+{
+   char found_c[9] = "", found_a[9] = "", lbl[ROOM_LABEL_CAP];
+   int i, cab = join_can_cable(), ada = join_can_adapter(),
+       gba = g_pcfg.console == FE_CONSOLE_GBA;
+   room_label(g_pcfg.group, lbl, sizeof(lbl));
+   for (i = 0; i < n; i++)
+   {
+      char code[5];
+      int num, k = room_parse(g_scan_groups[i], &num, code);
+      if (num != nn)
+         continue;
+      if (gba && k == ROOM_CABLE_GBA && cab && !strcmp(code, g_game_code))
+         snprintf(found_c, sizeof(found_c), "%.8s", g_scan_groups[i]);
+      else if (gba && k == ROOM_ADAPTER && ada)
+         snprintf(found_a, sizeof(found_a), "%.8s", g_scan_groups[i]);
+      else if (!gba && k == ROOM_CABLE_GB && !found_c[0])
+         snprintf(found_c, sizeof(found_c), "%.8s", g_scan_groups[i]);
+      else if (!gba && k == ROOM_ADAPTER)
+         snprintf(found_a, sizeof(found_a), "%.8s", g_scan_groups[i]);
+   }
+   /* GB/GBC: a GB room wins; an older build's GPSPnn is tried after. */
+   if (!gba && found_c[0])
+      found_a[0] = '\0';
+   fe_evt("wl_join_room room=%d scan=%d cable=%s adapter=%s", nn, n,
+          found_c[0] ? found_c : "-", found_a[0] ? found_a : "-");
+   if (found_c[0] && found_a[0])
+   {
+      snprintf(g_ask_group[0], sizeof(g_ask_group[0]), "%s", found_c);
+      snprintf(g_ask_group[1], sizeof(g_ask_group[1]), "%s", found_a);
+      screen_to(SCR_JOINASK);
+      return UI_ACT_NONE;
+   }
+   if (!found_c[0] && !found_a[0])
+   {
+      osd_toast("%s not found - is the host still there?", lbl);
+      screen_to(SCR_WIRELESS);
+      g_cursor = WL_JOINCODE;
+      return UI_ACT_NONE;
+   }
+   snprintf(g_join_group, sizeof(g_join_group), "%s",
+            found_c[0] ? found_c : found_a);
+   screen_to(SCR_MENU);
+   return UI_ACT_NET_JOIN;
+}
+
+/* Wireless while a session is up (or a cable host waits): the status where
+ * the explainer sits, then Stop hosting / Disconnect and Back. */
+static ui_action wl_session(unsigned edges, const char *session_info)
+{
+   int hosting = g_link.state == UI_LINK_HOSTING;
+   char l2[96], l3[96];
+   if (edges & PSP_CTRL_UP)
+      g_cursor = (g_cursor + WLS_COUNT - 1) % WLS_COUNT;
+   if (edges & PSP_CTRL_DOWN)
+      g_cursor = (g_cursor + 1) % WLS_COUNT;
+   if (edges & PSP_CTRL_CIRCLE)
+      screen_to(SCR_MENU);
+   if (edges & PSP_CTRL_CROSS)
+   {
+      screen_to(SCR_MENU);
+      if (g_cursor == WLS_DISCONNECT)
+         return UI_ACT_NET_DISCONNECT;
+   }
+   l2[0] = l3[0] = '\0';
+   if (hosting)
+   {
+      snprintf(l2, sizeof(l2), "Hosting %s by Link Cable. Waiting for the "
+               "other PSP.", g_link.room);
+      wl_line_name(l3, sizeof(l3), "They open ", own_game_name(),
+                   ", then Wireless > Join.", 436);
+   }
+   else if (g_link.state == UI_LINK_LINKED && g_link.cable)
+   {
+      if (g_link.player)
+         snprintf(l2, sizeof(l2), "Link Cable, %s, Player %d.", g_link.room,
+                  g_link.player);
+      else
+         snprintf(l2, sizeof(l2), "Link Cable, %s.", g_link.room);
+      snprintf(l3, sizeof(l3), "The other PSP is linked. Only buttons cross "
+               "the air.");
+   }
+   else if (g_link.state == UI_LINK_LINKED)
+   {
+      if (g_link.player == 1)
+      {
+         snprintf(l2, sizeof(l2), "Hosting %s by Wireless Adapter.",
+                  g_link.room);
+         snprintf(l3, sizeof(l3), "The game decides who plays with whom.");
+      }
+      else
+      {
+         snprintf(l2, sizeof(l2), "Wireless Adapter, %s.", g_link.room);
+         snprintf(l3, sizeof(l3), "The other PSP is in the room.");
+      }
+   }
+   else
+      snprintf(l2, sizeof(l2), "%s",
+               session_info && session_info[0] ? session_info
+                                               : "session active");
+   ov_backdrop(OV_SCRIM);
+   ov_head(NULL, "WIRELESS");
+   vid_text(22, 72, "Status", C_DIM);
+   vid_text(22, 72 + FE_FONT_H + 2, l2, C_VALUE);
+   if (l3[0])
+      vid_text(22, 72 + 2 * (FE_FONT_H + 2), l3, C_DIM);
+   wl_row_at(WL_STATUS_ROW_Y0, g_cursor == WLS_DISCONNECT, 1,
+             hosting ? "Stop hosting" : "Disconnect", NULL);
+   wl_row_at(WL_STATUS_ROW_Y0 + 22, g_cursor == WLS_BACK, 1, "Back", NULL);
+   footer(VID_GLYPH_X " select   " VID_GLYPH_O " back");
+   return UI_ACT_NONE;
+}
+
 static ui_action screen_wireless(unsigned edges, int session_active,
                                  const char *session_info)
 {
-   if (session_active)
-   {
-      if (edges & PSP_CTRL_UP)
-         g_cursor = (g_cursor + WLS_COUNT - 1) % WLS_COUNT;
-      if (edges & PSP_CTRL_DOWN)
-         g_cursor = (g_cursor + 1) % WLS_COUNT;
-      if (edges & PSP_CTRL_CIRCLE)
-         screen_to(SCR_MENU);
-      if (edges & PSP_CTRL_CROSS)
-      {
-         if (g_cursor == WLS_DISCONNECT)
-         {
-            screen_to(SCR_MENU);
-            return UI_ACT_NET_DISCONNECT;
-         }
-         screen_to(SCR_MENU);
-      }
-      page("WIRELESS", "LINKED");
-      /* status card */
-      vid_rect(62, 62, 360, 54, C_SHADOW, 90);
-      vid_rect(58, 58, 360, 54, C_CARD, 235);
-      vid_rect(58, 58, 360, 2, C_ACCENT, 255);
-      vid_text(74, 66, "Status", C_DIM);
-      vid_text(74, 88, session_info ? session_info : "session active",
-               C_VALUE);
-      row(58, 140, 360, g_cursor == WLS_DISCONNECT, 1, "Disconnect", NULL);
-      row(58, 162, 360, g_cursor == WLS_BACK, 1, "Back", NULL);
-      footer("X select   O back");
-      return UI_ACT_NONE;
-   }
+   int ids[WL_COUNT], n = wl_rows(ids), i, id;
+   char l1[96], l2[96], lbl[ROOM_LABEL_CAP];
+   const char *host_value = NULL;
 
+   if (session_active || g_link.state != UI_LINK_OFF)
+      return wl_session(edges, session_info);
+
+   if (g_cursor >= n)
+      g_cursor = 0;
    if (edges & PSP_CTRL_UP)
-      g_cursor = (g_cursor + WL_COUNT - 1) % WL_COUNT;
+      g_cursor = (g_cursor + n - 1) % n;
    if (edges & PSP_CTRL_DOWN)
-      g_cursor = (g_cursor + 1) % WL_COUNT;
-   if (g_cursor == WL_JOINCODE)
+      g_cursor = (g_cursor + 1) % n;
+   id = ids[g_cursor];
+   if (id == WL_JOINCODE)
    {
       if (edges & PSP_CTRL_LEFT)
          settings_adjust(SET_ROOM, -1);
@@ -911,20 +2918,25 @@ static ui_action screen_wireless(unsigned edges, int session_active,
       screen_to(SCR_MENU);
    if (edges & PSP_CTRL_CROSS)
    {
-      switch (g_cursor)
+      switch (id)
       {
       case WL_HOST:
+         if (ui_host_mode() == UI_HOST_ASK)
+         {
+            screen_to(SCR_HOST);
+            return UI_ACT_NONE;
+         }
+         g_host_cable = ui_host_mode() == UI_HOST_CABLE;
          snprintf(g_join_group, sizeof(g_join_group), "%s", g_pcfg.group);
          screen_to(SCR_MENU);
          return UI_ACT_NET_HOST;
       case WL_SCAN:
          g_scan_count = -1;
+         g_scan_room = -1;
          screen_to(SCR_SCAN);
          return UI_ACT_NONE;
       case WL_JOINCODE:
-         snprintf(g_join_group, sizeof(g_join_group), "%s", g_pcfg.group);
-         screen_to(SCR_MENU);
-         return UI_ACT_NET_JOIN;
+         return wl_join_room();
       case WL_MGIFT:
          /* Navigate only.  The Mystery Gift screen starts the radio, because
           * the player has to pick WHICH saved network to join first -- see the
@@ -937,18 +2949,114 @@ static ui_action screen_wireless(unsigned edges, int session_active,
       }
    }
 
-   page("WIRELESS", g_pcfg.group);
-   vid_text(36, HDR_H + 16, "Link two PSPs over ad-hoc WiFi.  Both consoles",
-            C_DIM);
-   vid_text(36, HDR_H + 16 + FE_FONT_H + 2, "must use the same room code.",
-            C_DIM);
-   row(36, 106, 408, g_cursor == WL_HOST, 1, "Host session", NULL);
-   row(36, 128, 408, g_cursor == WL_SCAN, 1, "Join: scan for rooms", NULL);
-   row(36, 150, 408, g_cursor == WL_JOINCODE, 1, "Join room code",
-       g_pcfg.group);
-   row(36, 172, 408, g_cursor == WL_MGIFT, 1, "Mystery Gift", "phone");
-   row(36, 194, 408, g_cursor == WL_BACK, 1, "Back", NULL);
-   footer("X select   DPAD change code   O back");
+   wl_explain(l1, sizeof(l1), l2, sizeof(l2), &host_value);
+   ov_backdrop(OV_SCRIM);
+   ov_head(NULL, "WIRELESS");
+   vid_text(22, 72, l1, C_DIM);
+   vid_text(22, 72 + FE_FONT_H + 2, l2, C_DIM);
+   for (i = 0; i < n; i++)
+   {
+      switch (ids[i])
+      {
+      case WL_HOST:
+         wl_row(i, g_cursor == i, "Host", host_value);
+         break;
+      case WL_SCAN:
+         wl_row(i, g_cursor == i, "Join: scan for rooms", NULL);
+         break;
+      case WL_JOINCODE:
+         wl_row(i, g_cursor == i, "Join room",
+                room_label(g_pcfg.group, lbl, sizeof(lbl)));
+         break;
+      case WL_MGIFT:
+         wl_row(i, g_cursor == i, "Mystery Gift", "phone");
+         break;
+      default:
+         wl_row(i, g_cursor == i, "Back", NULL);
+         break;
+      }
+   }
+   footer(VID_GLYPH_X " select   DPAD change room   " VID_GLYPH_O " back");
+   return UI_ACT_NONE;
+}
+
+/* HOST, for a game that links both ways: the one question, asked once. */
+static ui_action screen_host(unsigned edges)
+{
+   enum { HC_CABLE, HC_ADAPTER, HC_BACK, HC_COUNT };
+   if (edges & PSP_CTRL_UP)
+      g_cursor = (g_cursor + HC_COUNT - 1) % HC_COUNT;
+   if (edges & PSP_CTRL_DOWN)
+      g_cursor = (g_cursor + 1) % HC_COUNT;
+   if (edges & PSP_CTRL_CIRCLE)
+   {
+      screen_to(SCR_WIRELESS);
+      return UI_ACT_NONE;
+   }
+   if (edges & PSP_CTRL_CROSS)
+   {
+      if (g_cursor == HC_BACK)
+      {
+         screen_to(SCR_WIRELESS);
+         return UI_ACT_NONE;
+      }
+      g_host_cable = g_cursor == HC_CABLE;
+      snprintf(g_join_group, sizeof(g_join_group), "%s", g_pcfg.group);
+      screen_to(SCR_MENU);
+      return UI_ACT_NET_HOST;
+   }
+   ov_backdrop(OV_SCRIM);
+   ov_head(g_ov_title, "HOST");
+   vid_text(22, 72, "How will the other PSP connect?", C_ITEM);
+   /* 460 wide, not the Wireless rows' 300: "Wireless Adapter" and its note
+    * do not both fit in 300 px (the design's own render overlapped them). */
+   wl_row_at_w(104, 460, g_cursor == HC_CABLE, 1, "Link Cable",
+               "both PSPs need this game");
+   wl_row_at_w(126, 460, g_cursor == HC_ADAPTER, 1, "Wireless Adapter",
+               "the game's wireless mode");
+   wl_row_at_w(148, 460, g_cursor == HC_BACK, 1, "Back", NULL);
+   footer(VID_GLYPH_X " host   " VID_GLYPH_O " back");
+   return UI_ACT_NONE;
+}
+
+/* Join room N found BOTH a Link Cable and a Wireless Adapter Room N: ask
+ * (owner, 2026-10-03). */
+static ui_action screen_joinask(unsigned edges)
+{
+   enum { JA_CABLE, JA_ADAPTER, JA_BACK, JA_COUNT };
+   char lbl[ROOM_LABEL_CAP], q[64];
+   if (edges & PSP_CTRL_UP)
+      g_cursor = (g_cursor + JA_COUNT - 1) % JA_COUNT;
+   if (edges & PSP_CTRL_DOWN)
+      g_cursor = (g_cursor + 1) % JA_COUNT;
+   if (edges & PSP_CTRL_CIRCLE)
+   {
+      screen_to(SCR_WIRELESS);
+      return UI_ACT_NONE;
+   }
+   if (edges & PSP_CTRL_CROSS)
+   {
+      if (g_cursor == JA_BACK)
+      {
+         screen_to(SCR_WIRELESS);
+         return UI_ACT_NONE;
+      }
+      snprintf(g_join_group, sizeof(g_join_group), "%s",
+               g_ask_group[g_cursor == JA_CABLE ? 0 : 1]);
+      screen_to(SCR_MENU);
+      return UI_ACT_NET_JOIN;
+   }
+   room_label(g_ask_group[0], lbl, sizeof(lbl));
+   snprintf(q, sizeof(q), "%s is open two ways. Which one?", lbl);
+   ov_backdrop(OV_SCRIM);
+   ov_head(g_ov_title, "JOIN");
+   vid_text(22, 72, q, C_ITEM);
+   wl_row_at_w(104, 460, g_cursor == JA_CABLE, 1, "Link Cable",
+               own_game_name());
+   wl_row_at_w(126, 460, g_cursor == JA_ADAPTER, 1, "Wireless Adapter",
+               "the game's wireless mode");
+   wl_row_at_w(148, 460, g_cursor == JA_BACK, 1, "Back", NULL);
+   footer(VID_GLYPH_X " join   " VID_GLYPH_O " back");
    return UI_ACT_NONE;
 }
 
@@ -1023,15 +3131,13 @@ static ui_action screen_mgift(unsigned edges)
          screen_to(SCR_WIRELESS);
    }
 
-   page("MYSTERY GIFT", running ? "LISTENING" : "OFF");
-
-   vid_rect(62, 62, 360, 76, C_SHADOW, 90);
-   vid_rect(58, 58, 360, 76, C_CARD, 235);
-   vid_rect(58, 58, 360, 2, C_ACCENT, 255);
-   vid_text(74, 66, "Station", C_DIM);
-   vid_text(74, 88, l1 && l1[0] ? l1 : "not started", C_VALUE);
+   ov_backdrop(OV_SCRIM);
+   ov_head(NULL, "MYSTERY GIFT");
+   ov_text_right(460, 48, running ? "LISTENING" : "OFF", C_DIM);
+   /* The station's two lines where the wireless explainer sits. */
+   vid_text(22, 72, l1 && l1[0] ? l1 : "Station not started", C_VALUE);
    if (l2 && l2[0])
-      vid_text(74, 110, l2, C_ITEM);
+      vid_text(22, 72 + FE_FONT_H + 2, l2, C_ITEM);
 
    /* WHAT TO SET THE PHONE TO.  The connection profile is made for us, so the
     * only thing the player has to get right is the hotspot itself -- and the
@@ -1039,8 +3145,9 @@ static ui_action screen_mgift(unsigned edges)
     * Spelling it out here beats a README they do not have on them. */
    if (!running)
    {
-      vid_text(58, 216, "Phone: Mobile Hotspot named  Mystery Gift", C_DIM);
-      vid_text(58, 232, "Security: Open    Band: 2.4 GHz", C_DIM);
+      vid_text(22, 196, "Phone: Mobile Hotspot named  Mystery Gift", C_DIM);
+      vid_text(22, 196 + FE_FONT_H + 2, "Security: Open    Band: 2.4 GHz",
+               C_DIM);
    }
 
    /* Name the profile, so "which network is this going to join" is answered on
@@ -1051,99 +3158,202 @@ static ui_action screen_mgift(unsigned edges)
    else if (mgnet_config_name(g_mg_conf, cname, sizeof(cname)) != 0 || !cname[0])
       snprintf(cname, sizeof(cname), "connection %d", g_mg_conf);
 
-   row(58, 150, 360, g_cursor == MGF_NET, !running, "Network", cname);
-   row(58, 172, 360, g_cursor == MGF_START, 1,
-       running ? "Stop listening" : "Start listening", NULL);
-   row(58, 194, 360, g_cursor == MGF_BACK, 1, "Back", NULL);
+   wl_row_at(WL_ROW_Y0, g_cursor == MGF_NET, !running, "Network", cname);
+   wl_row(1, g_cursor == MGF_START,
+          running ? "Stop listening" : "Start listening", NULL);
+   wl_row(2, g_cursor == MGF_BACK, "Back", NULL);
 
    if (running)
-      footer("X select   O back (keeps listening)");
+      footer(VID_GLYPH_X " select   " VID_GLYPH_O " back (keeps listening)");
    else if (g_mg_conf == 0)
-      footer("SELECT+DOWN toggles in game.  X start   O back");
+      footer("SELECT+DOWN toggles in game.  " VID_GLYPH_X " start   "
+             VID_GLYPH_O " back");
    else
-      footer("DPAD pick network   X start   O back");
+      footer("DPAD pick network   " VID_GLYPH_X " start   " VID_GLYPH_O
+             " back");
    return UI_ACT_NONE;
+}
+
+/* The scan list: three columns, room / mode / game (docs/GBA-LINK-UI.md).
+ * A row this game can join is lit; the others are dimmed but still listed,
+ * so "my friend's room is there, why can't I join" is answered on the spot:
+ * X on a dimmed row puts the reason on a plate where the footer was, and
+ * the next d-pad press clears it.  Join room N comes through here too when
+ * it must look first (g_scan_room). */
+#define SCAN_X_MODE  96
+#define SCAN_X_TITLE 226
+#define SCAN_X_END   456
+
+/* Harness `ui_scan_fake = GPSP07,GC07BPEE,...`: the scan answers with these
+ * group names instead of the radio, so every scan-list state of the design
+ * can be photographed on one console (docs/GBA-LINK-UI.md).  "-" = none. */
+static char g_scan_fake[96];
+void ui_scan_fake_set(const char *csv)
+{
+   snprintf(g_scan_fake, sizeof(g_scan_fake), "%s", csv ? csv : "");
+}
+
+static int scan_fake_fill(void)
+{
+   const char *p = g_scan_fake;
+   int n = 0;
+   if (!strcmp(g_scan_fake, "-"))
+      return 0;
+   while (*p && n < 8)
+   {
+      int k = 0;
+      while (*p && *p != ',' && k < 8)
+         g_scan_groups[n][k++] = *p++;
+      g_scan_groups[n][k] = '\0';
+      while (*p && *p != ',')
+         p++;
+      if (*p == ',')
+         p++;
+      if (k)
+         n++;
+   }
+   return n;
 }
 
 static ui_action screen_scan(unsigned edges)
 {
-   int rows = (g_scan_count > 0 ? g_scan_count : 1) + 1;
+   int rows = (g_scan_count > 0 ? g_scan_count : 0) + 1;
+   int i;
 
    if (g_scan_count < 0)
    {
       /* Draw one "scanning" frame; the blocking scan runs on the NEXT
        * frame so the message is visible during the wait. */
       static int drew_notice;
-      page("WIRELESS", "SCANNING");
-      vid_text_center(120, "Searching for rooms (10s)...", C_ITEM);
-      vid_rect(140, 148, 200, 3, C_ACCENT_DK, 200);
+      ov_backdrop(OV_SCRIM);
+      ov_head(NULL, "WIRELESS");
+      ov_text_right(460, 48, "SCANNING", C_DIM);
+      if (g_scan_room >= 0)
+      {
+         char lbl[ROOM_LABEL_CAP], t[48];
+         snprintf(t, sizeof(t), "Looking for %s (10 s)...",
+                  room_label(g_pcfg.group, lbl, sizeof(lbl)));
+         vid_text(22, 72, t, C_ITEM);
+      }
+      else
+         vid_text(22, 72, "Searching for rooms (10 s)...", C_ITEM);
+      vid_rect(22, 72 + FE_FONT_H + 8, 200, 3, C_ACCENT_DK, 200);
       if (drew_notice)
       {
-         int n = adhoc_transport_scan(g_scan_groups, 8, 0);
+         int n = g_scan_fake[0] ? scan_fake_fill()
+                                : adhoc_transport_scan(g_scan_groups, 8, 0);
          g_scan_count = (n < 0) ? 0 : n;
+         g_scan_note[0] = '\0';
          fe_evt("wl_scan result=%d rc_stage=%s", n, adhoc_transport_stage());
-         if (n == ADHOC_ERR_WLAN_OFF)
-            osd_toast("WLAN switch is OFF");
+         for (i = 0; i < g_scan_count; i++)
+            fe_evt("wl_scan_room i=%d group=%s", i, g_scan_groups[i]);
          drew_notice = 0;
+         if (n == ADHOC_ERR_WLAN_OFF)
+         {
+            osd_toast("WLAN switch is OFF");
+            g_scan_room = -1;
+         }
+         if (g_scan_room >= 0)
+         {
+            int nn = g_scan_room;
+            g_scan_room = -1;
+            return scan_resolve_room(nn, g_scan_count);
+         }
       }
       else
          drew_notice = 1;
       return UI_ACT_NONE;
    }
 
+   if (edges & (PSP_CTRL_UP | PSP_CTRL_DOWN | PSP_CTRL_LEFT | PSP_CTRL_RIGHT))
+      g_scan_note[0] = '\0';         /* read; the footer comes back */
    if (edges & PSP_CTRL_UP)
       g_cursor = (g_cursor + rows - 1) % rows;
    if (edges & PSP_CTRL_DOWN)
       g_cursor = (g_cursor + 1) % rows;
    if (edges & PSP_CTRL_CIRCLE)
       screen_to(SCR_WIRELESS);
-   if (edges & PSP_CTRL_CROSS)
+   else if (edges & PSP_CTRL_CROSS)
    {
       if (g_scan_count > 0 && g_cursor < g_scan_count)
       {
-         snprintf(g_join_group, sizeof(g_join_group), "%s",
-                  g_scan_groups[g_cursor]);
-         screen_to(SCR_MENU);
-         return UI_ACT_NET_JOIN;
+         scan_row r;
+         scan_row_decide(g_scan_groups[g_cursor], &r);
+         if (r.ok)
+         {
+            snprintf(g_join_group, sizeof(g_join_group), "%s",
+                     g_scan_groups[g_cursor]);
+            screen_to(SCR_MENU);
+            return UI_ACT_NET_JOIN;
+         }
+         snprintf(g_scan_note, sizeof(g_scan_note), "%s", r.plate);
+         fe_evt("wl_scan_refused group=%s why=\"%s\"",
+                g_scan_groups[g_cursor], r.plate);
       }
-      screen_to(SCR_WIRELESS);
+      else
+         screen_to(SCR_WIRELESS);
    }
+   if (g_screen != SCR_SCAN)
+      return UI_ACT_NONE;
 
-   page("WIRELESS", g_scan_count ? "ROOMS FOUND" : "NO ROOMS");
+   ov_backdrop(OV_SCRIM);
+   ov_head(NULL, "WIRELESS");
+   ov_text_right(460, 48, g_scan_count ? "ROOMS FOUND" : "NO ROOMS", C_DIM);
    if (g_scan_count > 0)
    {
-      int i;
+      /* Up to eight rooms + Back from y=72: the explainer has nothing to
+       * say here, so the list takes its place. */
       for (i = 0; i < g_scan_count; i++)
-         row(36, HDR_H + 16 + i * 22, 408, g_cursor == i, 1,
-             g_scan_groups[i], NULL);
-      row(36, HDR_H + 16 + g_scan_count * 22, 408,
-          g_cursor == g_scan_count, 1, "Back", NULL);
+      {
+         char lbl[ROOM_LABEL_CAP], t[64];
+         scan_row r;
+         int y = 72 + i * 20, sel = g_cursor == i;
+         scan_row_decide(g_scan_groups[i], &r);
+         if (sel)
+            ov_band(y, 460, 24);
+         vid_text(18, y, room_label(g_scan_groups[i], lbl, sizeof(lbl)),
+                  r.ok ? (sel ? C_SEL : C_ITEM) : C_DIM);
+         if (r.mode[0])
+            vid_text(SCAN_X_MODE, y, r.mode, r.ok ? C_ACCENT_DK : C_DIM);
+         if (r.title[0])
+         {
+            snprintf(t, sizeof(t), "%s", r.title);
+            clip_title(t, SCAN_X_END - SCAN_X_TITLE);
+            vid_text(SCAN_X_TITLE, y, t, r.ok ? C_ITEM : C_DIM);
+         }
+      }
+      wl_row_at(72 + g_scan_count * 20, g_cursor == g_scan_count, 1, "Back",
+                NULL);
    }
    else
    {
-      vid_text_center(HDR_H + 24, "No rooms answered the scan.", C_DIM);
-      vid_text_center(HDR_H + 24 + FE_FONT_H + 2,
-                      "Have the other PSP host first, then rescan.", C_DIM);
-      row(36, HDR_H + 76, 408, 1, 1, "Back", NULL);
+      vid_text(22, 72, "No rooms answered the scan.", C_DIM);
+      vid_text(22, 72 + FE_FONT_H + 2,
+               "Have the other PSP host first, then rescan.", C_DIM);
+      wl_row(0, 1, "Back", NULL);
    }
-   footer("X join   O back");
+   if (g_scan_note[0])
+      ov_plate(g_scan_note);
+   else
+      footer(VID_GLYPH_X " join   " VID_GLYPH_O " back");
    return UI_ACT_NONE;
 }
 
 /* ----- main menu ---------------------------------------------------------- */
 
 /* M_GAMELIST sits after Settings so the demo script's fixed row counts for
- * rows 0-4 stay valid (it never navigates past Settings). */
-enum { M_RESUME, M_SAVESTATE, M_LOADSTATE, M_WIRELESS, M_SETTINGS, M_GAMELIST,
+ * rows 0-3 stay valid (it never navigates past Settings).  Save and load are
+ * one row and one page since 3.5 (docs/UI-OVERLAY.md section 13). */
+enum { M_RESUME, M_SAVESTATES, M_WIRELESS, M_SETTINGS, M_GAMELIST,
        M_EXIT, M_COUNT };
 
 static ui_action screen_menu(unsigned edges, int session_active)
 {
    static const char *labels[M_COUNT] = {
-      "Resume", "Save state", "Load state", "Wireless", "Settings",
+      "Resume", "Save states", "Wireless", "Settings",
       "Quit to game list", "Exit"
    };
-   int i, top;
+   int i, k, fade, dy;
 
    if (edges & PSP_CTRL_UP)
       g_cursor = (g_cursor + M_COUNT - 1) % M_COUNT;
@@ -1156,26 +3366,15 @@ static ui_action screen_menu(unsigned edges, int session_active)
       switch (g_cursor)
       {
       case M_RESUME:    return UI_ACT_RESUME;
-      case M_SAVESTATE:
+      case M_SAVESTATES:
          if (session_active)
          {
             osd_toast("Savestates locked during wireless session");
             break;
          }
-         g_state_save_mode = 1;
          g_state_slot = 1;
          screen_to(SCR_STATE_SLOTS);
-         break;
-      case M_LOADSTATE:
-         if (session_active)
-         {
-            osd_toast("Savestates locked during wireless session");
-            break;
-         }
-         g_state_save_mode = 0;
-         g_state_slot = 1;
-         screen_to(SCR_STATE_SLOTS);
-         break;
+         return screen_state_slots(0);   /* draw this frame as the new page */
       case M_WIRELESS:  screen_to(SCR_WIRELESS); break;
       case M_SETTINGS:  screen_to(SCR_SETTINGS); break;
       case M_GAMELIST:  return UI_ACT_GAMELIST;
@@ -1183,69 +3382,540 @@ static ui_action screen_menu(unsigned edges, int session_active)
       }
    }
 
-   page("GBAdhoc", session_active ? "LINKED" : g_pcfg.group);
-   top = HDR_H + 22;
+   /* THE OPENING: over OV_OPEN_FRAMES frames the scrim comes up from 0 to
+    * 170 and the rows rise 8 px into place, their colour walked out of the
+    * background (the GE has no text alpha -- see mix565).  The selection
+    * band lands on the last frame. */
+   if (g_ov_open_k < OV_OPEN_FRAMES)
+      g_ov_open_k++;
+   k    = g_ov_open_k;
+   fade = 256 * (OV_OPEN_FRAMES - k) / OV_OPEN_FRAMES;
+   dy   = 8 * (OV_OPEN_FRAMES - k) / OV_OPEN_FRAMES;
+
+   ov_backdrop(OV_SCRIM * k / OV_OPEN_FRAMES);
+   ov_head(g_ov_title, NULL);
    for (i = 0; i < M_COUNT; i++)
    {
-      int enabled = !((i == M_SAVESTATE || i == M_LOADSTATE) &&
-                      session_active);
-      const char *val = (i == M_WIRELESS && session_active) ? "linked" : NULL;
-      row(120, top + i * 26, 240, g_cursor == i, enabled, labels[i], val);
+      int y = 88 + i * 22 + dy;
+      int enabled = !(i == M_SAVESTATES && session_active);
+      uint16_t c = !enabled ? C_DIM : (i == g_cursor ? C_SEL : C_ITEM);
+      if (i == g_cursor && k >= OV_OPEN_FRAMES)
+         ov_band(y, vid_text_w(labels[i]) + 44, 24);
+      vid_text(18, y, labels[i], mix565(c, C_BG_BOT, fade));
+      /* The Wireless row carries the session's mode where it used to
+       * say "linked" (docs/GBA-LINK-UI.md); a cable host waiting says so. */
+      if (i == M_WIRELESS && (session_active || g_link.state))
+         vid_text(18 + vid_text_w(labels[i]) + 12, y,
+                  g_link.state == UI_LINK_HOSTING ? "hosting" :
+                  g_link.state == UI_LINK_LINKED
+                     ? (g_link.cable ? "Link Cable" : "Wireless Adapter")
+                     : "linked",
+                  mix565(C_ACCENT_DK, C_BG_BOT, fade));
+      /* Save states: how many slots hold a state (the open-time stat). */
+      if (i == M_SAVESTATES && enabled)
+      {
+         char used[24];
+         snprintf(used, sizeof(used), "%d of %d used", g_ov_used,
+                  PSP_STATE_SLOT_COUNT);
+         vid_text(18 + vid_text_w(labels[i]) + 12, y, used,
+                  mix565(C_ACCENT_DK, C_BG_BOT, fade));
+      }
    }
-   footer("X select   O resume");
+   footer(VID_GLYPH_X " select     " VID_GLYPH_O " resume");
    return UI_ACT_NONE;
+}
+
+/* DELETE A SAVE STATE (docs/CONTROL-REMAP.md section 11).  The three names
+ * come from psp_state_delete_paths(), which can only ever produce the slot's
+ * .stN, its .stN.thumb and its .stN.shot -- never the ROM, the .sav or
+ * another slot -- and the previews go only once the state itself is gone (or
+ * was never there), so a refused remove cannot leave a state without its
+ * picture.  0 = the slot is now empty. */
+static int state_delete(const char *slot1_path, unsigned slot)
+{
+   char st[PSP_FILE_PATH_CAP], th[PSP_STATE_THUMB_PATH_CAP];
+   char sh[PSP_STATE_SHOT_PATH_CAP];
+   SceIoStat sst;
+   int rc;
+   if (psp_state_delete_paths(st, sizeof(st), th, sizeof(th), sh, sizeof(sh),
+                              slot1_path, slot) != 0)
+   {
+      fe_evt("state_delete slot=%u rc=bad_path", slot);
+      return -1;
+   }
+   /* Success is judged by the file being GONE, not by the return code:
+    * PPSSPP returns 0 from sceIoRemove whenever the file existed, removed
+    * or not (its case-folding retry can miss a FAT short name such as
+    * FIRERED.st0), and a report that says "deleted" over a state still on
+    * the stick would be worse than no feature. */
+   rc = sceIoRemove(st);
+   if (sceIoGetstat(st, &sst) >= 0)
+   {
+      FE_EVT_ONLY(rc);
+      fe_evt("state_delete slot=%u rc=0x%08X", slot, (unsigned)rc);
+      return -1;
+   }
+   (void)sceIoRemove(th);      /* an "old" state never had one */
+   (void)sceIoRemove(sh);      /* nor a 3.1 one this */
+   fe_evt("state_delete slot=%u file=%s", slot, st);
+   return 0;
+}
+
+/* One state's preview into slot i's texture: the compact .thumb the save
+ * path writes beside it (state_slots.h), validated exactly as the browser's
+ * state shelf validates it.  0 = a preview is there. */
+static int state_thumb_read(const char *state_path, uint16_t *dst)
+{
+   char thumb_path[PSP_STATE_THUMB_PATH_CAP];
+   unsigned char hdr[PSP_STATE_THUMB_HEADER_SIZE];
+   size_t bytes = (size_t)PSP_STATE_THUMB_WIDTH * PSP_STATE_THUMB_HEIGHT * 2;
+   SceUID fd;
+   int ok;
+   if (psp_state_thumb_path(thumb_path, sizeof(thumb_path), state_path) != 0)
+      return -1;
+   fd = sceIoOpen(thumb_path, PSP_O_RDONLY, 0);
+   if (fd < 0)
+      return -1;
+   ok = sceIoRead(fd, hdr, sizeof(hdr)) == sizeof(hdr) &&
+        memcmp(hdr, PSP_STATE_THUMB_MAGIC, 4) == 0 &&
+        hdr[4] == PSP_STATE_THUMB_WIDTH && hdr[5] == 0 &&
+        hdr[6] == PSP_STATE_THUMB_HEIGHT && hdr[7] == 0 &&
+        hdr[8] == PSP_STATE_THUMB_WIDTH && hdr[9] == 0 &&
+        sceIoRead(fd, dst, bytes) == (int)bytes;
+   sceIoClose(fd);
+   return ok ? 0 : -1;
+}
+
+/* "3 Oct 2026, 14:32" from a stat's st_mtime: the six fields as the kernel
+ * stamped them from the console's own clock (the RTC quirks are time()'s,
+ * memory rtc-wallclock-psp; no libc time conversion is involved).  "" when
+ * the fields are not a date. */
+static void ov_stamp(char *out, size_t n, const ScePspDateTime *t)
+{
+   static const char *mon[12] = { "Jan", "Feb", "Mar", "Apr", "May", "Jun",
+                                  "Jul", "Aug", "Sep", "Oct", "Nov", "Dec" };
+   if (!t || t->month < 1 || t->month > 12 || t->day < 1 || t->day > 31 ||
+       t->hour > 23 || t->minute > 59)
+   {
+      out[0] = '\0';
+      return;
+   }
+   snprintf(out, n, "%d %s %d, %02d:%02d", t->day, mon[t->month - 1],
+            t->year, t->hour, t->minute);
+}
+
+/* Which slots hold a state, and when each was saved: five stats.  Once per
+ * menu open and once per page scan -- never per frame. */
+static void ov_slots_stat_io(void)
+{
+   char path[PSP_FILE_PATH_CAP];
+   SceIoStat st;
+   int i;
+   g_ov_used = 0;
+   for (i = 0; i < PSP_STATE_SLOT_COUNT; i++)
+   {
+      g_ov_slot[i] = 0;
+      g_ov_stamp[i][0] = '\0';
+      if (!g_state_base[0] ||
+          psp_state_path_for_slot(path, sizeof(path), g_state_base,
+                                  (unsigned)i + 1) != 0 ||
+          sceIoGetstat(path, &st) < 0)
+         continue;
+      g_ov_slot[i] = 1;
+      g_ov_used++;
+      ov_stamp(g_ov_stamp[i], sizeof(g_ov_stamp[i]), &st.sce_st_mtime);
+   }
+}
+
+static void ov_slots_stat(void)
+{
+   pwr_hold("ss_read");
+   ov_slots_stat_io();
+   pwr_release();
+}
+
+/* Once, as the slots screen opens (and after a save or a delete on it):
+ * which slots hold a state, their times, and their previews into the
+ * thumbnail textures.  Five stats and at most five 5 KiB reads, with the
+ * core paused -- never inside the draw loop.  The full preview is forgotten:
+ * the slot it showed may have just changed, and it is read again on dwell. */
+static void ov_slots_scan_io(void)
+{
+   char path[PSP_FILE_PATH_CAP];
+   int i;
+   ov_slots_stat();
+   for (i = 0; i < PSP_STATE_SLOT_COUNT; i++)
+   {
+      g_ov_shot_none[i] = 0;
+      if (g_ov_slot[i] && g_ov_thumbs &&
+          psp_state_path_for_slot(path, sizeof(path), g_state_base,
+                                  (unsigned)i + 1) == 0 &&
+          state_thumb_read(path, g_ov_thumbs + (size_t)i *
+                           PSP_STATE_THUMB_WIDTH *
+                           PSP_STATE_THUMB_TEX_HEIGHT) == 0)
+         g_ov_slot[i] = 2;
+      /* What the page will draw for the slot (0 none, 1 state, 2 state +
+       * thumbnail) and its time: the GE model's input (tools/ui_model). */
+      fe_evt("ss_slot n=%d have=%d stamp=%s", i + 1, g_ov_slot[i],
+             g_ov_stamp[i]);
+   }
+   if (g_ov_thumbs)
+      sceKernelDcacheWritebackRange(g_ov_thumbs, PSP_STATE_SLOT_COUNT *
+                                    PSP_STATE_THUMB_WIDTH *
+                                    PSP_STATE_THUMB_TEX_HEIGHT * 2);
+   g_ov_shot_slot = -1;
+   g_ov_dwell = 0;
+   g_slots_dirty = 0;
+}
+
+static void ov_slots_scan(void)
+{
+   pwr_hold("ss_read");
+   ov_slots_scan_io();
+   pwr_release();
+}
+
+/* Slot i's .shot into the VRAM texture: open, the 16-byte header checked
+ * (state_slots.h psp_state_shot_check), then h rows of 256 texels in 4 KiB
+ * reads through a stack buffer, copied in through the uncached alias.  One
+ * open, at most 82 KiB, one close; nothing allocated.  0 = the texture now
+ * holds slot i (g_ov_shot_slot); -1 = it holds nothing usable. */
+static int ov_shot_read_io(int i)
+{
+   char path[PSP_FILE_PATH_CAP], shot[PSP_STATE_SHOT_PATH_CAP];
+   unsigned char hdr[PSP_STATE_THUMB_HEADER_SIZE];
+   uint16_t buf[8 * PSP_STATE_SHOT_STRIDE];             /* 4 KiB, 8 rows */
+   unsigned w, h, y;
+   SceUID fd;
+   int ok;
+   g_ov_shot_slot = -1;
+   if (i < 0 || i >= PSP_STATE_SLOT_COUNT || !vid_shot_tex() ||
+       !g_state_base[0] ||
+       psp_state_path_for_slot(path, sizeof(path), g_state_base,
+                               (unsigned)i + 1) != 0 ||
+       psp_state_shot_path(shot, sizeof(shot), path) != 0)
+      return -1;
+   fd = sceIoOpen(shot, PSP_O_RDONLY, 0);
+   if (fd < 0)
+      return -1;
+   ok = sceIoRead(fd, hdr, sizeof(hdr)) == (int)sizeof(hdr) &&
+        psp_state_shot_check(hdr, &w, &h) == 0;
+   for (y = 0; ok && y < h; y += 8)
+   {
+      unsigned n = h - y < 8 ? h - y : 8;
+      int bytes = (int)(n * PSP_STATE_SHOT_STRIDE * sizeof(uint16_t));
+      ok = sceIoRead(fd, buf, (SceSize)bytes) == bytes;
+      if (ok)
+         vid_shot_rows((int)y, buf, (int)n);
+   }
+   sceIoClose(fd);
+   if (!ok)
+      return -1;
+   g_ov_shot_slot = i;
+   g_ov_shot_w = (int)w;
+   g_ov_shot_h = (int)h;
+   return 0;
+}
+
+static int ov_shot_read(int i)
+{
+   int rc;
+   pwr_hold("ss_read");
+   rc = ov_shot_read_io(i);
+   pwr_release();
+   return rc;
+}
+
+/* Harness `shot_probe = 1` (main_psp.c): the read priced once, four times in
+ * a row on the first slot holding a .shot, as the page first opens -- one
+ * EVT line each, so hardware can confirm OV_SHOT_DWELL's premise that the
+ * read fits in a frame or two.  Then forgotten: the dwell reads as usual. */
+void ui_shot_probe_arm(int on)
+{
+   g_shot_probe = on ? 1 : 0;
+}
+
+static void ov_shot_probe(void)
+{
+   int i, n;
+   if (!g_shot_probe)
+      return;
+   g_shot_probe = 0;
+   for (i = 0; i < PSP_STATE_SLOT_COUNT; i++)
+      if (g_ov_slot[i])
+         break;
+   for (n = 1; n <= 4 && i < PSP_STATE_SLOT_COUNT; n++)
+   {
+      unsigned t0 = sceKernelGetSystemTimeLow();
+      int rc = ov_shot_read(i);
+      FE_EVT_ONLY(t0);
+      FE_EVT_ONLY(rc);
+      fe_evt("shot_read n=%d us=%u rc=%d slot=%d w=%d h=%d", n,
+             (unsigned)(sceKernelGetSystemTimeLow() - t0), rc, i + 1,
+             rc == 0 ? g_ov_shot_w : 0, rc == 0 ? g_ov_shot_h : 0);
+   }
+   g_ov_shot_slot = -1;
+}
+
+/* The main loop's answer to UI_ACT_SAVESTATE / UI_ACT_LOADSTATE.  A save
+ * keeps the page open and says so on its plate (the next frame rescans: one
+ * stat and one thumb read; the picture comes back on dwell); a load closes
+ * the menu, back into the game -- or, if it failed, stays and says so.
+ * Return 1 when the page reported it (no toast wanted). */
+int ui_state_save_done(int rc)
+{
+   int s = g_slot_saving;
+   g_slot_saving = 0;
+   if (!g_active || g_screen != SCR_STATE_SLOTS || !s)
+      return 0;
+   snprintf(g_slot_note, sizeof(g_slot_note),
+            rc == 0 ? "Slot %d saved" : "Slot %d could not be saved", s);
+   g_slots_dirty = 1;
+   return 1;
+}
+
+int ui_state_load_done(int rc)
+{
+   if (!g_active || g_screen != SCR_STATE_SLOTS)
+      return 0;
+   if (rc == 0)
+   {
+      ui_close();
+      return 0;                  /* the toast says it, over the game */
+   }
+   snprintf(g_slot_note, sizeof(g_slot_note), "Slot %d could not be loaded",
+            g_state_slot);
+   return 1;
+}
+
+/* THE SAVE STATES PAGE (docs/UI-OVERLAY.md section 13; Fable's direction A,
+ * "Split", builds/savestate-mockups/README.md section 6).  One page for save
+ * and load: the five slots on the left (the 64x42 thumbnail, the slot, its
+ * time), the highlighted slot's picture 1:1 on the right.
+ *
+ *   X  load at once and back into the game     (empty: says so, plate)
+ *   [] save; over a saved slot the plate asks first; the page stays open
+ *   /\ delete, after the plate's question        (empty: nothing)
+ *   O  back to the menu
+ *
+ * Only load is immediate, and it sits on the key that always meant "go"
+ * here.  Both destructive actions have their own key AND a question, and
+ * while a question is up X answers it and every other key keeps the slot,
+ * so an X meant for "overwrite" or "delete" can never load instead. */
+#define SS_ROW_Y(i)  (72 + 34 * (i))
+#define SS_PX 228                /* the preview panel */
+#define SS_PY 62
+#define SS_PW 240
+#define SS_PH 160
+
+static void ss_panel(int i)
+{
+   const int x = SS_PX, y = SS_PY, w = SS_PW, h = SS_PH;
+   const uint16_t *th = g_ov_thumbs ? g_ov_thumbs + (size_t)i *
+                        PSP_STATE_THUMB_WIDTH * PSP_STATE_THUMB_TEX_HEIGHT
+                                    : NULL;
+   vid_rect(x + 3, y + 3, w, h, C_SHADOW, 90);
+   if (!g_ov_slot[i])
+   {
+      static const char l1[] = "Nothing saved here";
+      static const char l2[] = VID_GLYPH_SQ " save";
+      vid_rect(x, y, w, h, C_CARD, 230);
+      ov_outline(x, y, w, h, C_ACCENT_DK, 120);
+      vid_text(x + (w - vid_text_w(l1)) / 2, y + h / 2 - 18, l1, C_DIM);
+      vid_text(x + (w - vid_text_w(l2)) / 2, y + h / 2 + 2, l2, C_ITEM);
+      return;
+   }
+   if (g_ov_shot_slot == i)
+   {
+      /* 1:1, nearest: the frame exactly as the player saw it.  GB/GBC
+       * (160x144) sits centred on a plate. */
+      int sw = g_ov_shot_w, sh = g_ov_shot_h;
+      if (sw != w || sh != h)
+         vid_rect(x, y, w, h, C_CARD, 255);
+      vid_shot_draw(x + (w - sw) / 2, y + (h - sh) / 2, sw, sh);
+      ov_outline(x, y, w, h, C_ACCENT_DK, 120);
+      return;
+   }
+   /* No full picture (yet): the 64x42 thumbnail at 2x, nearest -- while the
+    * read has not landed, for a 3.1 state for good (captioned), and always
+    * when VRAM had no room for the texture. */
+   vid_rect(x, y, w, h, C_CARD, 255);
+   ov_outline(x, y, w, h, C_ACCENT_DK, 120);
+   if (g_ov_slot[i] == 2 && th)
+      vid_image_nearest(x + (w - 128) / 2, y + (h - 84) / 2 - 6, 128, 84, th,
+                        PSP_STATE_THUMB_WIDTH, PSP_STATE_THUMB_TEX_HEIGHT,
+                        PSP_STATE_THUMB_WIDTH, PSP_STATE_THUMB_HEIGHT);
+   else
+   {
+      static const char np[] = "No preview";
+      vid_text(x + (w - vid_text_w(np)) / 2, vid_text_y_in(y, h) - 8, np,
+               C_DIM);
+   }
+   if (g_ov_shot_none[i])
+   {
+      static const char cap[] = "saved by 3.1: small preview only";
+      vid_text(x + (w - vid_text_w(cap)) / 2, y + h - 22, cap, C_DIM);
+   }
 }
 
 static ui_action screen_state_slots(unsigned edges)
 {
-   SceIoStat st;
-   char path[PSP_FILE_PATH_CAP];
-   int occupied = 0, i;
+   ui_action act = UI_ACT_NONE;
+   int i, cur;
+
+   if (g_slots_dirty)
+      ov_slots_scan();           /* after a save: the slot's new files */
+
+   /* A question on the plate (overwrite or delete): X answers it, any other
+    * key keeps the slot, and no other key acts this frame. */
+   if (g_slot_ask)
+   {
+      if (edges & PSP_CTRL_CROSS)
+      {
+         int s = g_slot_ask_n, ask = g_slot_ask;
+         g_slot_ask = 0;
+         if (ask == SLOT_ASK_DELETE)
+         {
+            if (state_delete(g_state_base, (unsigned)s) == 0)
+               snprintf(g_slot_note, sizeof(g_slot_note), "Slot %d deleted",
+                        s);
+            else
+               snprintf(g_slot_note, sizeof(g_slot_note),
+                        "Slot %d could not be deleted", s);
+            ov_slots_scan();
+         }
+         else
+         {
+            g_slot_saving = s;
+            act = UI_ACT_SAVESTATE;
+         }
+      }
+      else if (edges)
+         g_slot_ask = 0;
+      edges = 0;
+   }
+   if (edges & (PSP_CTRL_UP | PSP_CTRL_DOWN | PSP_CTRL_CIRCLE |
+                PSP_CTRL_CROSS | PSP_CTRL_SQUARE | PSP_CTRL_TRIANGLE))
+      g_slot_note[0] = '\0';
 
    if (edges & PSP_CTRL_CIRCLE)
    {
       screen_to(SCR_MENU);
-      return UI_ACT_NONE;
+      return screen_menu(0, g_ov_linked);
    }
-   if (edges & PSP_CTRL_UP)
-      g_state_slot = g_state_slot > 1 ? g_state_slot - 1 : PSP_STATE_SLOT_COUNT;
-   if (edges & PSP_CTRL_DOWN)
-      g_state_slot = g_state_slot < PSP_STATE_SLOT_COUNT ? g_state_slot + 1 : 1;
-   if (g_state_base[0] &&
-       psp_state_path_for_slot(path, sizeof(path), g_state_base,
-                               (unsigned)g_state_slot) == 0 &&
-       sceIoGetstat(path, &st) >= 0)
-      occupied = 1;
-   if (edges & PSP_CTRL_CROSS)
+   if (edges & (PSP_CTRL_UP | PSP_CTRL_DOWN))
    {
-      if (!occupied && !g_state_save_mode)
+      if (edges & PSP_CTRL_UP)
+         g_state_slot = g_state_slot > 1 ? g_state_slot - 1
+                                          : PSP_STATE_SLOT_COUNT;
+      else
+         g_state_slot = g_state_slot < PSP_STATE_SLOT_COUNT
+                           ? g_state_slot + 1 : 1;
+      g_ov_dwell = 0;
+   }
+   cur = g_state_slot - 1;
+   if (g_state_base[0])
+   {
+      if (edges & PSP_CTRL_CROSS)
       {
-         osd_toast("No saved state in this slot");
-         return UI_ACT_NONE;
+         if (g_ov_slot[cur])
+            act = UI_ACT_LOADSTATE;
+         else            /* on the plate, as every page message: a toast
+                          * would sit on the header */
+            snprintf(g_slot_note, sizeof(g_slot_note),
+                     "Slot %d is empty", g_state_slot);
       }
-      screen_to(SCR_MENU);
-      return g_state_save_mode ? UI_ACT_SAVESTATE : UI_ACT_LOADSTATE;
+      else if (edges & PSP_CTRL_SQUARE)
+      {
+         if (g_ov_slot[cur])
+         {
+            g_slot_ask = SLOT_ASK_OVERWRITE;
+            g_slot_ask_n = g_state_slot;
+         }
+         else
+         {
+            g_slot_saving = g_state_slot;
+            act = UI_ACT_SAVESTATE;
+         }
+      }
+      else if ((edges & PSP_CTRL_TRIANGLE) && g_ov_slot[cur])
+      {
+         g_slot_ask = SLOT_ASK_DELETE;
+         g_slot_ask_n = g_state_slot;
+      }
    }
 
-   page(g_state_save_mode ? "Save state" : "Load state", NULL);
-   for (i = 1; i <= PSP_STATE_SLOT_COUNT; i++)
+   /* THE DWELL: the full picture is read once the cursor has rested
+    * OV_SHOT_DWELL frames on a saved slot (this frame counts), with the core
+    * paused, and kept until the cursor moves or the slot changes. */
+   if (g_ov_dwell <= OV_SHOT_DWELL && ++g_ov_dwell == OV_SHOT_DWELL &&
+       g_ov_slot[cur] && g_ov_shot_slot != cur && vid_shot_tex())
    {
-      int y = HDR_H + 26 + (i - 1) * 30;
-      int has = 0;
-      if (g_state_base[0] &&
-          psp_state_path_for_slot(path, sizeof(path), g_state_base,
-                                  (unsigned)i) == 0 &&
-          sceIoGetstat(path, &st) >= 0)
-         has = 1;
-      row(74, y, 332, i == g_state_slot, 1,
-          has ? (g_state_save_mode ? "Overwrite saved state" : "Saved state")
-              : (g_state_save_mode ? "Save to empty slot" : "Empty slot"),
-          i == 1 ? "slot 1" : NULL);
-      if (i == g_state_slot)
-         vid_text(350, y + 3, has ? "X confirm" : "empty", C_DIM);
+      unsigned t0 = sceKernelGetSystemTimeLow();
+      int rc = ov_shot_read(cur);
+      if (rc != 0)
+         g_ov_shot_none[cur] = 1;
+      FE_EVT_ONLY(t0);
+      fe_evt("shot_dwell slot=%d rc=%d us=%u", cur + 1, rc,
+             (unsigned)(sceKernelGetSystemTimeLow() - t0));
    }
-   footer("X select   O back");
-   return UI_ACT_NONE;
+
+   ov_backdrop(OV_SCRIM);
+   ov_head(g_ov_title, "SAVE STATES");
+   for (i = 0; i < PSP_STATE_SLOT_COUNT; i++)
+   {
+      int y = SS_ROW_Y(i), by = y + 1, sel = (i == cur);
+      char lbl[16];
+      /* The band is the drawer card's rule, card = text + 1: two lines,
+       * 32 rows, bleeding off the left edge. */
+      if (sel)
+      {
+         vid_rect(0, by, 212, 32, C_ACCENT, 40);
+         vid_rect(0, by, 4, 32, C_ACCENT, 255);
+      }
+      if (g_ov_slot[i] == 2)
+         vid_image(20, by + 4, 36, 24,
+                   g_ov_thumbs + (size_t)i * PSP_STATE_THUMB_WIDTH *
+                      PSP_STATE_THUMB_TEX_HEIGHT,
+                   PSP_STATE_THUMB_WIDTH, PSP_STATE_THUMB_TEX_HEIGHT,
+                   PSP_STATE_THUMB_WIDTH, PSP_STATE_THUMB_HEIGHT, 255);
+      else
+         vid_rect(20, by + 4, 36, 24, C_CARD, 255);
+      snprintf(lbl, sizeof(lbl), "Slot %d", i + 1);
+      vid_text(64, y, lbl, sel ? C_SEL : C_ITEM);
+      if (g_ov_slot[i])
+         vid_text(64, y + 14, g_ov_stamp[i][0] ? g_ov_stamp[i] : "saved",
+                  sel ? C_VALUE : C_DIM);
+      else
+         vid_text(64, y + 14, "empty", C_DIM);
+   }
+   ss_panel(cur);
+   {
+      char cap[48];
+      snprintf(cap, sizeof(cap), "Slot %d  -  %s", cur + 1,
+               !g_ov_slot[cur] ? "empty"
+               : g_ov_stamp[cur][0] ? g_ov_stamp[cur] : "saved");
+      vid_text(SS_PX, 228, cap, C_DIM);
+   }
+   if (g_slot_ask)
+   {
+      char q[72];
+      if (g_slot_ask == SLOT_ASK_DELETE)
+         snprintf(q, sizeof(q), "Delete Slot %d?      " VID_GLYPH_X
+                  " delete     " VID_GLYPH_O " keep", g_slot_ask_n);
+      else
+         snprintf(q, sizeof(q), "Overwrite Slot %d?      " VID_GLYPH_X
+                  " overwrite     " VID_GLYPH_O " keep", g_slot_ask_n);
+      ov_plate(q);
+   }
+   else if (g_slot_note[0])
+      ov_plate(g_slot_note);
+   else if (g_ov_slot[cur])
+      footer(VID_GLYPH_X " load     " VID_GLYPH_SQ " save     " VID_GLYPH_TRI
+             " delete     " VID_GLYPH_O " back");
+   else
+      footer(VID_GLYPH_SQ " save     " VID_GLYPH_O " back");
+   return act;
 }
 
 /* ----- frame dispatcher --------------------------------------------------- */
@@ -1261,6 +3931,7 @@ ui_action ui_frame(unsigned pad, int session_active, const char *session_info)
    if (ui_demo_running())
       pad = demo_pad();
    edges = pad_edges(pad);
+   g_ov_linked = session_active;
 
    vid_overlay_begin(1);
    switch (g_screen)
@@ -1277,14 +3948,33 @@ ui_action ui_frame(unsigned pad, int session_active, const char *session_info)
    case SCR_MGIFT:
       act = screen_mgift(edges);
       break;
+   case SCR_HOST:
+      act = screen_host(edges);
+      break;
+   case SCR_JOINASK:
+      act = screen_joinask(edges);
+      break;
    case SCR_STATE_SLOTS:
       act = screen_state_slots(edges);
+      break;
+   case SCR_CONTROLS:
+      act = screen_controls(edges, pad);
       break;
    default:
       act = screen_menu(edges, session_active);
       break;
    }
    vid_overlay_end();
+   demo_dump_flush();
+   /* ui_demo: every frame of the menu's opening, for docs/UI-OVERLAY.md. */
+   if (g_demo_on >= 0 && g_demo_steps == demo_script &&
+       g_screen == SCR_MENU && g_ov_open_k < OV_OPEN_FRAMES &&
+       g_ov_open_k > 0)
+   {
+      char nm[32];
+      snprintf(nm, sizeof(nm), "ge_ui_open_%d", g_ov_open_k);
+      demo_dump_named(nm);
+   }
 
    if (act == UI_ACT_RESUME || act == UI_ACT_EXIT ||
        act == UI_ACT_NET_HOST || act == UI_ACT_NET_JOIN)
@@ -1700,55 +4390,49 @@ static void browser_pop_draw(int x, int y_cur, int row_h, int cur)
  * new controls did not fit at any abbreviation, so the browser now splits
  * them by kind: the footer keeps the ACTIONS on the highlighted game (play,
  * page, states, star, settings) and the header carries the two VIEW switches
- * -- TRIANGLE beside the console badge, SELECT beside the favourites pill --
+ * -- TRIANGLE beside the console card, SELECT beside the favourites pill --
  * each labelled with its button, right where the thing it changes is drawn.
  *
- * Badge: a translucent plate in the console colour, its name, and the
- * palette as a 2 px stripe along the bottom.  During the switch it lands at
- * 1.35x (g_fx_badge).  Favourites pill: the star and how many, filled in
- * the console colour while that view is open. */
+ * Right to left: the console card (hdr_card, the rightmost thing, exactly
+ * where the loading screen puts it), TRIANGLE hung on it, then the
+ * favourites pill with SELECT before it, then the games count when it fits.
+ * (3.1 had the pill outermost and the card inside it; the owner moved the
+ * card out, so a picked game's loading screen keeps it in place.)
+ * Favourites pill: the star and how many, filled in the console colour
+ * while that view is open. */
 static void browser_header(int n_scan)
 {
    const ui_skin *s = skin_of(g_pcfg.console);
    char count[8];
-   int x = 460, pw, bw, k, i;
+   int x, pw, i;
+
+   x = hdr_card(s, g_fx_badge);
+   x -= 4 + vid_text_w(VID_GLYPH_TRI);
+   vid_text(x, HDR_TEXT_Y, VID_GLYPH_TRI, C_DIM);
 
    snprintf(count, sizeof(count), "%d", g_fav_count);
    pw = 8 + vid_text_w(VID_GLYPH_STAR) + 4 + vid_text_w(count) + 8;
-   x -= pw;
+   x -= 14 + pw;
    if (g_browser_favs)
    {
-      vid_rect(x, 9, pw, 20, C_CON, 60);
-      vid_text(x + 8, 11, VID_GLYPH_STAR, C_CON);
-      vid_text(x + 8 + vid_text_w(VID_GLYPH_STAR) + 4, 11, count, C_SEL);
+      vid_rect(x, HDR_CARD_Y, pw, HDR_CARD_H, C_CON, 60);
+      vid_text(x + 8, HDR_TEXT_Y, VID_GLYPH_STAR, C_CON);
+      vid_text(x + 8 + vid_text_w(VID_GLYPH_STAR) + 4, HDR_TEXT_Y, count,
+               C_SEL);
    }
    else
    {
       /* The count is information, not a hint: C_ACCENT_DK (#6B6B6B on the
        * light page, #8B8B8B on the dark) clears 4.5:1 where C_DIM does
        * not.  The SELECT and TRIANGLE labels stay C_DIM like the footer. */
-      vid_rect(x, 9, pw, 20, C_BG_TOP, 140);
-      vid_text(x + 8, 11, g_fav_count ? VID_GLYPH_STAR : VID_GLYPH_STAR_O,
+      vid_rect(x, HDR_CARD_Y, pw, HDR_CARD_H, C_BG_TOP, 140);
+      vid_text(x + 8, HDR_TEXT_Y,
+               g_fav_count ? VID_GLYPH_STAR : VID_GLYPH_STAR_O, C_ACCENT_DK);
+      vid_text(x + 8 + vid_text_w(VID_GLYPH_STAR) + 4, HDR_TEXT_Y, count,
                C_ACCENT_DK);
-      vid_text(x + 8 + vid_text_w(VID_GLYPH_STAR) + 4, 11, count, C_ACCENT_DK);
    }
    x -= 6 + vid_text_w("SELECT");
-   vid_text(x, 11, "SELECT", C_DIM);
-
-   bw = 8 + vid_text_w(s->id) + 8;
-   x -= 14 + bw;
-   {
-      int sw = (bw * g_fx_badge) >> 8, sh = (20 * g_fx_badge) >> 8;
-      int bx = x + bw / 2 - sw / 2, by = 19 - sh / 2;
-      vid_rect(bx, by, sw, sh, C_CON, g_pcfg.theme == 1 ? 36 : 48);
-      for (k = 0; k < s->pal_n; k++)
-         vid_rect(bx + (k * sw) / s->pal_n, by + sh - 2,
-                  ((k + 1) * sw) / s->pal_n - (k * sw) / s->pal_n, 2,
-                  s->pal[k], 255);
-      vid_text(x + 8, 11, s->id, C_CON);
-   }
-   x -= 4 + vid_text_w(VID_GLYPH_TRI);
-   vid_text(x, 11, VID_GLYPH_TRI, C_DIM);
+   vid_text(x, HDR_TEXT_Y, "SELECT", C_DIM);
 
    /* The shelf used to put "24 games" here; it keeps it when it fits. */
    if (!g_ui_shell && n_scan > 0)
@@ -1756,8 +4440,8 @@ static void browser_header(int n_scan)
       char buf[24];
       snprintf(buf, sizeof(buf), "%d games", n_scan);
       i = x - 16 - vid_text_w(buf);
-      if (i >= 20 + VID_LOGO_W + 12)
-         vid_text(i, 11, buf, C_DIM);
+      if (i >= HDR_LOGO_X + VID_LOGO_W + 12)
+         vid_text(i, HDR_TEXT_Y, buf, C_DIM);
    }
 }
 
@@ -1889,6 +4573,7 @@ static void rom_scan_dir(const char *rel, int depth, int *n,
       else if (ui_rom_matches_console(ent.d_name, console))
       {
          g_rom_found++;
+         ret_scan_tick();
          if (*n < BROWSER_MAX)
          {
             char        path[PSP_ROM_REL_PATH_CAP];
@@ -2409,13 +5094,14 @@ static void art_cache_565(const char *path, const uint16_t *tex, int stride,
 /* Try png, jpg, bmp in that order.  Returns 0 on success;
  * dw and dh come in as the box to fit and come back as the sub-rect
  * actually written. */
-static int art_load_any(int rom_idx, const char *dir, uint16_t *tex,
+/* `base` is the ROM's file name (no folder): its stem names the art. */
+static int art_load_any(const char *base, const char *dir, uint16_t *tex,
                         int stride, int *dw, int *dh)
 {
    extern char g_dir_base[];
    /* .565 first: it is the texture itself and costs one read. */
    static const char *ext[] = { "565", "png", "jpg", "jpeg", "bmp" };
-   int stem = (int)ui_rom_stem_length(g_roms[rom_idx].base);
+   int stem = (int)ui_rom_stem_length(base);
    unsigned e;
 
    int boxw = *dw, boxh = *dh;
@@ -2432,7 +5118,7 @@ static int art_load_any(int rom_idx, const char *dir, uint16_t *tex,
        * the same frame to fit into. */
       *dw = boxw; *dh = boxh;
       path_len = snprintf(path, sizeof(path), "%s/%s/%.*s.%s", g_dir_base,
-                          dir, stem, g_roms[rom_idx].base, ext[e]);
+                          dir, stem, base, ext[e]);
       if (path_len < 0 || (size_t)path_len >= sizeof(path))
          continue;
       if (sceIoGetstat(path, &st) < 0)
@@ -2464,8 +5150,7 @@ static int art_load_any(int rom_idx, const char *dir, uint16_t *tex,
           * make the emulator look hung on first run. */
          char cpath[PSP_FILE_PATH_CAP];
          int cache_len = snprintf(cpath, sizeof(cpath), "%s/%s/%.*s.565",
-                                  g_dir_base, dir, stem,
-                                  g_roms[rom_idx].base);
+                                  g_dir_base, dir, stem, base);
          if (cache_len < 0 || (size_t)cache_len >= sizeof(cpath))
             return 0; /* art decoded, but its cache destination cannot fit */
          fe_evt("art_time fmt=png us=%u %s",
@@ -2509,7 +5194,8 @@ static const uint16_t *art_get(const char *rom_dir, int rom_idx, int load,
    g_art[victim].rom_idx = rom_idx;
    g_art[victim].aw = ART_W;
    g_art[victim].ah = ART_H;
-   if (art_load_any(rom_idx, "boxart", g_art[victim].tex, ART_TEX_W,
+   if (art_load_any(g_roms[rom_idx].base, "boxart", g_art[victim].tex,
+                    ART_TEX_W,
                     &g_art[victim].aw, &g_art[victim].ah) == 0)
    {
       sceKernelDcacheWritebackRange(g_art[victim].tex,
@@ -2527,12 +5213,23 @@ static const uint16_t *art_get(const char *rom_dir, int rom_idx, int load,
  * selection changes AND the stick has been idle -- a hero decode is the most
  * expensive thing the browser does, and doing it mid-scroll would stutter
  * exactly when the user is moving. */
+static const uint16_t *hero_decode(int rom_idx, const char *base);
+
 static const uint16_t *hero_get(int rom_idx, int load)
 {
    if (g_hero_idx == rom_idx && g_hero_state)
       return g_hero_state > 0 ? g_hero : NULL;
    if (!load)
       return g_hero_state > 0 && g_hero_idx == rom_idx ? g_hero : NULL;
+   return hero_decode(rom_idx, g_roms[rom_idx].base);
+}
+
+/* The decode itself, by file name, so a launch that never saw the browser
+ * (harness, variant) can fetch the same art.  `rom_idx` only keys the
+ * one-entry cache; HERO_IDX_PATH marks a by-path load. */
+#define HERO_IDX_PATH (-2)
+static const uint16_t *hero_decode(int rom_idx, const char *base)
+{
 
    if (!g_hero)
    {
@@ -2571,7 +5268,7 @@ static const uint16_t *hero_get(int rom_idx, int load)
    /* At 512 this is the screen itself, so the draw below is 1:1. */
    g_hero_w = (g_hero_tex >= 480) ? 480 : g_hero_tex;
    g_hero_h = (g_hero_w * 272) / 480;
-   if (art_load_any(rom_idx, "hero", g_hero, g_hero_tex,
+   if (art_load_any(base, "hero", g_hero, g_hero_tex,
                     &g_hero_w, &g_hero_h) == 0)
    {
       sceKernelDcacheWritebackRange(g_hero,
@@ -2581,10 +5278,15 @@ static const uint16_t *hero_get(int rom_idx, int load)
       return g_hero;
    }
 
-   /* Otherwise derive one from the cover, as before. */
-   g_hero_w = HERO_W;
-   g_hero_h = HERO_H;
-   if (art_load_any(rom_idx, "boxart", g_hero, g_hero_tex,
+   /* Otherwise derive one from the cover, as before.  The 5:7 cover box is
+    * 256x358, but the texture can be the 256x256 fallback (HERO_TEX_SMALL,
+    * when the 512 KiB one was refused -- most likely on a PSP-1000): a tall
+    * cover fitted into the full box wrote up to 102 rows (~52 KB) past the
+    * end of the buffer.  Clamp the box to the texture actually held; the fit
+    * keeps the aspect, so a tall cover just comes out smaller. */
+   g_hero_w = HERO_W < g_hero_tex ? HERO_W : g_hero_tex;
+   g_hero_h = HERO_H < g_hero_tex ? HERO_H : g_hero_tex;
+   if (art_load_any(base, "boxart", g_hero, g_hero_tex,
                     &g_hero_w, &g_hero_h) == 0)
    {
       sceKernelDcacheWritebackRange(g_hero,
@@ -2913,14 +5615,107 @@ static struct {
    unsigned elapsed[8];
 } g_loading;
 
+/* ---- LAUNCH ART (docs/DISPLAY-FEATURES.md) --------------------------------
+ *
+ * The game's hero art, taken ONCE when a ROM is picked, becomes the ambient
+ * texture (32 KiB of VRAM, ambient_look.h) -- and that same bake is the
+ * loading screen's background (Fable's "L2").  Source: the hero the browser
+ * already decoded when it is this ROM's (the Marquee shell usually has it);
+ * otherwise the Marquee's own decode, by file name, into the same buffer.
+ * Then the browser frees its whole art pool exactly as it always did --
+ * before fe_host_boot, so the core's startup allocations (residency, JIT
+ * tier, the ROM-cache loop) find the heap as they did in 3.1.  The sharp
+ * hero is never kept ("L1" would hold 512 KiB through the load).
+ *
+ * Every step is optional: no art, no VRAM room, or `loading_art = 0` gives
+ * the palette loading screen and palette/black bars. */
+static int g_launch_taken;       /* a launch has been through here        */
+static int g_loading_dumps;      /* harness `loading_dump = N`             */
+void ui_loading_dump_shots(int n) { g_loading_dumps = n > 0 ? n : 0; }
+
+static void browser_cart(int cx, int cy, const ui_skin *s);
+
+/* The ambient bars' no-art colour: the console's darkest palette shade. */
+uint16_t ui_console_shade(int console)
+{
+   if (console < FE_CONSOLE_GBA || console >= FE_CONSOLE_COUNT)
+      console = FE_CONSOLE_GBA;
+   return SKIN_DARK[console].pal[0];
+}
+
+static void launch_art_take(void)
+{
+   int rows;
+   if (g_hero_state <= 0 || !g_hero || g_hero_w <= 0 || g_hero_h <= 0)
+      return;
+   /* The texture is g_hero_tex square: never read a row past it. */
+   rows = g_hero_h < g_hero_tex ? g_hero_h : g_hero_tex;
+   vid_ambient_bake_art(g_hero, g_hero_tex, g_hero_w, rows,
+                        g_hero_precomposed);
+}
+
+/* Browser pick: reuse the decoded hero when it is this ROM's. */
+static void launch_art_from_browser(int rom)
+{
+   unsigned t0 = sceKernelGetSystemTimeLow();
+   int reused = (g_hero_idx == rom && g_hero_state > 0);
+   FE_EVT_ONLY(t0);
+   g_launch_taken = 1;
+   if (!g_pcfg.loading_art)
+      return;
+   if (!reused)
+      hero_get(rom, 1);   /* the Marquee's decode; art_free_all() follows */
+   if (g_hero_idx == rom && g_hero_state > 0)
+      launch_art_take();
+   fe_evt("launch_art_source rom=%s reused=%d found=%d us=%u", g_roms[rom].name,
+          reused, vid_ambient_source() == 1,
+          (unsigned)sceKernelGetSystemTimeLow() - t0);
+}
+
+/* Harness / variant launch: no browser, so decode by the ROM's file name,
+ * bake, and free the decode at once -- still before fe_host_boot. */
+static void launch_art_from_path(const char *path)
+{
+   const char *base = strrchr(path, '/');
+   unsigned t0 = sceKernelGetSystemTimeLow();
+   FE_EVT_ONLY(t0);
+   g_launch_taken = 1;
+   if (!g_pcfg.loading_art)
+      return;
+   base = base ? base + 1 : path;
+   if (hero_decode(HERO_IDX_PATH, base))
+      launch_art_take();
+   art_free_all();
+   fe_evt("launch_art_source path=%s reused=0 found=%d us=%u", base,
+          vid_ambient_source() == 1,
+          (unsigned)sceKernelGetSystemTimeLow() - t0);
+}
+
+/* clip_title, measured in the face the loading title is drawn in. */
+static void clip_title_hd(char *t, int px)
+{
+   int n = (int)strlen(t);
+   if (vid_text_hd_w(t) <= px)
+      return;
+   while (n > 1)
+   {
+      t[--n] = 0;
+      if (vid_text_hd_w(t) + vid_text_hd_w("...") <= px)
+         break;
+   }
+   while (n > 0 && (t[n - 1] == ' ' || t[n - 1] == '-'))
+      t[--n] = 0;
+   strcpy(t + n, "...");
+}
+
+/* "L2": the browser's marquee chrome over the ambient bake, or over the
+ * console's palette ramp when there is no art (Fable, loading/). */
 void ui_loading_update(const char *stage, unsigned done, unsigned total)
 {
-   static const signed char ring[8][2] = {
-      {0,-7}, {5,-5}, {7,0}, {5,5}, {0,7}, {-5,5}, {-7,0}, {-5,-5}
-   };
    unsigned now = sceKernelGetSystemTimeLow();
-   int changed, i;
+   int changed;
    char amount[48];
+   const ui_skin *s;
    if (!g_loading.active) return;
    changed = !g_loading.count ||
              strcmp(stage, g_loading.stage[g_loading.count - 1]) != 0;
@@ -2935,24 +5730,55 @@ void ui_loading_update(const char *stage, unsigned done, unsigned total)
    if (!changed && now - g_loading.drawn_at < 100000 && done != total)
       return;
    g_loading.drawn_at = now;
+   g_thm = (g_pcfg.theme == 1) ? &THM_LIGHT : &THM_DARK;
+   s = skin_of(g_pcfg.console);
    vid_overlay_begin(1);
-   page("LOADING GAME", NULL);
-   for (i = 0; i < 8; i++)
-      vid_rect(452 + ring[i][0], 13 + ring[i][1], 3, 3, C_TITLE,
-               50 + 25 * ((i + 8 - (now / 100000) % 8) % 8));
-   vid_text_center(100, g_loading.title, C_ITEM);
-   vid_text_center(132, stage, C_VALUE);
+
+   /* Background. */
+   vid_rect(0, 0, VID_SCR_W, VID_SCR_H,
+            g_theme_black ? 0x0000 : C_BG_TOP, 255);
+   if (vid_ambient_image(0, 0, VID_SCR_W, VID_SCR_H, 255))
+      vid_rect(0, 0, VID_SCR_W, VID_SCR_H, C_BG_TOP, LOAD_SCRIM);
+   else
+   {
+      vid_gradient_a(0, 0, VID_SCR_W, VID_SCR_H, s->pal[0],
+                     g_pcfg.theme == 1 ? LOAD_PAL_RAMP_LIGHT
+                                       : LOAD_PAL_RAMP_DARK, 0);
+      browser_cart(240, 180, s);
+   }
+   vid_gradient_a(0, 232, VID_SCR_W, 40, C_BG_TOP, 0, LOAD_FOOT_RAMP);
+
+   /* Chrome: wordmark, console card, the busy ring -- the browser's header
+    * row (HDR_*), so nothing in it moves when a game is picked. */
+   vid_logo(HDR_LOGO_X, HDR_LOGO_Y, C_ACCENT, 255);
+   hdr_ring(hdr_card(s, 256), now, C_TITLE);
+
+   /* Title, stage, amount, progress in the console's colour. */
+   vid_text_hd(20, 74, g_loading.title, C_SEL);
+   vid_text(20, 102, stage, C_ITEM);
    if (total)
    {
       if (done > total) done = total;
-      vid_rect(90, 164, 300, 4, C_ACCENT_DK, 160);
-      vid_rect(90, 164, (int)((unsigned long long)done * 300 / total), 4,
-               C_ACCENT, 255);
       snprintf(amount, sizeof(amount), "%u / %u KiB", done / 1024,
                (total + 1023) / 1024);
-      vid_text_center(185, amount, C_DIM);
+      vid_text(460 - vid_text_w(amount), 102, amount, C_DIM);
+      vid_rect(20, 126, 440, 3, C_ACCENT_DK, 160);
+      vid_rect(20, 126, (int)((unsigned long long)done * 440 / total), 3,
+               s->accent, 255);
    }
    vid_overlay_end();
+   if (g_loading_dumps > 0)
+   {
+      /* Harness: the loading screen is never on screen long under PPSSPP,
+       * and neither browser nor game loop runs while it is. */
+      extern char g_dir_base[];
+      char gp[176];
+      static int n;
+      g_loading_dumps--;
+      snprintf(gp, sizeof(gp), "%s/log/ge_loading_%d.bmp", g_dir_base, n++);
+      if (vid_dump_ge(gp) == 0)
+         fe_evt("ge_dump file=ge_loading_%d.bmp ui=1", n - 1);
+   }
    vid_swap();
    /* Ensure the status is actually visible BEFORE the next blocking call.
     * The existing swap path still owns all display-buffer safety. */
@@ -2964,15 +5790,51 @@ void ui_loading_begin(const char *path)
    const char *name = strrchr(path, '/');
    char *dot;
    if (g_loading.active) return; /* browser already started the timer */
+   g_ret_on = 0;   /* a launch with no browser: no crossfade to finish */
+   /* No browser pick came first (harness or variant launch): fetch the
+    * art by file name, before the core's allocations. */
+   if (!g_launch_taken)
+      launch_art_from_path(path);
    memset(&g_loading, 0, sizeof(g_loading));
    g_loading.active = 1;
    g_loading.started = sceKernelGetSystemTimeLow();
    snprintf(g_loading.title, sizeof(g_loading.title) - 4, "%s", name ? name + 1 : path);
    dot = strrchr(g_loading.title, '.');
    if (dot) *dot = 0;
-   clip_title(g_loading.title, 432);
+   clip_title_hd(g_loading.title, 440);
    ui_loading_update("Remembering game", 0, 0);
 }
+
+#if defined(GBA_LINK) || defined(GPSP_MEM_BUDGET)
+/* A full-screen notice for a boot that cannot continue (docs/MEMORY-BUDGET.md:
+ * the memory gate).  Held until a button is pressed or hold_ms passes, so an
+ * unattended rig still returns to the XMB.  Compiled into the builds that
+ * carry the gate only; a release is byte-identical without it. */
+void ui_notice(const char *title, const char *l1, const char *l2,
+               const char *l3, unsigned hold_ms)
+{
+   unsigned t0 = sceKernelGetSystemTimeLow();
+   SceCtrlData pad;
+   g_loading.active = 0;
+   do
+   {
+      vid_overlay_begin(1);
+      page(title, NULL);
+      if (l1) vid_text_center(96, l1, C_WARN);
+      if (l2) vid_text_center(124, l2, C_ITEM);
+      if (l3) vid_text_center(152, l3, C_ITEM);
+      vid_text_center(200, "Press any button to return to the XMB.", C_DIM);
+      vid_overlay_end();
+      vid_swap();
+      sceDisplayWaitVblankStart();
+      memset(&pad, 0, sizeof(pad));
+      sceCtrlPeekBufferPositive(&pad, 1);
+      if ((pad.Buttons & 0xF3F9u) &&
+          sceKernelGetSystemTimeLow() - t0 > 500000u)   /* not a held key */
+         break;
+   } while (sceKernelGetSystemTimeLow() - t0 < hold_ms * 1000u);
+}
+#endif
 
 void ui_loading_finish(int success)
 {
@@ -3071,16 +5933,18 @@ static void shell_shelf(const char *rom_dir, int cur, int n, int n_scan,
 
    vid_rect(0, 0, 480, 272, C_BG_TOP, 255);
 
-   vid_logo(20, 8, C_ACCENT, 255);
+   vid_logo(HDR_LOGO_X, HDR_LOGO_Y, C_ACCENT, 255);
    browser_header(n_scan);
 
    /* The selection band does NOT move -- it is the fixed thing the list
     * slides under.  Only the rows take the scroll offset.  Its edge is the
     * console colour: one of the three places that colour is spent. */
-   vid_rect(0, SHELF_TOP + SHELF_SEL * SHELF_ROW_H - 4, 300, SHELF_ROW_H,
-            C_CARD, 255);
-   vid_rect(0, SHELF_TOP + SHELF_SEL * SHELF_ROW_H - 4, 3, SHELF_ROW_H,
-            C_CON, 255);
+   /* Cap height centred on the selected row's text (vid_band_y): 7 px of
+    * card above the capitals and 7 below.  It was `- 4`: 8 above, 6 below. */
+   vid_rect(0, vid_band_y(SHELF_TOP + SHELF_SEL * SHELF_ROW_H, SHELF_ROW_H),
+            300, SHELF_ROW_H, C_CARD, 255);
+   vid_rect(0, vid_band_y(SHELF_TOP + SHELF_SEL * SHELF_ROW_H, SHELF_ROW_H),
+            3, SHELF_ROW_H, C_CON, 255);
 
    sy = scroll_px(cur, SHELF_ROW_H) + g_fx_dy;
 
@@ -3252,6 +6116,7 @@ static void browser_state_cache_free(void)
       free(g_browser_previews);
    g_browser_previews = NULL;
    g_browser_state_open = 0;
+   g_shelf_del = 0;
    g_browser_preview_rom = -1;
    g_browser_panel_t = 0;
    memset(g_browser_preview_status, 0, sizeof(g_browser_preview_status));
@@ -3282,7 +6147,14 @@ static void browser_state_panel(const char *rom_dir, int cur, int n)
    vid_text(x + 14, 34, title, C_DIM);
    for (i = 0; i < PSP_STATE_SLOT_COUNT; i++)
    {
+      /* The card is y-3..y+28 (32 rows).  Its two lines, 14 apart, are
+       * placed as one block with their cap heights centred in it
+       * (vid_text_y_in over the card less one line pitch): capitals from
+       * y to y+24, 3 rows of card above and 4 below.  They were at y+1 and
+       * y+15, which put the second line's capitals on the card's bottom
+       * edge and "empty"'s descenders 4 px past it. */
       int y = 62 + i * 35, exists = g_browser_state_exists[i];
+      int ty = vid_text_y_in(y - 3, 32 - 14);
       vid_rect(x + 10, y - 3, 182, 32,
                i + 1 == g_browser_state_slot ? C_CARD : C_BG_TOP, 255);
       if (g_browser_previews && g_browser_preview_status[i] == 1)
@@ -3294,19 +6166,41 @@ static void browser_state_panel(const char *rom_dir, int cur, int n)
       else
       {
          vid_rect(x + 14, y - 1, 42, 28, C_HDR_BOT, 255);
-         vid_text(x + 15, y + 7, exists ? "old" : "empty", C_DIM);
+         vid_text(x + 15, vid_text_y_in(y - 1, 28), exists ? "old" : "empty",
+                  C_DIM);
       }
       {
          char slot[16];
          snprintf(slot, sizeof(slot), "Slot %d", i + 1);
-         vid_text(x + 66, y + 1, slot, C_SEL);
+         vid_text(x + 66, ty, slot, C_SEL);
       }
-      vid_text(x + 66, y + 15, exists ? "saved" : "empty",
+      vid_text(x + 66, ty + 14, exists ? "saved" : "empty",
                exists ? C_VALUE : C_DIM);
    }
    vid_rect(x + 10, 238, 182, 1, C_CARD, 255);
-   vid_text(x + 14, 241, "UP/DN: slot", C_DIM);
-   vid_text(x + 14, 254, "X: load   O: close", C_DIM);
+   if (g_shelf_del)
+   {
+      /* The question is a plate, as in game: the panel's hint lines give
+       * way to it, so the answer keys are where the eye already is. */
+      char q[32];
+      snprintf(q, sizeof(q), "Delete Slot %d?", g_shelf_del);
+      vid_rect(x + 2, 239, 480 - x - 2, 33, C_ACCENT, 40);
+      vid_text(x + 14, 241, q, C_SEL);
+      vid_text(x + 14, 254, "X: delete   O: keep", C_SEL);
+   }
+   else if (g_shelf_note[0])
+   {
+      vid_rect(x + 2, 239, 480 - x - 2, 33, C_ACCENT, 40);
+      vid_text(x + 14, 241, g_shelf_note, C_SEL);
+      vid_text(x + 14, 254, "X: load   O: close", C_DIM);
+   }
+   else
+   {
+      vid_text(x + 14, 241, g_browser_state_exists[g_browser_state_slot - 1]
+                  ? "UP/DN: slot   " VID_GLYPH_SQ ": delete" : "UP/DN: slot",
+               C_DIM);
+      vid_text(x + 14, 254, "X: load   O: close", C_DIM);
+   }
    (void)n;
 }
 
@@ -3359,7 +6253,7 @@ static void shell_marquee(const char *rom_dir, int cur, int n, int n_scan,
       vid_gradient_a(0, 232, 480, 40, C_BG_TOP, 0, 190);
    }
 
-   vid_logo(20, 10, C_ACCENT, 255);
+   vid_logo(HDR_LOGO_X, HDR_LOGO_Y, C_ACCENT, 255);
    browser_header(n_scan);
 
    {
@@ -3423,7 +6317,8 @@ static void shell_marquee(const char *rom_dir, int cur, int n, int n_scan,
             : g_fx_in >= 0 ? (21 * ease_out((g_fx_in * 256) / SW_ROWS_IN)) >> 8
             : 21;
       if (h > 0)
-         vid_rect(20, MQ_MID - 4 + (21 - h) / 2, 3, h, C_CON, 255);
+         vid_rect(20, vid_band_y(MQ_MID, 21) + (21 - h) / 2, 3, h, C_CON,
+                  255);
    }
    browser_pop_draw(270, MQ_MID + sy, MQ_ROW_H, cur);
 
@@ -3472,7 +6367,7 @@ static void browser_empty(const char *rom_dir, int n_scan)
 
    g_thm = (g_pcfg.theme == 1) ? &THM_LIGHT : &THM_DARK;
    vid_rect(0, 0, 480, 272, C_BG_TOP, 255);
-   vid_logo(20, 10, C_ACCENT, 255);
+   vid_logo(HDR_LOGO_X, HDR_LOGO_Y, C_ACCENT, 255);
    browser_header(n_scan);
    if (g_browser_favs)
    {
@@ -3515,29 +6410,130 @@ extern volatile int g_running;               /* main_psp exit flag */
  *
  * Returns 1 if a boot-time setting changed and the caller must relaunch
  * (Media Engine mode is latched before the browser runs), else 0. */
+static int browser_demo(int frame, unsigned *edges);
+static int g_bframe;             /* browser loop iterations, script clock */
+
+/* Where the browser stood when START opened Settings. */
+static struct { const char *rom_dir; int cur, n, n_scan, idle; } g_bpage;
+
+/* The backdrop of START settings (docs/UI-OVERLAY.md, "Settings from the
+ * browser").  The same screen_settings() the game uses, but with no game
+ * frame to sit on: the browser's own page showed through the scrim as
+ * clutter.  Instead the highlighted game's art is baked ONCE, here, into
+ * the ambient texture (32 KiB of VRAM, no heap), and ov_backdrop() draws it
+ * every frame under the scrim -- the loading screen's "L2" look.
+ *
+ * The art is whatever the browser already holds or would hold anyway:
+ *   - the hero, when it is this game's (the Marquee's idle decode);
+ *   - Marquee: hero_get() decodes into the texture the Marquee owns (it
+ *     would after IDLE_HERO frames regardless);
+ *   - Shelf: the cover in the box-art cache the shelf is showing.  The
+ *     Shelf never holds a hero, and allocating one here would be a new
+ *     512 KiB allocation, so a game with hero/ art shows its cover's bake.
+ * Nothing found (no art, no ROM highlighted, an empty console, or
+ * `loading_art = 0`): the console's palette ramp.  Returns 1 when art was
+ * baked. */
+static int browse_backdrop_take(void)
+{
+   unsigned t0 = sceKernelGetSystemTimeLow();
+   int rom = -1, from = 0;       /* 1 hero held, 2 hero decoded, 3 cover */
+   FE_EVT_ONLY(t0);
+   if (g_pcfg.loading_art && g_bpage.rom_dir && g_bpage.n > 0)
+      rom = view_rom(g_bpage.cur);
+   if (rom >= 0)
+   {
+      if (g_hero_idx == rom && g_hero_state > 0)
+         from = 1;
+      else if (g_ui_shell && hero_get(rom, 1))
+         from = 2;
+      if (from)
+         launch_art_take();
+      else if (!g_ui_shell)
+      {
+         art_slot a;
+         const uint16_t *tex = art_get(g_bpage.rom_dir, rom, 1, &a);
+         /* The slot texture is ART_TEX_W x ART_TEX_H; aw x ah is what the
+          * cover filled, top-left. */
+         if (tex && a.aw > 0 && a.ah > 0)
+         {
+            from = 3;
+            vid_ambient_bake_cover(tex, ART_TEX_W, a.aw,
+                                   a.ah < ART_TEX_H ? a.ah : ART_TEX_H);
+         }
+      }
+   }
+   fe_evt("browse_backdrop rom=%s from=%d art=%d us=%u",
+          rom >= 0 ? g_roms[rom].name : "-", from, vid_ambient_source() == 1,
+          (unsigned)sceKernelGetSystemTimeLow() - t0);
+   return vid_ambient_source() == 1;
+}
+
 static int browser_settings(void)
 {
    int relaunch = 0;
 
+   browse_backdrop_take();
+   g_ov_browse = 1;
+
+   /* Settings > Link mode edits the highlighted game (docs/GBA-LINK-UI.md):
+    * its key, and its header code read once here, never per frame. */
+   g_bset_have = 0;
+   g_bset_key[0] = g_bset_code[0] = '\0';
+   if (g_bpage.rom_dir && !g_lm_loaded)
+      ui_linkmode_load(g_bpage.rom_dir);
+   if (g_bpage.rom_dir && g_bpage.n > 0 && g_pcfg.console == FE_CONSOLE_GBA)
+   {
+      int rom = view_rom(g_bpage.cur);
+      char path[PSP_FILE_PATH_CAP];
+      SceUID fd;
+      snprintf(g_bset_key, sizeof(g_bset_key), "%s", g_roms[rom].name);
+      if (snprintf(path, sizeof(path), "%s/%s", g_bpage.rom_dir,
+                   g_roms[rom].name) < (int)sizeof(path) &&
+          (fd = sceIoOpen(path, PSP_O_RDONLY, 0)) >= 0)
+      {
+         if (sceIoLseek(fd, 0xAC, PSP_SEEK_SET) == 0xAC &&
+             sceIoRead(fd, g_bset_code, 4) == 4)
+            g_bset_code[4] = '\0';
+         else
+            g_bset_code[0] = '\0';
+         sceIoClose(fd);
+      }
+      g_bset_have = 1;
+   }
+
    screen_to(SCR_SETTINGS);
    g_cursor = SET_ROOM;
    g_prev_pad = 0xFFFFFFFFu;      /* swallow the opening START */
-   while (g_running && g_screen == SCR_SETTINGS)
+   /* Settings > Controls runs inside this loop too: it is a sub-page of
+    * these settings, and it leaves back to them. */
+   while (g_running && (g_screen == SCR_SETTINGS || g_screen == SCR_CONTROLS))
    {
       SceCtrlData pd;
-      unsigned edges;
+      unsigned edges, pad;
       sceCtrlPeekBufferPositive(&pd, 1);
-      edges = pad_edges(pd.Buttons);
+      pad = ui_demo_running() ? demo_pad() : pd.Buttons;
+      edges = pad_edges(pad);
+      /* The harness script keeps counting in here, so a shoot can walk the
+       * Settings screen (no-op without a script). */
+      browser_demo(++g_bframe, &edges);
       vid_overlay_begin(1);
-      if (screen_settings(edges) == UI_ACT_RELAUNCH)
+      if (g_screen == SCR_CONTROLS)
+         screen_controls(edges, pad);
+      else if (screen_settings(edges) == UI_ACT_RELAUNCH)
       {
          relaunch = 1;
          g_screen = SCR_MENU;   /* screen_settings already consumed O */
       }
       vid_overlay_end();
+      demo_dump_flush();
       sceDisplayWaitVblankStart();
       vid_swap();
    }
+   /* Leave the ambient texture as the browser had it: nothing baked (the
+    * browser runs before any launch).  A pick bakes its own at that time,
+    * and a game with no art must not inherit this one's. */
+   g_ov_browse = 0;
+   vid_ambient_drop();
    if (g_settings_dirty)
    {
       pcfg_save();
@@ -3605,12 +6601,275 @@ static void browser_dump(const char *name)
       fe_evt("ge_dump file=%s.bmp ui=1", name);
 }
 
+/* ---- "Quit to game list": the hold and the crossfade ---------------------
+ * (docs/INPROC-RETURN.md)  The player picks Quit to game list; the menu goes
+ * and the picture it sat on stays, scrimmed exactly as the menu had it, with
+ * one chip in the middle -- the loading screen's ring and "Returning to game
+ * list...".  The game unloads under it (main_psp.c ticks the ring between
+ * the teardown's steps, the ROM scan ticks it per game found), and the
+ * browser's first UI_RETURN_FADE_FRAMES frames draw the same picture over
+ * themselves at a falling alpha: a crossfade, with no black frame anywhere.
+ *
+ * When the unload is refused and the EBOOT relaunches instead, the hold is
+ * what stays on screen until the firmware blanks it; the new process is
+ * told (argv) and its browser fades in from black (ui_return_fade_in).
+ *
+ * No heap, no VRAM: the picture is the wake snapshot in the netdrv arena,
+ * which outlives the game. */
+#define RET_TICK_US  50000u
+#define RET_CHIP_H   24
+static int      g_ret_on;      /* 1 hold/crossfade, 2 fade in from black */
+static int      g_ret_k;       /* crossfade frames drawn                  */
+static unsigned g_ret_last;    /* last hold frame presented               */
+static int      g_ret_dump;    /* harness `ret_dumps`: GE-dump the frames */
+static int      g_ret_dump_k;  /* crossfade frame to dump after this draw */
+static unsigned g_ret_n;       /* returns so far (dump names)             */
+static unsigned g_ret_t0;      /* when the hold went up (EVT ms=)         */
+
+/* The chip, centred: ring, then the line, on a plate in the accent colour
+ * (the Controls page's bound chip, a row taller). */
+static void ret_chip(int a, unsigned now)
+{
+   static const signed char ring[8][2] = {
+      {0,-7}, {5,-5}, {7,0}, {5,5}, {0,7}, {-5,5}, {-7,0}, {-5,-5}
+   };
+   static const char msg[] = "Returning to game list...";
+   int tw = vid_text_w(msg), w = 12 + 16 + 10 + tw + 14, i;
+   int x = (VID_SCR_W - w) / 2, y = (VID_SCR_H - RET_CHIP_H) / 2;
+   int cx = x + 12 + 8, cy = y + RET_CHIP_H / 2;
+   vid_rect(x, y, w, RET_CHIP_H, C_BG_BOT, (200 * a) / 255);
+   vid_rect(x, y, w, RET_CHIP_H, C_ACCENT, ((g_pcfg.theme == 1 ? 28 : 40) * a) / 255);
+   vid_rect(x, y + RET_CHIP_H - 2, w, 2, skin_of(g_pcfg.console)->accent, a);
+   for (i = 0; i < 8; i++)
+      vid_rect(cx + ring[i][0] - 1, cy + ring[i][1] - 1, 3, 3, C_TITLE,
+               ((50 + 25 * ((i + 8 - (now / 100000) % 8) % 8)) * a) / 255);
+   vid_text_a(x + 12 + 16 + 10, vid_text_y_in(y, RET_CHIP_H), msg, C_SEL, a);
+}
+
+/* The hold picture at alpha `a` (255: exactly the menu's backdrop at its
+ * resting scrim, minus the menu). */
+static void ret_layer(int a, unsigned now)
+{
+   ov_theme();
+   if (g_ret_on == 2)
+   {
+      vid_rect(0, 0, VID_SCR_W, VID_SCR_H, 0x0000, a);
+      return;
+   }
+   if (g_ov_frame)
+      vid_image_screen(g_ov_frame, 256, 256, g_ov_fw, g_ov_fh, a);
+   vid_rect(0, 0, VID_SCR_W, VID_SCR_H, C_BG_BOT,
+            ((g_ov_frame ? OV_SCRIM : 255) * a) / 255);
+   vid_gradient_a(0, OV_RAMP_Y, VID_SCR_W, VID_SCR_H - OV_RAMP_Y, C_BG_BOT,
+                  0, (165 * a) / 255);
+   ret_chip(a, now);
+}
+
+static void ret_present(void)
+{
+   unsigned now = sceKernelGetSystemTimeLow();
+   vid_overlay_begin(1);
+   if (!g_ov_frame)
+      vid_rect(0, 0, VID_SCR_W, VID_SCR_H, C_BG_BOT, 255);
+   ret_layer(255, now);
+   vid_overlay_end();
+   if (g_ret_dump && !g_ret_last)
+   {
+      char nm[32];
+      snprintf(nm, sizeof(nm), "ge_ret%u_hold", g_ret_n);
+      browser_dump(nm);
+   }
+   sceDisplayWaitVblankStart();
+   vid_swap();
+   g_ret_last = now ? now : 1;
+}
+
+void ui_return_dumps(int on)
+{
+   g_ret_dump = on;
+}
+
+void ui_return_hold(void)
+{
+   g_ret_on = 1;
+   g_ret_k = 0;
+   g_ret_last = 0;
+   g_ret_n++;
+   g_ret_t0 = sceKernelGetSystemTimeLow();
+
+   ret_present();
+}
+
+void ui_return_tick(void)
+{
+   if (g_ret_on == 1 &&
+       sceKernelGetSystemTimeLow() - g_ret_last >= RET_TICK_US)
+      ret_present();
+}
+
+static void ret_scan_tick(void)
+{
+   ui_return_tick();
+}
+
+void ui_return_fade_in(void)
+{
+   g_ret_on = 2;
+   g_ret_k = 0;
+}
+
+/* The browser's frame is drawn; lay the hold over it at this frame's alpha.
+ * Returns 1 while a fade is running (the caller swallows input: nothing acts
+ * on a list the player cannot fully see yet). */
+static int ret_fade_layer(void)
+{
+   int a;
+   if (!g_ret_on)
+      return 0;
+   g_ret_k++;
+   a = 255 * (UI_RETURN_FADE_FRAMES - g_ret_k) / UI_RETURN_FADE_FRAMES;
+   g_ret_dump_k = g_ret_k;
+   if (a <= 0)
+   {
+      fe_evt("ui_return fade_done mode=%d ms=%u", g_ret_on,
+             (sceKernelGetSystemTimeLow() - g_ret_t0) / 1000u);
+      g_ret_on = 0;
+      return 0;
+   }
+   ret_layer(a, sceKernelGetSystemTimeLow());
+   return 1;
+}
+
+/* Harness `ret_dumps = 1`: after the frame is drawn, before the swap. */
+static void ret_dump_frame(void)
+{
+   char nm[32];
+   int k = g_ret_dump_k;
+   g_ret_dump_k = 0;
+   if (!g_ret_dump || !k ||
+       (k != 1 && k != 4 && k != 8 && k != 12 && k != 15 &&
+        k != UI_RETURN_FADE_FRAMES))
+      return;
+   snprintf(nm, sizeof(nm), "ge_ret%u_fade%02d", g_ret_n, k);
+   browser_dump(nm);
+}
+
+/* ---- harness browser script (ui_browser_script = file) ------------------
+ * The fixed BDEMO table photographs the states; a README shoot also needs
+ * per-frame sequences (the flare, the star pop, the shelf slide) and layouts
+ * the table does not visit.  A text file, one step per line, frames counted
+ * as above:
+ *     <frame> press <UP|DOWN|LEFT|RIGHT|CROSS|CIRCLE|TRIANGLE|SQUARE|
+ *                    SELECT|START|L|R>
+ *     <frame> dump <name>              -> log/<name>.bmp
+ *     <frame> seq <last_frame> <name>  -> log/<name>_<frame>.bmp, every frame
+ *     <frame> exit
+ * Harness only (reached through the ini a release build cannot read). */
+#define BSCRIPT_MAX 192
+typedef struct { unsigned short at, until; unsigned btn; char name[24]; unsigned char verb; } bscript_step;
+enum { BS_PRESS = 1, BS_DUMP, BS_SEQ, BS_EXIT };
+static bscript_step g_bscript[BSCRIPT_MAX];
+static int g_bscript_n;
+
+static unsigned bscript_button(const char *s)
+{
+   static const struct { const char *n; unsigned b; } tab[] = {
+      { "UP", PSP_CTRL_UP }, { "DOWN", PSP_CTRL_DOWN }, { "LEFT", PSP_CTRL_LEFT },
+      { "RIGHT", PSP_CTRL_RIGHT }, { "CROSS", PSP_CTRL_CROSS },
+      { "CIRCLE", PSP_CTRL_CIRCLE }, { "TRIANGLE", PSP_CTRL_TRIANGLE },
+      { "SQUARE", PSP_CTRL_SQUARE }, { "SELECT", PSP_CTRL_SELECT },
+      { "START", PSP_CTRL_START }, { "L", PSP_CTRL_LTRIGGER },
+      { "R", PSP_CTRL_RTRIGGER },
+   };
+   unsigned k;
+   for (k = 0; k < sizeof(tab) / sizeof(tab[0]); k++)
+      if (strcmp(tab[k].n, s) == 0)
+         return tab[k].b;
+   return 0;
+}
+
+void ui_browser_script_load(const char *rel)
+{
+   extern char g_dir_base[];
+   char path[176], line[96];
+   FILE *fp;
+   snprintf(path, sizeof(path), "%s/%s", g_dir_base, rel);
+   fp = fopen(path, "r");
+   if (!fp)
+   {
+      fe_evt("ui_browser_script file=%s MISSING", rel);
+      return;
+   }
+   while (g_bscript_n < BSCRIPT_MAX && fgets(line, sizeof(line), fp))
+   {
+      bscript_step *s = &g_bscript[g_bscript_n];
+      char verb[16], arg[24], arg2[24];
+      unsigned at;
+      int n = sscanf(line, "%u %15s %23s %23s", &at, verb, arg, arg2);
+      if (n < 2 || line[0] == '#')
+         continue;
+      memset(s, 0, sizeof(*s));
+      s->at = (unsigned short)at;
+      if (!strcmp(verb, "press") && n >= 3)
+      {
+         s->verb = BS_PRESS;
+         s->btn = bscript_button(arg);
+      }
+      else if (!strcmp(verb, "dump") && n >= 3)
+      {
+         s->verb = BS_DUMP;
+         snprintf(s->name, sizeof(s->name), "%s", arg);
+      }
+      else if (!strcmp(verb, "seq") && n >= 4)
+      {
+         s->verb = BS_SEQ;
+         s->until = (unsigned short)strtoul(arg, NULL, 10);
+         snprintf(s->name, sizeof(s->name), "%s", arg2);
+      }
+      else if (!strcmp(verb, "exit"))
+         s->verb = BS_EXIT;
+      else
+         continue;
+      g_bscript_n++;
+   }
+   fclose(fp);
+   g_ui_bdemo = 1;
+   fe_evt("ui_browser_script file=%s steps=%d", rel, g_bscript_n);
+}
+
 /* Returns 1 when the script wants the browser to exit. */
 static int browser_demo(int frame, unsigned *edges)
 {
    unsigned k;
    if (!g_ui_bdemo)
       return 0;
+   if (g_bscript_n)
+   {
+      int i;
+      for (i = 0; i < g_bscript_n; i++)
+      {
+         bscript_step *s = &g_bscript[i];
+         if (s->verb == BS_SEQ)
+         {
+            if (frame >= s->at && frame <= s->until)
+            {
+               char nm[40];
+               snprintf(nm, sizeof(nm), "%s_%04d", s->name, frame);
+               browser_dump(nm);
+            }
+            continue;
+         }
+         if (s->at != frame)
+            continue;
+         if (s->verb == BS_PRESS)
+            *edges |= s->btn;
+         else if (s->verb == BS_DUMP)
+            browser_dump(s->name);
+         else if (s->verb == BS_EXIT)
+            return 1;
+      }
+      return 0;
+   }
    for (k = 0; k < sizeof(BDEMO) / sizeof(BDEMO[0]); k++)
       if (BDEMO[k].at == frame)
       {
@@ -3700,7 +6959,7 @@ int ui_browser(const char *rom_dir, char *out, size_t out_sz,
                int *out_state_slot, fe_console_t *console_out)
 {
    int n_scan = rom_scan(rom_dir, (fe_console_t)g_pcfg.console);
-   int n, cur = 0, i, idle = 0, bframe = 0;
+   int n, cur = 0, i, idle = 0;
 
    if (out_state_slot)
       *out_state_slot = 0;
@@ -3709,6 +6968,7 @@ int ui_browser(const char *rom_dir, char *out, size_t out_sz,
 
    if (n_scan < 0)
    {
+      g_ret_on = 0;
       for (i = 0; i < 180 && g_running; i++)
       {
          vid_overlay_begin(1);
@@ -3734,6 +6994,7 @@ int ui_browser(const char *rom_dir, char *out, size_t out_sz,
    if (g_rom_found > n_scan || g_rom_scan_path_errors)
    {
       char msg[80];
+      g_ret_on = 0;   /* a full-screen notice: nothing to fade from */
       const char *detail = g_rom_scan_path_errors
          ? "Some paths were too long and were skipped."
          : (n_scan == BROWSER_MAX ? "This build lists 1024 at a time."
@@ -3794,7 +7055,7 @@ int ui_browser(const char *rom_dir, char *out, size_t out_sz,
 
       sceCtrlPeekBufferPositive(&pd, 1);
       edges = pad_edges(pd.Buttons);
-      bframe++;
+      g_bframe++;
 
       /* L+R+SELECT in the browser: dump the gallery screen as displayed
        * pixels (plain file I/O — works in every build, including the
@@ -3823,8 +7084,27 @@ int ui_browser(const char *rom_dir, char *out, size_t out_sz,
             edges |= PSP_CTRL_CROSS;
          }
       }
-      if (browser_demo(bframe, &edges))
+      /* The crossfade from the game (ui_return_*): input waits for it. */
+      if (g_ret_on)
+         edges = 0;
+      if (browser_demo(g_bframe, &edges))
          break;
+      if (g_ctl_bdemo == 1 && g_bframe == 90)
+      {
+         g_ctl_bdemo = 2;
+         ctl_bdemo_start();
+         edges |= PSP_CTRL_START;
+      }
+      else if (g_ctl_bdemo == 2)
+      {
+         /* browser_settings() ran inside the previous iteration and has
+          * returned, so the settings are closed: stop the script (its last
+          * gap never plays out) and boot the game. */
+         g_ctl_bdemo = 0;
+         g_demo_on = -1;
+         fe_evt("ui_demo_done");
+         edges |= PSP_CTRL_CROSS;
+      }
 
       /* TRIANGLE cycles the active hardware family, as a flare (see
        * switch_begin).  A press while one is running finishes it -- doing
@@ -3944,6 +7224,44 @@ int ui_browser(const char *rom_dir, char *out, size_t out_sz,
       {
          char state_path[PSP_FILE_PATH_CAP];
          SceIoStat st;
+         /* SQUARE deletes the highlighted slot after an X on the panel's
+          * plate; O or any other key keeps it, and while the question is
+          * up nothing else acts (an X can never load instead). */
+         if (g_shelf_del)
+         {
+            if (edges & PSP_CTRL_CROSS)
+            {
+               int s = g_shelf_del, ok;
+               g_shelf_del = 0;
+               ok = browser_rom_state_path(rom_dir, rom, 1, state_path,
+                                           sizeof(state_path)) == 0 &&
+                    state_delete(state_path, (unsigned)s) == 0;
+               snprintf(g_shelf_note, sizeof(g_shelf_note),
+                        ok ? "Slot %d deleted" : "Slot %d not deleted", s);
+               /* Refresh what the shelf shows: the slot list from the stick,
+                * and the deleted slot's preview dropped (status 2 = none),
+                * so not even the closing slide shows it.  An empty shelf has
+                * nothing left to offer: it closes. */
+               if (ok)
+                  g_browser_preview_status[s - 1] = 2;
+               if (!browser_rom_has_state(rom_dir, rom))
+               {
+                  g_browser_state_open = 0;
+                  idle = 0;
+               }
+            }
+            else if (edges)
+               g_shelf_del = 0;
+            edges = 0;
+         }
+         if (edges)
+            g_shelf_note[0] = '\0';
+         if ((edges & PSP_CTRL_SQUARE) &&
+             g_browser_state_exists[g_browser_state_slot - 1])
+         {
+            g_shelf_del = g_browser_state_slot;
+            edges = 0;
+         }
          if (edges & PSP_CTRL_CIRCLE)
          {
             g_browser_state_open = 0;
@@ -3970,6 +7288,7 @@ int ui_browser(const char *rom_dir, char *out, size_t out_sz,
                   *out_state_slot = g_browser_state_slot;
                if (console_out)
                   *console_out = (fe_console_t)g_pcfg.console;
+               launch_art_from_browser(rom);
                ui_loading_begin(out);
                if (pcfg_remember_rom(g_roms[rom].name) != 0)
                   fe_log("Could not remember last ROM: %s", g_roms[rom].name);
@@ -3994,6 +7313,8 @@ int ui_browser(const char *rom_dir, char *out, size_t out_sz,
                   PSP_STATE_THUMB_TEX_HEIGHT * sizeof(uint16_t));
             g_browser_state_open = 1;
             g_browser_state_slot = 1;
+            g_shelf_del = 0;
+            g_shelf_note[0] = '\0';
             g_browser_preview_rom = -1;
             memset(g_browser_preview_status, 0,
                    sizeof(g_browser_preview_status));
@@ -4010,6 +7331,11 @@ int ui_browser(const char *rom_dir, char *out, size_t out_sz,
          { cur = (cur + SHELF_ROWS) % n; idle = 0; }
       if (edges & PSP_CTRL_START)
       {
+         g_bpage.rom_dir = rom_dir;
+         g_bpage.cur = cur;
+         g_bpage.n = n;
+         g_bpage.n_scan = n_scan;
+         g_bpage.idle = idle;
          if (browser_settings())
          {
             art_free_all();
@@ -4033,6 +7359,7 @@ int ui_browser(const char *rom_dir, char *out, size_t out_sz,
          }
          if (console_out)
             *console_out = (fe_console_t)g_pcfg.console;
+         launch_art_from_browser(rom);
          ui_loading_begin(out);
          if (pcfg_remember_rom(g_roms[rom].name) != 0)
             fe_log("Could not remember last ROM: %s", g_roms[rom].name);
@@ -4050,7 +7377,9 @@ int ui_browser(const char *rom_dir, char *out, size_t out_sz,
          vid_overlay_begin(1);
          browser_empty(rom_dir, n_scan);
          switch_draw();
+         ret_fade_layer();
          vid_overlay_end();
+         ret_dump_frame();
          sceDisplayWaitVblankStart();
          vid_swap();
          if ((edges & PSP_CTRL_CIRCLE) && !g_browser_favs)
@@ -4079,8 +7408,10 @@ int ui_browser(const char *rom_dir, char *out, size_t out_sz,
          shell_shelf(rom_dir, cur, n, n_scan, idle);
       browser_state_panel(rom_dir, rom, n);
       switch_draw();
+      ret_fade_layer();
 
       vid_overlay_end();
+      ret_dump_frame();
       sceDisplayWaitVblankStart();
       vid_swap();
       if (idle < 1000)

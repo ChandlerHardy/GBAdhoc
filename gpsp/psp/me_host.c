@@ -27,6 +27,14 @@ int me_host_up(void)
    return g_mb != NULL && !g_me_dead;
 }
 
+/* 1 when the watchdog gave up on the engine this session: whatever state the
+ * second core was left in, the in-process return does not bet on a clean
+ * restart and relaunches instead. */
+int me_host_was_dead(void)
+{
+   return g_me_dead != 0;
+}
+
 static int g_me_need_seh;
 
 void me_host_require_sysevent(int on)

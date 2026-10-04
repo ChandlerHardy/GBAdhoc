@@ -409,7 +409,25 @@ const char *gamepak_cap_reason = "default";
  * Whole 1 MiB blocks are carved from it before the heap is asked. */
 u8 *gamepak_spare_pool;
 u32 gamepak_spare_pool_bytes;
-/* gamepak_buffers[0 .. gamepak_static_blocks-1] point into the spare pool:
+/* A second pool, lent by the frontend (GBA_LINK: instance B's static state
+ * while no cable session runs, docs/GBA-LINK-MIRROR.md 19).  Carved after
+ * the first, under the same rules. */
+u8 *gamepak_spare_pool2;
+u32 gamepak_spare_pool2_bytes;
+/* Set by a frontend reloading the same game in-process (see
+ * init_gamepak_buffer's post-load reserve). */
+u32 gamepak_reload;
+/* A frontend that needs heap kept free for itself across a load (a link
+ * session's buffers, GBA-LINK-MIRROR.md 19) sets the size; the block is
+ * taken here, before the ROM cache's "blocks until malloc fails", and the
+ * frontend takes ownership of gamepak_hold after the load. */
+u32 gamepak_hold_bytes;
+void *gamepak_hold;
+/* The ROM cache's size at the first (non-reload) load: a reload takes at
+ * most that many blocks, so the game comes back with exactly the cache it
+ * had (the heap has a block more to give without the post-load reserve). */
+static u32 gamepak_boot_blocks;
+/* gamepak_buffers[0 .. gamepak_static_blocks-1] point into the spare pools:
  * they are not heap blocks and are never freed. */
 u32 gamepak_static_blocks;
 /* Blocks the residency attempt reached (0 = no attempt was made). */
@@ -418,6 +436,21 @@ u32 gamepak_force_swap_stubs;
 u32 gamepak_size;           /* Size of the ROM in bytes */
 u32 gamepak_file_blocks;    /* Physical payload size in 32KB blocks */
 u32 gamepak_page_loads;     /* Monotonic: 32KB ROM page faults served */
+#ifdef GBA_LINK
+/* Shared ROM between two link cores (gbalink.h).  Borrower: share_in set
+ * before retro_init.  Owner: evict_hook set while a borrower exists. */
+#include "gbalink.h"
+const gbalink_rom_share *gamepak_share_in;
+void (*gamepak_evict_hook)(u32 phys);
+static u8 *gamepak_page0_private;
+/* A borrower's own allocation, given back when the link session that loaded
+ * it ends (GBA-LINK-MIRROR.md 19): nothing else of the shared ROM is its. */
+void gamepak_share_release(void)
+{
+  free(gamepak_page0_private);
+  gamepak_page0_private = NULL;
+}
+#endif
 /* Optional boot-only observer. Runs between existing 1 MiB reads on the
  * caller's thread; never during emulation/page faults. No buffer ownership. */
 void (*gpsp_rom_load_progress)(u32 loaded, u32 total);
@@ -442,7 +475,10 @@ void (*gpsp_heap_census)(const char *where);
  * map's tail is OBJ VRAM (pages 64..95); a stale tail line hides dirty sprite
  * pages from the renderer.  Aligned, the 96-byte map starts a line, so the
  * two lines me_inv() touches are exactly the two it spans. */
-u8  vram_clean[VRAM_DIRTY_PAGES] __attribute__((aligned(64)));
+/* 128-aligned (was 64) so the MIPS stub's `lui` for the map also reaches
+ * vram_clean[VRAM_DIRTY_ANY]: a 128-byte block never straddles the 0x8000
+ * boundary where the stub's sign-extended low half would change the lui. */
+u8  vram_clean[VRAM_DIRTY_MAP_BYTES] __attribute__((aligned(128)));
 u32 vram_dirty_marks;
 bool gamepak_mirror_1m;     /* 1MiB Classic NES/Famicom Mini mirror mode */
 static u8 *gamepak_mini_rom;
@@ -523,6 +559,7 @@ void reload_timing_info()
 
 u8 read_backup(u32 address)
 {
+  DRPH_SCOPE(DRPH_MEMC);
   u8 value = 0;
   cph_bkr++;   /* phase 5h: counted, not timed -- see main.h */
 
@@ -597,13 +634,24 @@ u8 read_backup(u32 address)
 // 14bit address DMAs are made (this is done in the DMA handler).
 
 u32 eeprom_size = EEPROM_512_BYTE;
+#ifdef GBA_LINK
+/* Monotonic count of game writes to the backup chip (SRAM/flash/EEPROM):
+ * a GBA link session's "is the game saving" watch (fe_gbadual m_cart_crc)
+ * instead of re-hashing 128 KiB of each machine's battery every 30 frames
+ * (a 4-5 ms spike on a PSP-1000, twice a second). */
+u32 backup_writes;
+#endif
 u32 eeprom_mode = EEPROM_BASE_MODE;
 u32 eeprom_address = 0;
 u32 eeprom_counter = 0;
 
 void function_cc write_eeprom(u32 unused_address, u32 value)
 {
+  DRPH_SCOPE(DRPH_MEMC);
   cph_bkw++;   /* phase 5h */
+#ifdef GBA_LINK
+  backup_writes++;   /* gba_memory.h */
+#endif
   switch(eeprom_mode)
   {
     case EEPROM_BASE_MODE:
@@ -720,6 +768,7 @@ void function_cc write_eeprom(u32 unused_address, u32 value)
 
 u32 function_cc read_eeprom(void)
 {
+  DRPH_SCOPE(DRPH_MEMC);
   u32 value;
   cph_bkr++;   /* phase 5h */
 
@@ -925,6 +974,7 @@ static inline s32 signext28(u32 value)
 
 cpu_alert_type function_cc write_io_register16(u32 address, u32 value)
 {
+  DRPH_SCOPE(DRPH_MEMC);
   uint32_t ioreg = ((address & 0xffffff) >> 1);
   value &= 0xffff;
   switch(ioreg)
@@ -1090,6 +1140,7 @@ cpu_alert_type function_cc write_io_register16(u32 address, u32 value)
 
 cpu_alert_type function_cc write_io_register8(u32 address, u32 value)
 {
+  DRPH_SCOPE(DRPH_MEMC);
   address &= 0xffffff;
   if (address == 0x301) {
     if (value & 1)
@@ -1113,6 +1164,7 @@ cpu_alert_type function_cc write_io_register8(u32 address, u32 value)
 
 cpu_alert_type function_cc write_io_register32(u32 address, u32 value)
 {
+  DRPH_SCOPE(DRPH_MEMC);
   address &= 0xfffffc;
   // Handle sound FIFO data write
   if (address == 0xA0) {
@@ -1135,6 +1187,7 @@ cpu_alert_type function_cc write_io_register32(u32 address, u32 value)
 {                                                                             \
   u32 aladdr = address & ~1U;                                                 \
   u16 val16 = (value << 8) | value;                                           \
+  reg[PAL_UPDATED] = 1;                                                       \
   address16(palette_ram, aladdr) = eswap16(val16);                            \
   address16(palette_ram_converted, aladdr) = convert_palette(val16);          \
 }
@@ -1142,6 +1195,7 @@ cpu_alert_type function_cc write_io_register32(u32 address, u32 value)
 #define write_palette16(address, value)                                       \
 {                                                                             \
   u32 palette_address = address;                                              \
+  reg[PAL_UPDATED] = 1;                                                       \
   address16(palette_ram, palette_address) = eswap16(value);                   \
   value = convert_palette(value);                                             \
   address16(palette_ram_converted, palette_address) = value;                  \
@@ -1152,6 +1206,7 @@ cpu_alert_type function_cc write_io_register32(u32 address, u32 value)
   u32 palette_address = address;                                              \
   u32 value_high = value >> 16;                                               \
   u32 value_low = value & 0xFFFF;                                             \
+  reg[PAL_UPDATED] = 1;                                                       \
   address32(palette_ram, palette_address) = eswap32(value);                   \
   value_high = convert_palette(value_high);                                   \
   address16(palette_ram_converted, palette_address + 2) = value_high;         \
@@ -1162,8 +1217,12 @@ cpu_alert_type function_cc write_io_register32(u32 address, u32 value)
 
 void function_cc write_backup(u32 address, u32 value)
 {
+  DRPH_SCOPE(DRPH_MEMC);
   value &= 0xFF;
   cph_bkw++;   /* phase 5h */
+#ifdef GBA_LINK
+  backup_writes++;   /* gba_memory.h */
+#endif
 
   if(backup_type == BACKUP_EEPROM)
     return;
@@ -1296,6 +1355,7 @@ void function_cc write_backup(u32 address, u32 value)
 
 #define vram_mark(addr)                                                       \
   vram_clean[(addr) >> VRAM_DIRTY_SHIFT] = 0;                                 \
+  vram_clean[VRAM_DIRTY_ANY] = 0;                                             \
   vram_dirty_marks++                                                          \
 
 #define write_vram8()                                                         \
@@ -1627,6 +1687,7 @@ float rumble_active_pct() {
 }
 
 void function_cc write_gpio(u32 address, u32 value) {
+  DRPH_SCOPE(DRPH_MEMC);
   u8 prev_value = gpio_regs[0];
   switch(address) {
   case 0xC4:
@@ -1826,7 +1887,11 @@ static void load_game_config_over(const char *gamecode)
      if (strcmp(gbaover[i].gamepak_code, gamecode) != 0)
         continue;
 
-     printf("gamepak code match for : %s\n", gbaover[i].gamepak_code);
+     /* (Upstream printed "gamepak code match" to stdout here.  On the PSP
+      * that line went nowhere, and its first use made newlib allocate
+      * stdout's 1 KiB buffer for the life of the process -- in the middle
+      * of a game, which a heap census across an in-process return or a link
+      * session reload reads as a leak.  docs/INPROC-RETURN.md.) */
      is_known_game = true;
 
      if (gbaover[i].idle_loop_target_pc != 0)
@@ -2366,6 +2431,7 @@ static u32 dma_transfer_region_span(u32 src_ptr, u32 dst_ptr,
 
 cpu_alert_type dma_transfer(unsigned dma_chan, int *usedcycles)
 {
+  DRPH_SCOPE(DRPH_DMA);
   dma_transfer_type *dmach = &dma[dma_chan];
   u32 src_ptr = 0x0FFFFFFF & dmach->source_address & (
                    dmach->length_type == DMA_16BIT ? ~1U : ~3U);
@@ -2484,14 +2550,99 @@ static u32 evict_gamepak_page(void)
   // without triggering a "page fault"
   if (phyrom >= 0) {
     map_rom_entry(read, phyrom, NULL, gamepak_size >> 15);
+#ifdef GBA_LINK
+    if (gamepak_evict_hook)
+      gamepak_evict_hook((u32)phyrom);   /* the borrower maps it too */
+#endif
   }
 
   return ret;
 }
 
+#ifdef GBA_LINK
+/* Owner side of the shared ROM: page `phys` as this instance maps it, loaded
+ * (and possibly evicting another) when it is not. */
+static u8 *gamepak_share_page_out(u32 phys)
+{
+  u8 *m = memory_map_read[(0x8000000 >> 15) + phys];
+  return m ? m : load_gamepak_page(phys);
+}
+
+void gamepak_share_export(gbalink_rom_share *s)
+{
+  memset(s, 0, sizeof(*s));
+  s->map_read = (uint8_t *const *)memory_map_read;
+  s->page = gamepak_share_page_out;
+  s->size = gamepak_size;
+  s->file_blocks = gamepak_file_blocks;
+  s->mirror_1m = gamepak_mirror_1m;
+  s->mini_materialized = gamepak_mini_materialized;
+  s->must_swap = gamepak_must_swap();
+  s->backup_type_reset = backup_type_reset;
+  s->flash_device_id = flash_device_id;
+  s->flash_bank_cnt = flash_bank_cnt;
+}
+
+/* Borrower side: the owner evicted `phys`. */
+void gamepak_share_unmap(u32 phys)
+{
+  if (!gamepak_share_in || phys == 0)    /* page 0 is our own copy */
+    return;
+  map_rom_entry(read, phys, NULL, gamepak_size >> 15);
+}
+
+/* Borrower: map the owner's pages instead of reading the file. */
+static s32 gamepak_share_adopt(const gbalink_rom_share *s)
+{
+  u32 p, rom_blocks;
+  const u8 *pg0;
+  memory_unload_gamepak();
+  gamepak_size = s->size;
+  gamepak_file_blocks = s->file_blocks;
+  gamepak_mirror_1m = s->mirror_1m;
+  gamepak_mini_materialized = s->mini_materialized;
+  rom_blocks = gamepak_size >> 15;
+  if (!rom_blocks)
+    return -1;
+  if (!gamepak_page0_private)
+    gamepak_page0_private = (u8 *)malloc(32 * 1024);
+  pg0 = s->page(0);
+  if (!gamepak_page0_private || !pg0)
+    return -1;
+  memcpy(gamepak_page0_private, pg0, 32 * 1024);
+  map_null(read, 0x8000000, 0xD000000);
+  for (p = 0; p < rom_blocks; p++)
+  {
+    u8 *ptr = p ? s->map_read[(0x8000000 >> 15) + p] : gamepak_page0_private;
+    if (ptr)
+      map_rom_entry(read, p, ptr, rom_blocks);
+  }
+  /* The header logic reads block 0; only its first page is ever read. */
+  gamepak_buffers[0] = gamepak_page0_private;
+  gamepak_buffer_count = 0;           /* nothing of ours to evict or free */
+  return 0;
+}
+#endif
+
 u8 *load_gamepak_page(u32 physical_index)
 {
+  DRPH_SCOPE(DRPH_MEMC);
   u32 rom_blocks = gamepak_size >> 15;
+#ifdef GBA_LINK
+  if (gamepak_share_in)
+  {
+    /* Borrower: the owner's pool serves the fault. */
+    u8 *ptr;
+    gamepak_page_loads++;
+    if (!rom_blocks || physical_index % rom_blocks == 0)
+      return gamepak_page0_private;   /* before the load, or page 0 */
+    if (physical_index >= rom_blocks)
+      physical_index %= rom_blocks;
+    ptr = gamepak_share_in->page(physical_index);
+    map_rom_entry(read, physical_index, ptr, rom_blocks);
+    return ptr;
+  }
+#endif
   /* Monotonic counter: every one of these is a 32 KiB read from the storage
    * medium in the middle of emulation, so a frontend can attribute a
    * frame-time spike to ROM paging instead of guessing. */
@@ -2580,6 +2731,29 @@ u8 *load_gamepak_page(u32 physical_index)
 void init_gamepak_buffer(void)
 {
   unsigned i;
+#ifdef GBA_LINK
+  if (gamepak_share_in)
+  {
+    /* Borrower: no ROM pool of its own (gbalink.h), only its page 0.  It
+     * exists from here because a ROM lookup can happen before the game is
+     * loaded (the BIOS hooks are translated when the dynarec starts), where
+     * the owner's path would return its block 0. */
+    if (!gamepak_page0_private)
+      gamepak_page0_private = (u8 *)malloc(32 * 1024);
+    if (gamepak_page0_private)
+      memset(gamepak_page0_private, 0, 32 * 1024);
+    gamepak_buffers[0] = gamepak_page0_private;
+    gamepak_buffer_count = 0;
+    for (i = 0; i < 1024; i++)
+    {
+      gamepak_blk_queue[i].next_lru = (u16)(i + 1);
+      gamepak_blk_queue[i].phy_rom = -1;
+    }
+    gamepak_lru_head = 0;
+    gamepak_lru_tail = 0;
+    return;
+  }
+#endif
 #if defined(PSP) || defined(GPSP_TEST_GAMEPAK_BUDGET)
   /* POST-LOAD BUDGET.  The loop below takes 1 MiB blocks until malloc fails,
    * so on a PSP-1000 (where it runs out before the gamepak_buffer_cap) the
@@ -2629,7 +2803,15 @@ void init_gamepak_buffer(void)
   if (want > sizeof(gamepak_buffers) / sizeof(gamepak_buffers[0]))
     want = sizeof(gamepak_buffers) / sizeof(gamepak_buffers[0]);
   target = want > cap ? want : cap;
-  post_load_reserve = malloc(1024 * 1024);
+  /* Not on a reload of the same game (GBA-LINK-MIRROR.md 19): what the
+   * reserve keeps room for -- the frontend's allocations after the load --
+   * is still allocated from the first load, and the reserve would only
+   * cost a block. */
+  if (gamepak_hold_bytes && !gamepak_hold)
+    gamepak_hold = malloc(gamepak_hold_bytes);
+  post_load_reserve = gamepak_reload ? NULL : malloc(1024 * 1024);
+  if (gamepak_reload && gamepak_boot_blocks && target > gamepak_boot_blocks)
+    target = gamepak_boot_blocks;
 
   gamepak_buffer_count = 0;
   /* The spare pool first: memory nothing else will use, so every block
@@ -2641,6 +2823,17 @@ void init_gamepak_buffer(void)
     gamepak_buffers[gamepak_buffer_count] =
       gamepak_spare_pool + gamepak_buffer_count * gamepak_buffer_blocksize;
     gamepak_buffer_count++;
+  }
+  {
+    u32 first = gamepak_buffer_count, k = 0;
+    while (gamepak_spare_pool2 && gamepak_buffer_count < target &&
+           (k + 1) * gamepak_buffer_blocksize <= gamepak_spare_pool2_bytes)
+    {
+      gamepak_buffers[first + k] =
+        gamepak_spare_pool2 + k * gamepak_buffer_blocksize;
+      k++;
+      gamepak_buffer_count++;
+    }
   }
   gamepak_static_blocks = gamepak_buffer_count;
   while (gamepak_buffer_count < target)
@@ -2666,6 +2859,8 @@ void init_gamepak_buffer(void)
     }
   }
   free(post_load_reserve);
+  if (!gamepak_reload)
+    gamepak_boot_blocks = gamepak_buffer_count;
 #else
   u32 cap = gamepak_buffer_cap;
   // Try to allocate up to 32 blocks of 1MB each
@@ -2683,6 +2878,16 @@ void init_gamepak_buffer(void)
   }
 #endif
 
+#ifdef GBA_LINK
+  /* Block 0 is read as code before any cartridge is loaded: retro_load_game's
+   * check_variables enables the dynarec while the BIOS is not mapped yet, so
+   * init_bios_hooks translates "BIOS 0x8" from load_gamepak_page(0), which is
+   * this block (valgrind: the only uninitialised read in a link session).
+   * Make what it reads the same on every console. */
+  if (gamepak_buffer_count && gamepak_buffers[0])
+    memset(gamepak_buffers[0], 0, gamepak_buffer_blocksize);
+#endif
+
   // Initialize the memory map structure
   for (i = 0; i < 1024; i++)
   {
@@ -2696,6 +2901,10 @@ void init_gamepak_buffer(void)
 
 bool gamepak_must_swap(void)
 {
+#ifdef GBA_LINK
+  if (gamepak_share_in)
+    return gamepak_share_in->must_swap;
+#endif
   if (gamepak_mini_materialized)
     return false;
 
@@ -2738,6 +2947,9 @@ void init_memory(void)
   memset(iwram, 0, sizeof(iwram));
   memset(ewram, 0, sizeof(ewram));
   memset(vram, 0, sizeof(vram));
+  /* Written without the store paths: every page differs from any copy an
+   * observer kept (the ME's eDRAM mirror, ME_MIDFRAME_LOG's shadow). */
+  memset(vram_clean, 0, sizeof(vram_clean));
 
   write_ioreg(REG_DISPCNT, 0x80);
   write_ioreg(REG_P1, 0x3FF);
@@ -3436,6 +3648,14 @@ u32 load_gamepak(const struct retro_game_info* info, const char *name,
 {
    char game_code[5] = {0,0,0,0,0};
 
+#ifdef GBA_LINK
+   if (gamepak_share_in)
+   {
+      if (gamepak_share_adopt(gamepak_share_in))
+         return -1;
+   }
+   else
+#endif
    if (load_gamepak_raw(name))
       return -1;
 
@@ -3482,7 +3702,25 @@ u32 load_gamepak(const struct retro_game_info* info, const char *name,
     * populated its fixed gates. */
    smc_gates_reset();
 #endif
+#ifdef GBA_LINK
+   {
+      /* The cartridge's own gate set, before any is learned: a link session
+       * starts both machines from it (gbalink_core.c lk_cold_start). */
+      void gbalink_gates_snapshot(void);
+      gbalink_gates_snapshot();
+   }
+#endif
 
+#ifdef GBA_LINK
+   if (gamepak_share_in && backup_type_reset == BACKUP_UNKN)
+   {
+      /* The owner's detection, made from the blocks in file order. */
+      backup_type_reset = gamepak_share_in->backup_type_reset;
+      flash_device_id = gamepak_share_in->flash_device_id;
+      flash_bank_cnt = gamepak_share_in->flash_bank_cnt;
+   }
+   else
+#endif
    if (backup_type_reset == BACKUP_UNKN)
    {
       u32 scan_size = gamepak_size < (1024*1024) ? gamepak_size : (1024*1024);

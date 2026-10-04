@@ -65,6 +65,20 @@ static void trigger_key(u32 key)
   }
 }
 
+#ifdef GBA_LINK
+/* Link sessions (gbalink_core.c): the frame's buttons come from the lockstep,
+ * not the input callback.  Same effect on the guest as update_input's tail:
+ * the keypad IRQ on a new press, then KEYINPUT.  No turbo, no fast-forward,
+ * no GB Player hack -- neither console may apply them to a shared machine. */
+void gbalink_update_input(u32 new_key)
+{
+   if ((new_key | old_key) != old_key)
+      trigger_key(new_key);
+   old_key = new_key;
+   write_ioreg(REG_P1, (~old_key) & 0x3FF);
+}
+#endif
+
 u32 update_input(void)
 {
    unsigned i;

@@ -27,6 +27,9 @@ u32 sound_frequency = GBA_SOUND_FREQUENCY;
 u32 sound_freq_bits = 16;
 
 u32 sound_on;
+#ifdef GBA_LINK
+u32 sound_synth_off;   /* sound.h */
+#endif
 /* Mix bus. Accumulates all six channels at full 16-bit output scale
  * (PSG full swing +/-8192 per channel, direct sound +/-32768 per channel;
  * worst-case |sum| = 4*8192 + 2*32768 = 98304, so s32 entries are required).
@@ -38,11 +41,22 @@ static u32 sound_buffer_base;
 
 static fixed16_16 gbc_sound_tick_step;
 
+#ifdef LINKBENCH
+/* tools/linkbench only (never a PSP build): DirectSound FIFO bytes queued per
+ * channel, reset by the bench every frame -- the audio a thin client would
+ * need if it mixed the GBA's own sample stream itself. */
+u32 lb_fifo_bytes[2];
+#endif
+
 /* Queue 4 samples to the top of the DS FIFO, wrap around circularly */
 
 void sound_timer_queue32(u32 channel, u32 value)
 {
   direct_sound_struct *ds = &direct_sound_channel[channel];
+
+#ifdef LINKBENCH
+  lb_fifo_bytes[channel & 1] += 4;
+#endif
 
   ds->fifo[ds->fifo_top++] = value & 0xFF;
   ds->fifo_top &= 31;
@@ -60,6 +74,7 @@ void sound_timer_queue32(u32 channel, u32 value)
 
 unsigned sound_timer(fixed8_24 frequency_step, u32 channel)
 {
+  DRPH_SCOPE(DRPH_SOUND);
   int ret = 0;
   u32 sample_status = DIRECT_SOUND_INACTIVE;
   direct_sound_struct *ds = &direct_sound_channel[channel];
@@ -88,6 +103,13 @@ unsigned sound_timer(fixed8_24 frequency_step, u32 channel)
 
     sample_status = ds->status;
   }
+#ifdef GBA_LINK
+  /* Headless: advance the phase and ring position exactly as the silent
+   * path does (the same quotient), write nothing.  The FIFO pop above and
+   * the DMA refill below are unchanged. */
+  if (sound_synth_off)
+    sample_status = DIRECT_SOUND_INACTIVE;
+#endif
 
   // Unqueue 1 sample from the base of the DS FIFO and place it on the audio
   // buffer for as many samples as necessary. If the DS FIFO is 16 bytes or
@@ -366,6 +388,23 @@ u32 gbc_sound_master_volume;
   gbc_sound_render_sample_right();                                            \
   gbc_sound_render_sample_left()                                              \
 
+/* sound_synth_off (GBA link headless machine): the per-sample loop still
+ * runs -- the length, envelope and sweep counters live in it and reach
+ * SOUNDCNT_X -- but nothing is mixed. */
+#define gbc_sound_render_sample_none()                                        \
+
+#ifdef GBA_LINK
+#define gbc_sound_render_case(type, side, sample_length, envelope_op, sweep_op) \
+  if (sound_synth_off)                                                        \
+    gbc_sound_render_##type(none, sample_length, envelope_op, sweep_op)       \
+  else                                                                        \
+    gbc_sound_render_##type(side, sample_length, envelope_op, sweep_op)       \
+
+#else
+#define gbc_sound_render_case(type, side, sample_length, envelope_op, sweep_op) \
+  gbc_sound_render_##type(side, sample_length, envelope_op, sweep_op)         \
+
+#endif
 #define gbc_sound_render_samples(type, sample_length, envelope_op, sweep_op)  \
   for(i = 0; i < buffer_ticks; i++)                                           \
   {                                                                           \
@@ -422,15 +461,15 @@ u32 gbc_sound_master_volume;
       break;                                                                  \
                                                                               \
     case GBC_SOUND_LEFT:                                                      \
-      gbc_sound_render_##type(left, sample_length, envelope_op, sweep_op);    \
+      gbc_sound_render_case(type, left, sample_length, envelope_op, sweep_op);\
       break;                                                                  \
                                                                               \
     case GBC_SOUND_RIGHT:                                                     \
-      gbc_sound_render_##type(right, sample_length, envelope_op, sweep_op);   \
+      gbc_sound_render_case(type, right, sample_length, envelope_op, sweep_op);\
       break;                                                                  \
                                                                               \
     case GBC_SOUND_LEFTRIGHT:                                                 \
-      gbc_sound_render_##type(both, sample_length, envelope_op, sweep_op);    \
+      gbc_sound_render_case(type, both, sample_length, envelope_op, sweep_op);\
       break;                                                                  \
   }                                                                           \
                                                                               \
@@ -447,6 +486,7 @@ static void render_gbc_sound_body(void);
  * `amix` is measuring. */
 void render_gbc_sound()
 {
+  DRPH_SCOPE(DRPH_SOUND);
   u32 cph_t = core_phase_enter(CORE_PHASE_FINE);
   render_gbc_sound_body();
   core_phase_leave(CORE_PHASE_FINE, &cph_amix, cph_t);
@@ -896,6 +936,7 @@ unsigned sound_write_savestate(u8 *dst)
 
 u32 sound_read_samples(s16 *out, u32 frames)
 {
+  DRPH_SCOPE(DRPH_SOUND);
    u32 i;
    u32 samples_to_read   = frames << 1;
    /* Get total number of samples in the buffer */

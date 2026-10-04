@@ -24,6 +24,10 @@
 #define SERIAL_MODE_SERIAL_AW1    4  // Connected to serial cable (AdvWars emulation mode)
 #define SERIAL_MODE_SERIAL_AW2    5  // Connected to serial cable (AdvWars emulation mode)
 #define SERIAL_MODE_AUTO          6  // Choose best fit automatically
+/* GBA_LINK builds: a link cable to a second core in the same process
+ * (gbalink_core.c).  Never chosen automatically; only gbalink's begin() sets
+ * it, and nothing else in the core reacts to it. */
+#define SERIAL_MODE_CABLE         7
 
 extern int serial_mode;
 
@@ -34,6 +38,19 @@ cpu_alert_type write_rcnt(u16 value);
 // Serial IRQ interface
 u32 serial_next_event();
 bool update_serial(unsigned cycles);
+
+#ifdef GBA_LINK
+// Link cable (gbalink_core.c)
+cpu_alert_type gbalink_write_siocnt(u16 value);
+cpu_alert_type gbalink_write_rcnt(u16 value);
+bool gbalink_update_serial(void);
+u32 gbalink_next_event(void);
+int gbalink_active(void);
+int gbalink_entry_yield(int remaining_cycles);
+int gbalink_halt_yield(void);
+void gbalink_account(u32 completed_cycles);
+void gbalink_reseed_snapshot(void);
+#endif
 
 // Savestate accessors
 u32 serial_get_irq_cycles(void);

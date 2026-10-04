@@ -892,12 +892,56 @@ void utrace_note(const char *what, u32 a, u32 b)
   if (utf) fprintf(utf, "  %s %08x %08x t=%u\n", what, (unsigned)a, (unsigned)b, (unsigned)cpu_ticks);
 }
 #endif
+#ifdef SERIAL_IDLE_FAST
+/* SERIAL_IDLE_FAST (contender #3, OFF by default; docs/DYNAREC-PROFILE.md):
+ * update_serial() runs on every update_gba pass (3-7% of a solo frame).  With
+ * no transfer pending and no link client role it is provably a no-op except
+ * for the protocol fakes' cycle counter, which this does inline:
+ *   - POKE / AW1 / AW2 with netplay_client_id == 0: serialpoke_update /
+ *     serialaw_update only do `frcnt += cycles` (their IRQ branch needs a
+ *     client id), then update_serial finds serial_irq_cycles == 0 -> false;
+ *   - DISABLED / GBP / AUTO: no device update, same irq check -> false;
+ *   - RFU: NOT taken -- the adapter answers the game even with no partner.
+ * Returns 1 when it handled the pass (no IRQ), 0 to take the full path. */
+extern u32 serial_irq_cycles;
+extern unsigned *const serial_poke_frcnt;
+extern unsigned *const serial_aw_frcnt;
+static inline int serial_idle_fast(unsigned cycles)
+{
+  if (serial_irq_cycles || netplay_client_id)
+    return 0;
+  switch (serial_mode) {
+  case SERIAL_MODE_SERIAL_POKE:
+    *serial_poke_frcnt += cycles;
+    return 1;
+  case SERIAL_MODE_SERIAL_AW1:
+  case SERIAL_MODE_SERIAL_AW2:
+    *serial_aw_frcnt += cycles;
+    return 1;
+  case SERIAL_MODE_DISABLED:
+  case SERIAL_MODE_GBP:
+  case SERIAL_MODE_AUTO:
+    return 1;
+  default:
+    return 0;
+  }
+}
+#endif
+
 u32 function_cc update_gba(int remaining_cycles)
 {
+  DRPH_SCOPE(DRPH_UPD);
   u32 changed_pc = 0;
   u32 frame_complete = 0;
   irq_type irq_raised = IRQ_NONE;
   int dma_cycles;
+#ifdef GBA_LINK
+  /* Link cable stepper (gbalink_core.c): postpone this whole call -- the
+   * dynarec returns to the stepper, which later makes exactly this call with
+   * exactly this argument.  Invisible to the guest. */
+  if (serial_mode == SERIAL_MODE_CABLE && gbalink_entry_yield(remaining_cycles))
+    return 0x80000000;
+#endif
   trace_update_gba(remaining_cycles);
 #ifdef STALE_CHECK
   { void stale_scan(u32); stale_scan(0xFFFFFFFFu); }
@@ -950,12 +994,19 @@ u32 function_cc update_gba(int remaining_cycles)
     unsigned completed_cycles = execute_cycles - remaining_cycles;
     cph_ugba++;   /* phase 5h: dynarec -> C round trips per frame */
     cpu_ticks += completed_cycles;
+#ifdef GBA_LINK
+    if (serial_mode == SERIAL_MODE_CABLE)
+      gbalink_account(completed_cycles);
+#endif
 
     remaining_cycles = 0;
 
     // Timers can trigger DMA (usually sound) and consume cycles
     dma_cycles = update_timers(&irq_raised, completed_cycles);
     // Check for serial port IRQs as well.
+#ifdef SERIAL_IDLE_FAST
+    if (!serial_idle_fast(completed_cycles))
+#endif
     if (update_serial(completed_cycles))
       irq_raised |= IRQ_SERIAL;
 
@@ -1043,7 +1094,13 @@ u32 function_cc update_gba(int remaining_cycles)
            * the frame's TIME than of its line count. How much larger has
            * never been measured, and it decides whether the ME can finish
            * inside the frame it belongs to. */
+#if ME_MIDFRAME_LOG
+          me_capture_visible_end();     /* line-160 log check + map merge */
+#endif
           gpsp_visible_done_hook();
+#if ME_MIDFRAME_LOG
+          me_capture_visible_resume();
+#endif
 
           // Reinit affine transformation counters for the next frame
           video_reload_counters();
@@ -1191,7 +1248,24 @@ u32 function_cc update_gba(int remaining_cycles)
            timer[i].count < execute_cycles)
           execute_cycles = timer[i].count;
     }
+#ifdef GBA_LINK
+    /* Halted: the loop jumps from event to event; stop at the run horizon
+     * (or a blocked transfer) the same way the entry check does.  Resuming
+     * calls update_gba(0), which is exactly the next iteration. */
+    if (serial_mode == SERIAL_MODE_CABLE &&
+        reg[CPU_HALT_STATE] != CPU_ACTIVE && !frame_complete &&
+        gbalink_halt_yield())
+    {
+      gbalink_reseed_snapshot();
+      return 0x80000000;
+    }
+#endif
   } while(reg[CPU_HALT_STATE] != CPU_ACTIVE && !frame_complete);
+
+#ifdef GBA_LINK
+  if (serial_mode == SERIAL_MODE_CABLE)
+    gbalink_reseed_snapshot();
+#endif
 
   // We voluntarily limit this. It is not accurate but it would be much harder.
   dma_cycles = MIN(64, dma_cycles);

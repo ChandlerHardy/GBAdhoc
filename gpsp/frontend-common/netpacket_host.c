@@ -13,7 +13,12 @@
 
 #define NP_STATS_INTERVAL_US 5000000ull   /* EVT net_stats every ~5 s */
 #define NP_PROBE_INTERVAL_US 1000000ull
-#define NP_GB_PROTOCOL "GBAdhoc GB link v1"
+/* v2: the link session (fe_gblink.h, two Game Boys per console).  v1 was the
+ * byte-per-exchange cable (netdrv/gb_link.c), which ad-hoc jitter cannot
+ * carry; a v1 peer is refused at the handshake rather than misread. */
+#define NP_GB_PROTOCOL "GBAdhoc GB link v2"
+static const char *np_gb_proto;      /* fe_np_set_gb_protocol, NULL = above */
+static int np_stop_reason;           /* fe_np_stop_reason */
 
 static struct
 {
@@ -252,6 +257,7 @@ static void np_session_stopped(void *user, int reason)
              st.txq_hiwater, st.srtt_us, st.rto_us);
    }
    fe_evt("session_stop reason=%d", reason);
+   np_stop_reason = reason;
    if (np.gb_mode)
       np_gb_clear_peers();
    if (np.core_started)
@@ -330,7 +336,8 @@ static int fe_np_start_internal(const fe_np_config *cfg, int gb_mode)
       np_start_why = "no netpacket iface";
       return -1;
    }
-   proto = gb_mode ? NP_GB_PROTOCOL : np.rcb->protocol_version;
+   proto = gb_mode ? (np_gb_proto ? np_gb_proto : NP_GB_PROTOCOL)
+                   : np.rcb->protocol_version;
    if (!proto || !proto[0])
    {
       fe_log("fe_np_start: core has no protocol_version string");
@@ -339,6 +346,7 @@ static int fe_np_start_internal(const fe_np_config *cfg, int gb_mode)
    }
 
    np.now_us = cfg->now_us;
+   np_stop_reason = 0;
    np.probe = gb_mode ? 0 : cfg->probe;
    np.core_started = 0;
    np.failed = 0;
@@ -449,6 +457,30 @@ int fe_np_gb_local_id(uint8_t *local_id)
    return 1;
 }
 
+int fe_np_gb_send_room(void)
+{
+   uint8_t id;
+   if (!fe_np_gb_peer_ready(&id))
+      return 0;
+   return netdrv_send_capacity(np.nd, id);
+}
+
+int fe_np_gb_peer_mac(uint8_t mac[6])
+{
+   uint8_t id;
+   if (!fe_np_gb_peer_ready(&id))
+      return -1;
+   return netdrv_peer_mac(np.nd, id, mac);
+}
+
+int fe_np_gb_unacked(void)
+{
+   uint8_t id;
+   if (!fe_np_gb_peer_ready(&id))
+      return 0;
+   return netdrv_unacked(np.nd, id);
+}
+
 int fe_np_gb_send(uint16_t peer_id, const void *payload, size_t len)
 {
    if (!np.active || !np.gb_mode || !np.core_started || !np.nd ||
@@ -511,7 +543,8 @@ void fe_np_pump(void)
              "drop_dead=%u core_tx=%u core_rx=%u peers=%d "
              "srtt_us=%u rto_us=%u retx_pct=%u txq_hi=%u spill=%u "
              "rttvar_us=%u beyondwin=%u retx_age=%u/%u reorder_hi=%u "
-             "tx_ack=%u rx_ack=%u tx_data=%u pumpgap=%u/%u stale=%u/%u",
+             "tx_ack=%u rx_ack=%u tx_data=%u pumpgap=%u/%u stale=%u/%u "
+             "tx_bytes=%u rx_bytes=%u",
              st.tx_frames, st.rx_frames, st.acked, st.retx, st.rx_dup,
              st.rx_drop_crc, st.rx_drop_malformed, st.rx_drop_unknown_peer,
              st.tx_overflow, st.tx_drop_dead, np.core_tx, np.core_rx,
@@ -538,7 +571,9 @@ void fe_np_pump(void)
               * computed from that stamp, so this is the floor of the
               * over-estimate: true RTT <= srtt - stale. */
              st.stamp_stale_n ? st.stamp_stale_sum / st.stamp_stale_n : 0u,
-             st.stamp_stale_max);
+             st.stamp_stale_max,
+             /* wire bytes, every frame (the session's bandwidth) */
+             st.tx_bytes, st.rx_bytes);
       np.last_stats_us = now;
    }
 }
@@ -578,6 +613,17 @@ int fe_np_session_active(void)
 int fe_np_failed(void)
 {
    return np.failed;
+}
+
+void fe_np_set_gb_protocol(const char *proto)
+{
+   if (!np.active)
+      np_gb_proto = proto && proto[0] ? proto : NULL;
+}
+
+int fe_np_stop_reason(void)
+{
+   return np_stop_reason;
 }
 
 /* ---- peer frame-rate matching (ADR-0027) -------------------------------- */

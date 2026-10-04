@@ -267,6 +267,11 @@ extern u32 gamepak_resident_got;
  * gamepak_static_blocks and are never freed. */
 extern u8 *gamepak_spare_pool;
 extern u32 gamepak_spare_pool_bytes;
+extern u8 *gamepak_spare_pool2;
+extern u32 gamepak_reload;
+extern u32 gamepak_hold_bytes;
+extern void *gamepak_hold;
+extern u32 gamepak_spare_pool2_bytes;
 extern u32 gamepak_static_blocks;
 /* Diagnostic: emit the paged-ROM load stubs (NULL page check + fault call)
  * even when the cart is resident, so a resident run executes exactly the
@@ -277,6 +282,9 @@ extern u32 gamepak_force_swap_stubs;
 /* Monotonic count of 32 KiB ROM page faults served from the storage medium
  * (only ever nonzero when gamepak_must_swap()). Frontends take deltas. */
 extern u32 gamepak_page_loads;
+#ifdef GBA_LINK
+extern u32 backup_writes;     /* gba_memory.c */
+#endif
 /* Page reads that needed a reopen, and pages mapped with 0xFF fill where the
  * file should have supplied data.  Both should stay 0; frontends may log them. */
 extern u32 gamepak_reopens;
@@ -317,7 +325,14 @@ extern u8 vram[1024 * 96];
  * with `sb $zero` -- it has no register holding a known-nonzero byte at the
  * point of the store, and manufacturing one would cost an extra instruction
  * in the hottest store path. Reset by memset(.., 1, ..). */
-extern u8  vram_clean[VRAM_DIRTY_PAGES];
+/* One more byte after the map (the array is VRAM_DIRTY_MAP_BYTES long):
+ * vram_clean[VRAM_DIRTY_ANY] is cleared by every mark, whatever the page, so
+ * a reader that resets it can tell "nothing was written" with one load
+ * (ME_MIDFRAME_LOG's per-scanline check, video.h).  The ME and the frontend
+ * only ever touch the first VRAM_DIRTY_PAGES bytes. */
+#define VRAM_DIRTY_ANY       VRAM_DIRTY_PAGES
+#define VRAM_DIRTY_MAP_BYTES (VRAM_DIRTY_PAGES + 32)
+extern u8  vram_clean[VRAM_DIRTY_MAP_BYTES];
 extern u32 vram_dirty_marks;
 extern u8 bios_rom[1024 * 16];
 // Double buffer used for SMC detection

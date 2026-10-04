@@ -9,7 +9,7 @@
 
 #define TOAST_MAX     4
 #define TOAST_FRAMES  150   /* ~2.5 s per toast */
-#define TOAST_LEN     56
+#define TOAST_LEN     72   /* "Hosting Room 7 by Link Cable. Waiting for the other PSP." */
 
 #define COL_TEXT   0xFFFF   /* white          */
 #define COL_PANEL  0x0000   /* black          */
@@ -46,6 +46,15 @@ void osd_toast(const char *fmt, ...)
    if (toast_count == 0)
       toast_timer = TOAST_FRAMES;
    toast_count++;
+}
+
+void osd_reset(void)
+{
+   toast_head = toast_count = 0;
+   toast_timer = 0;
+   chip_session_txt[0] = '\0';
+   chip_ff_txt[0] = '\0';
+   chip_fps_txt[0] = '\0';
 }
 
 void osd_chip_session(const char *text)

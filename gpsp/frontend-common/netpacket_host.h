@@ -61,6 +61,25 @@ int fe_np_gb_peer_ready(uint8_t *peer_id);
 int fe_np_gb_local_id(uint8_t *local_id);
 /* Reliable ordered unicast payload; caller explicitly encodes GB protocol. */
 int fe_np_gb_send(uint16_t peer_id, const void *payload, size_t len);
+/* Free reliable-queue slots toward the one peer (0 without one): bulk
+ * senders (a cartridge sent to the partner) pace themselves on it. */
+int fe_np_gb_send_room(void);
+/* Reliable payloads to the GB link partner not yet acknowledged. */
+int fe_np_gb_unacked(void);
+/* The GB link partner's radio address (for the bulk lane).  0 on success. */
+int fe_np_gb_peer_mac(uint8_t mac[6]);
+
+/* The GB-mode channel's netdrv protocol string (exact match at JOIN), set
+ * before fe_np_start_gb(): NULL = "GBAdhoc GB link v2" (the GB/GBC link).
+ * A GBA link-cable room uses "GBAdhoc cable v1" (docs/GBA-LINK-UI.md), so a
+ * GB console and an older build are refused at JOIN instead of half-joining.
+ * A setter, not a fe_np_config field (ADR-0035, as fe_np_set_arq_timers). */
+void fe_np_set_gb_protocol(const char *proto);
+
+/* The last netdrv session_stopped reason (ND_STOP_*, 0 = none since the last
+ * fe_np_start*): a joiner told ND_STOP_REFUSED was turned away by a full
+ * room. */
+int fe_np_stop_reason(void);
 
 /* Short human-readable reason for the last fe_np_start() failure, for the
  * frontend to show.  Never NULL. */

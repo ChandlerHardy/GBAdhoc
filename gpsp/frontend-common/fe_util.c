@@ -109,6 +109,64 @@ void fe_sha1_hex(const void *data, size_t len, char *out_hex)
    out_hex[40] = '\0';
 }
 
+/* The streaming form reuses sha1_block; fe_sha1_hex above is untouched. */
+void fe_sha1_init(fe_sha1_ctx *c)
+{
+   c->h[0] = 0x67452301; c->h[1] = 0xEFCDAB89; c->h[2] = 0x98BADCFE;
+   c->h[3] = 0x10325476; c->h[4] = 0xC3D2E1F0;
+   c->len = 0;
+   c->used = 0;
+}
+
+void fe_sha1_update(fe_sha1_ctx *c, const void *data, size_t len)
+{
+   const uint8_t *p = (const uint8_t *)data;
+   sha1_ctx b;
+   memcpy(b.h, c->h, sizeof(b.h));
+   c->len += (uint64_t)len * 8;
+   while (len)
+   {
+      size_t n = 64 - c->used;
+      if (n > len)
+         n = len;
+      memcpy(c->buf + c->used, p, n);
+      c->used += n;
+      p += n;
+      len -= n;
+      if (c->used == 64)
+      {
+         sha1_block(&b, c->buf);
+         c->used = 0;
+      }
+   }
+   memcpy(c->h, b.h, sizeof(c->h));
+}
+
+void fe_sha1_final(fe_sha1_ctx *c, uint8_t out[20])
+{
+   uint8_t pad[64 + 8];
+   size_t pad_len;
+   sha1_ctx b;
+   int i;
+   memcpy(b.h, c->h, sizeof(b.h));
+   memset(pad, 0, sizeof(pad));
+   memcpy(pad, c->buf, c->used);
+   pad[c->used] = 0x80;
+   pad_len = (c->used < 56) ? 64 : 128;
+   for (i = 0; i < 8; i++)
+      pad[pad_len - 1 - i] = (uint8_t)(c->len >> (8 * i));
+   sha1_block(&b, pad);
+   if (pad_len == 128)
+      sha1_block(&b, pad + 64);
+   for (i = 0; i < 5; i++)
+   {
+      out[i * 4] = (uint8_t)(b.h[i] >> 24);
+      out[i * 4 + 1] = (uint8_t)(b.h[i] >> 16);
+      out[i * 4 + 2] = (uint8_t)(b.h[i] >> 8);
+      out[i * 4 + 3] = (uint8_t)b.h[i];
+   }
+}
+
 /* -------------------------------------------------------------------- bmp */
 
 static void put16(uint8_t *p, uint32_t v) { p[0] = v & 0xFF; p[1] = (v >> 8) & 0xFF; }
@@ -260,7 +318,7 @@ static char *trim(char *s)
  * typo.  Up to FE_INI_AUDIT_PATHS files, FE_INI_AUDIT_KEYS lookups each.
  *
  * NOT IN A PLAYER BUILD.  Nothing in a release registers a path (the caller
- * is telemetry-only), so the table would be 13 KB of .bss that shrinks the
+ * is telemetry-only), so the table would be ~46 KB of .bss that shrinks the
  * PSP-1000's heap for nothing.  Same condition as fe_evt.h's
  * GPSP_NO_TELEMETRY. */
 #if defined(GPSP_PLAYABLE) && !defined(GPSP_KEEP_TELEMETRY)
@@ -277,13 +335,19 @@ int fe_ini_audit_report(const char *path,
 #define ini_audit_note(path, key) do { (void)(path); (void)(key); } while (0)
 #else
 #define FE_INI_AUDIT_PATHS 2
-#define FE_INI_AUDIT_KEYS  160
+/* 384: the 3.5.0 merge (GBA link + in-process return + Save States) took
+ * main() to ~207 distinct harness keys, and every lookup past the old 160th
+ * went unrecorded -- reported as cfg_unknown, which the rig scorers' I4 rule
+ * reads as a misspelled key (INVALID).  A full table now says so itself
+ * (__audit_table_full__ below) instead of blaming real keys. */
+#define FE_INI_AUDIT_KEYS  384
 #define FE_INI_AUDIT_KLEN  40
 static struct
 {
    char path[256];
    unsigned n;
    char key[FE_INI_AUDIT_KEYS][FE_INI_AUDIT_KLEN];
+   unsigned dropped;           /* lookups the full table could not record */
 } ini_audit[FE_INI_AUDIT_PATHS];
 
 void fe_ini_audit(const char *path)
@@ -294,6 +358,7 @@ void fe_ini_audit(const char *path)
       {
          strncpy(ini_audit[i].path, path, sizeof(ini_audit[i].path) - 1);
          ini_audit[i].n = 0;
+         ini_audit[i].dropped = 0;
          return;
       }
 }
@@ -308,6 +373,8 @@ static void ini_audit_note(const char *path, const char *key)
       for (k = 0; k < ini_audit[i].n; k++)
          if (!strcmp(ini_audit[i].key[k], key))
             return;
+      if (ini_audit[i].n >= FE_INI_AUDIT_KEYS)
+         ini_audit[i].dropped++;
       if (ini_audit[i].n < FE_INI_AUDIT_KEYS)
       {
          strncpy(ini_audit[i].key[ini_audit[i].n], key, FE_INI_AUDIT_KLEN - 1);
@@ -389,21 +456,362 @@ int fe_ini_audit_report(const char *path,
       n++;
    }
    fclose(f);
+   if (ini_audit[slot].dropped)
+   {
+      /* unknown on purpose: a scorer that rejects unknown keys rejects the
+       * run for the real reason, the table, not for whichever key it lost */
+      char cnt[16];
+      snprintf(cnt, sizeof(cnt), "%u", ini_audit[slot].dropped);
+      emit(user, "__audit_table_full__", cnt, 0, (long)ini_audit[slot].dropped,
+           1);
+      n++;
+   }
    return n;
 }
 #endif   /* audit only in telemetry builds */
 
+static unsigned ini_lookups, ini_misses;
+static const char *ini_never;
+
+void fe_ini_never(const char *path)
+{
+   ini_never = path;
+}
+
+void fe_ini_stats(unsigned *lookups, unsigned *misses)
+{
+   if (lookups) *lookups = ini_lookups;
+   if (misses)  *misses  = ini_misses;
+}
+
+
+/* ---- the in-memory INI document (fe_ini_doc, see fe_util.h) --------------
+ *
+ * The same reader and writer as fe_ini_get / fe_ini_set, byte for byte, but
+ * over a buffer: the file is read once and written once.
+ *
+ *   READ.  fe_ini_get reads the file with fgets into a 512-byte line, so a
+ *   line longer than 511 bytes is seen as several; doc_get walks the buffer
+ *   in exactly those pieces and parses each with the same code, so a lookup
+ *   answers what the file lookup answered for every input, not just sane
+ *   ones.
+ *   WRITE.  fe_ini_set's rule: the FIRST line whose text, after leading
+ *   blanks, is the key, then blanks, then '=', becomes "key = value\n";
+ *   otherwise the line is appended (after a '\n' if the file did not end in
+ *   one).  Everything else -- comments, blank lines, unknown keys, order,
+ *   CR LF endings on untouched lines, later duplicates -- is kept as it is.
+ *   A set that would not fit refuses (returns -1, the document unchanged):
+ *   nothing is ever dropped to make room. */
+
+static unsigned ini_doc_hits;        /* lookups served from a document */
+static fe_ini_doc *ini_bound;        /* fe_ini_get/set of ini_bound_path   */
+static const char *ini_bound_path;   /* use this document                  */
+
+/* fe_ini_get's parse of one fgets() line, shared by file and document. */
+static int ini_line_match(char *line, const char *key, char *out,
+                          size_t out_sz)
+{
+   char *eq, *k, *v;
+   if (line[0] == '#' || line[0] == ';' || line[0] == '[')
+      return 0;
+   eq = strchr(line, '=');
+   if (!eq)
+      return 0;
+   *eq = '\0';
+   k = trim(line);
+   v = trim(eq + 1);
+   if (strcmp(k, key) != 0)
+      return 0;
+   strncpy(out, v, out_sz - 1);
+   out[out_sz - 1] = '\0';
+   return 1;
+}
+
+/* Last resort for a save cut short by a power loss (fe_ini_doc_save): runs
+ * only when `path` itself is missing. */
+static int ini_exists(const char *p)
+{
+   FILE *f = fopen(p, "rb");
+   if (!f)
+      return 0;
+   fclose(f);
+   return 1;
+}
+
+int fe_ini_recover(const char *path)
+{
+   char tmp[FE_INI_PATH_CAP + 8], bak[FE_INI_PATH_CAP + 8];
+   if (snprintf(tmp, sizeof(tmp), "%s.tmp", path) >= (int)sizeof(tmp) ||
+       snprintf(bak, sizeof(bak), "%s.bak", path) >= (int)sizeof(bak))
+      return -1;
+   if (ini_exists(bak))
+   {
+      /* The old file was moved aside, so the new one had already been
+       * written and closed: it is complete.  Prefer it; else the old. */
+      if (ini_exists(tmp) && rename(tmp, path) == 0)
+      {
+         remove(bak);
+         return 1;
+      }
+      return rename(bak, path) == 0 ? 2 : -1;
+   }
+   /* No old file moved aside: a .tmp here is a FIRST save that never
+    * finished, so it may be a fragment.  Never use it. */
+   if (ini_exists(tmp))
+      remove(tmp);
+   return 0;
+}
+
+int fe_ini_doc_load(fe_ini_doc *d, const char *path)
+{
+   FILE *f;
+   size_t n;
+   memset(d, 0, sizeof(*d));
+   ini_lookups++;                       /* it is a file open, like a get */
+   f = fopen(path, "rb");
+   if (!f && fe_ini_recover(path) > 0)
+      f = fopen(path, "rb");
+   if (!f)
+   {
+      ini_misses++;
+      d->buf[0] = '\0';
+      d->ok = 1;                         /* absent: an empty document */
+      return 0;
+   }
+   d->existed = 1;
+   n = fread(d->buf, 1, sizeof(d->buf) - 1, f);
+   if ((n == sizeof(d->buf) - 1 && fgetc(f) != EOF) || ferror(f))
+   {
+      fclose(f);
+      d->buf[0] = '\0';
+      return -1;                         /* too big, or unreadable */
+   }
+   fclose(f);
+   d->buf[n] = '\0';
+   /* fe_ini_set worked on the C string: a NUL ended the file for it. */
+   d->len = strlen(d->buf);
+   d->ok = 1;
+   return 0;
+}
+
+int fe_ini_doc_get(const fe_ini_doc *d, const char *key, char *out,
+                   size_t out_sz)
+{
+   const char *p;
+   char line[512];
+   if (!d || !d->ok)
+      return 0;
+   ini_doc_hits++;
+   p = d->buf;
+   while (*p)
+   {
+      /* One fgets(line, 512): up to 511 bytes, or through the newline. */
+      size_t n = 0;
+      while (p[n] && n < sizeof(line) - 1)
+         if (p[n++] == '\n')
+            break;
+      memcpy(line, p, n);
+      line[n] = '\0';
+      p += n;
+      if (ini_line_match(line, key, out, out_sz))
+         return 1;
+   }
+   return 0;
+}
+
+long fe_ini_doc_get_int(const fe_ini_doc *d, const char *key, long def)
+{
+   char buf[64];
+   char *end;
+   long v;
+   if (!fe_ini_doc_get(d, key, buf, sizeof(buf)))
+      return def;
+   v = strtol(buf, &end, 0);
+   return (end == buf) ? def : v;
+}
+
+int fe_ini_doc_set(fe_ini_doc *d, const char *key, const char *value)
+{
+   char rep[1024];                      /* "key = value\n" */
+   size_t klen = strlen(key), rlen, ls = 0, le = 0, cap = sizeof(d->buf) - 1;
+   int written, found = 0;
+   const char *line;
+
+   if (!d || !d->ok)
+      return -1;
+   written = snprintf(rep, sizeof(rep), "%s = %s\n", key, value);
+   if (written < 0 || (size_t)written >= sizeof(rep))
+   {
+      d->overflow = 1;
+      return -1;
+   }
+   rlen = (size_t)written;
+
+   for (line = d->buf; *line; )
+   {
+      const char *nl = strchr(line, '\n');
+      size_t len = nl ? (size_t)(nl - line) + 1 : strlen(line);
+      const char *p = line;
+      while (*p == ' ' || *p == '\t')
+         p++;
+      if (strncmp(p, key, klen) == 0)
+      {
+         const char *q = p + klen;
+         while (*q == ' ' || *q == '\t')
+            q++;
+         if (*q == '=')
+         {
+            ls = (size_t)(line - d->buf);
+            le = ls + len;
+            found = 1;
+            break;
+         }
+      }
+      line += len;
+   }
+
+   if (found)
+   {
+      if (le - ls == rlen && memcmp(d->buf + ls, rep, rlen) == 0)
+         return 0;                       /* already says exactly this */
+      if (d->len - (le - ls) + rlen > cap)
+      {
+         d->overflow = 1;
+         return -1;
+      }
+      memmove(d->buf + ls + rlen, d->buf + le, d->len - le + 1);
+      memcpy(d->buf + ls, rep, rlen);
+      d->len = d->len - (le - ls) + rlen;
+   }
+   else
+   {
+      size_t need = rlen + (d->len && d->buf[d->len - 1] != '\n');
+      if (d->len + need > cap)
+      {
+         d->overflow = 1;
+         return -1;
+      }
+      if (d->len && d->buf[d->len - 1] != '\n')
+         d->buf[d->len++] = '\n';
+      memcpy(d->buf + d->len, rep, rlen + 1);
+      d->len += rlen;
+   }
+   d->changed = 1;
+   return 0;
+}
+
+int fe_ini_doc_set_int(fe_ini_doc *d, const char *key, long value)
+{
+   char buf[32];
+   snprintf(buf, sizeof(buf), "%ld", value);
+   return fe_ini_doc_set(d, key, buf);
+}
+
+static int ini_write_file(const char *p, const char *data, size_t n)
+{
+   FILE *f = fopen(p, "wb");
+   int bad;
+   if (!f)
+      return -1;
+   bad = fwrite(data, 1, n, f) != n;
+   bad |= fflush(f) != 0;
+   bad |= fclose(f) != 0;
+   return bad ? -1 : 0;
+}
+
+/* ATOMIC REPLACE, WITHOUT TRUSTING RENAME TO OVERWRITE.  Whether the PSP's
+ * FAT driver replaces an existing target on sceIoRename is not something to
+ * bet a config on, so it is never asked to:
+ *
+ *   1. remove path.bak (a leftover)          path = old
+ *   2. write path.tmp completely, close it   path = old, tmp = new
+ *   3. rename path -> path.bak               bak = old, tmp = new (complete)
+ *   4. rename path.tmp -> path               path = new
+ *   5. remove path.bak                       path = new
+ *
+ * A power cut anywhere leaves either `path` (old or new, whole) or, between
+ * 3 and 4, no `path` but a complete tmp beside the old bak -- which
+ * fe_ini_recover (run by the next load) turns back into `path`, preferring
+ * the new.  A tmp with no bak beside it is a first save that never finished
+ * and is never used.  If a rename fails, the file is put back and written
+ * in place instead (the old, non-atomic way, but once, not per key). */
+int fe_ini_doc_save(fe_ini_doc *d, const char *path)
+{
+   char tmp[FE_INI_PATH_CAP + 8], bak[FE_INI_PATH_CAP + 8];
+   int moved = 0;
+   if (!d || !d->ok)
+      return -1;
+   if (!d->changed)
+      return d->overflow ? -1 : 0;       /* byte-identical: nothing to do */
+   if (snprintf(tmp, sizeof(tmp), "%s.tmp", path) >= (int)sizeof(tmp) ||
+       snprintf(bak, sizeof(bak), "%s.bak", path) >= (int)sizeof(bak))
+      return -1;
+   remove(bak);
+   if (ini_write_file(tmp, d->buf, d->len) != 0)
+   {
+      remove(tmp);
+      return -1;
+   }
+   if (d->existed)
+      moved = rename(path, bak) == 0;
+   if (rename(tmp, path) != 0)
+   {
+      int rc;
+      if (moved)
+         rename(bak, path);
+      rc = ini_write_file(path, d->buf, d->len);
+      remove(tmp);
+      d->save_fallback = 1;
+      return rc ? -1 : (d->overflow ? -1 : 0);
+   }
+   if (moved)
+      remove(bak);
+   d->existed = 1;
+   d->changed = 0;
+   return d->overflow ? -1 : 0;
+}
+
+void fe_ini_doc_bind(fe_ini_doc *d, const char *path)
+{
+#ifdef FE_INI_DOC_LEGACY
+   /* tools/tests/test_ini_doc.c: the same callers on the per-key path. */
+   d = NULL;
+#endif
+   ini_bound = d && path ? d : NULL;
+   ini_bound_path = ini_bound ? path : NULL;
+}
+
+static fe_ini_doc *ini_doc_for(const char *path)
+{
+   return (ini_bound && ini_bound_path && strcmp(path, ini_bound_path) == 0)
+      ? ini_bound : NULL;
+}
+
+unsigned fe_ini_doc_hits(void)
+{
+   return ini_doc_hits;
+}
+
 int fe_ini_get(const char *path, const char *key, char *out, size_t out_sz)
 {
-   FILE *f = fopen(path, "r");
+   FILE *f;
    /* `last_rom` can hold a browser relative path of 319 bytes plus the
     * `key = ` prefix; keep the whole setting on one line when loading it. */
    char line[512];
    int found = 0;
 
    ini_audit_note(path, key);
-   if (!f)
+   if (ini_never && strcmp(path, ini_never) == 0)
       return 0;
+   if (ini_doc_for(path))
+      return fe_ini_doc_get(ini_doc_for(path), key, out, out_sz);
+   f = fopen(path, "r");
+   ini_lookups++;
+   if (!f)
+   {
+      ini_misses++;
+      return 0;
+   }
    while (fgets(line, sizeof(line), f))
    {
       char *eq, *k, *v;
@@ -447,8 +855,11 @@ int fe_ini_set(const char *path, const char *key, const char *value)
    char out[4096 + 320];
    size_t n = 0, o = 0, klen = strlen(key);
    int replaced = 0;
-   FILE *f = fopen(path, "r");
+   FILE *f;
 
+   if (ini_doc_for(path))
+      return fe_ini_doc_set(ini_doc_for(path), key, value);
+   f = fopen(path, "r");
    if (f)
    {
       n = fread(buf, 1, sizeof(buf) - 1, f);

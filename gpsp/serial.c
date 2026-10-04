@@ -22,7 +22,12 @@
 
 int serial_mode = SERIAL_MODE_AUTO;
 
+#ifdef SERIAL_IDLE_FAST
+/* main.c's idle fast path reads it (contender #3, docs/DYNAREC-PROFILE.md) */
+u32 serial_irq_cycles = 0;
+#else
 static u32 serial_irq_cycles = 0;
+#endif
 
 /* Savestate accessors for the serial-IRQ scheduler. The pending-cycles
  * counter must be persisted: without it, a state saved mid-transaction
@@ -75,6 +80,10 @@ uint16_t serial_mul_siocnt() {
 }
 
 cpu_alert_type write_rcnt(u16 value) {
+#ifdef GBA_LINK
+  if (serial_mode == SERIAL_MODE_CABLE)
+    return gbalink_write_rcnt(value);
+#endif
   u16 oldval = read_ioreg(REG_RCNT);
   u32 pvmode = get_serial_mode(oldval, read_ioreg(REG_RCNT));
   u32 nwmode = get_serial_mode(value, read_ioreg(REG_RCNT));
@@ -106,6 +115,10 @@ cpu_alert_type write_rcnt(u16 value) {
 }
 
 cpu_alert_type write_siocnt(u16 value) {
+#ifdef GBA_LINK
+  if (serial_mode == SERIAL_MODE_CABLE)
+    return gbalink_write_siocnt(value);
+#endif
   u16 oldval = read_ioreg(REG_SIOCNT);
   u16 newval = (value & 0x7F8B) | (oldval & 0x0004);
   u32 pvmode = get_serial_mode(oldval, read_ioreg(REG_RCNT));
@@ -200,6 +213,10 @@ cpu_alert_type write_siocnt(u16 value) {
 
 // How many cycles until the next serial event happens. Return MAX otherwise.
 u32 serial_next_event() {
+#ifdef GBA_LINK
+  if (serial_mode == SERIAL_MODE_CABLE)
+    return gbalink_next_event();
+#endif
   if (serial_irq_cycles)
     return serial_irq_cycles;
   return ~0U;
@@ -207,6 +224,11 @@ u32 serial_next_event() {
 
 // Account for consumed cycles and return if a serial IRQ should be raised.
 bool update_serial(unsigned cycles) {
+  DRPH_SCOPE(DRPH_SERIAL);
+#ifdef GBA_LINK
+  if (serial_mode == SERIAL_MODE_CABLE)
+    return gbalink_update_serial();
+#endif
   // Might wanna check if the connected device has some update (IRQ).
   switch (serial_mode) {
   case SERIAL_MODE_RFU:

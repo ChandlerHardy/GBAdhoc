@@ -144,6 +144,12 @@ int mgnet_wifi_up(int conf, unsigned timeout_us)
    }
 
    stage("mod_common");
+   {
+      /* transport_adhoc.c; weak, so a host test of this file links alone. */
+      extern volatile int gbadhoc_net_touched __attribute__((weak));
+      if (&gbadhoc_net_touched)
+         gbadhoc_net_touched = 1;
+   }
    rc = sceUtilityLoadNetModule(PSP_NET_MODULE_COMMON);
    if (rc < 0)
       return fail(MGNET_ERR_MODULES, "mod_common", (unsigned)rc);

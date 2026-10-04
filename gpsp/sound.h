@@ -156,6 +156,14 @@ extern u32 gbc_sound_buffer_index;
 extern u32 gbc_sound_last_cpu_ticks;
 
 extern u32 sound_on;
+#ifdef GBA_LINK
+/* A GBA link session's headless partner machine (gbalink_core.c): no
+ * samples are mixed into its sound buffer -- nobody hears it -- while every
+ * game-visible effect of the sound hardware (FIFO consumption and the DMA
+ * refills it triggers, PSG length/envelope/sweep and SOUNDCNT_X) runs
+ * exactly as before. */
+extern u32 sound_synth_off;
+#endif
 
 void sound_timer_queue32(u32 channel, u32 value);
 unsigned sound_timer(fixed8_24 frequency_step, u32 channel);

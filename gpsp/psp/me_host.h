@@ -29,6 +29,8 @@ int  me_host_init(const char *base_dir);
 void me_host_require_sysevent(int on);
 int  me_host_up(void);
 void me_host_shutdown(void);
+/* The watchdog declared the engine dead (it fell back to the CPU). */
+int  me_host_was_dead(void);
 
 /* Stage-0 microbenchmark: times ME copies of `len` bytes across access
  * modes against the same copy on the main CPU, verifies checksums, and

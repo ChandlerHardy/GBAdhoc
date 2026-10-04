@@ -12,7 +12,8 @@ Added, and nothing else changed in behaviour:
         crc32/md5, PRX md5, RESULT.TXT (incl. frames=/evt_drop=/t_ms=)
   frontend.prev.log (a relaunch-preserved log) is collected too
   ROLE.TXT on each card must name the role it is serviced as
-  --appdir must be GBADHOC-RIG (the owner's own install is never touched)
+  --appdir must be a rig folder: GBADHOC-RIG, or GBADHOC-GBLINK for the GB
+        link rig (the owner's own install is never touched)
 Liveness is RESULT.TXT, never log growth.
 
 The console finishes a run, writes handoff/RESULT.TXT, and exposes its memory
@@ -153,6 +154,10 @@ ROLE_CRITICAL = (".gpsp-harness.ini",)
 
 
 RIG_APPDIR = "GBADHOC-RIG"
+# Every folder a rig may write to.  GBADHOC-GBLINK is the GB link rig's
+# (tools/gblink/setup_gblink_cards.py); anything else still needs
+# --allow-appdir, and GBADHOC itself is never on this list.
+RIG_APPDIRS = (RIG_APPDIR, "GBADHOC-GBLINK")
 _ARM_OF_RUN = {}          # PC cycle -> arm letter that ran in it
 _NEXT_ARM = [None]        # arm staged for the run about to start
 _MODEL_MISMATCH = []      # (drive, role, logged model, ROLE.TXT model)
@@ -203,6 +208,75 @@ def check_role_file(drive, role):
     if not txt.lower().startswith(role):
         return False, "ROLE.TXT says %r" % txt
     return True, txt
+
+
+# ---- THE PSP-1000 MEMORY GUARD ----------------------------------------------
+# A harness64 / release EBOOT asks for the 64 MiB layout (PARAM.SFO MEMSIZE=1).
+# The PSP-1000 has 32 MiB: such an EBOOT staged to it did not come back (RC
+# 3.5.0 suite run 10, 2026-10-04: the 1000 left the rig until someone reset it;
+# arm F of an earlier rig did the same).  So before a single byte is written,
+# every EBOOT.PBP that would land on a card whose ROLE.TXT names the PSP-1000 is
+# read and refused if it carries MEMSIZE=1.
+
+def eboot_memsize(path):
+    """PARAM.SFO's MEMSIZE of an EBOOT.PBP: 1 (64 MiB layout), 0, or None when
+    the key is absent; raises ValueError on a file that is not a PBP."""
+    import struct
+    with open(path, "rb") as fh:
+        head = fh.read(0x28)
+        if len(head) < 0x28 or head[:4] != b"\x00PBP":
+            raise ValueError("not a PBP")
+        sfo_off, icon0_off = struct.unpack_from("<II", head, 8)
+        fh.seek(sfo_off)
+        sfo = fh.read(max(0, icon0_off - sfo_off))
+    if sfo[:4] != b"\x00PSF":
+        raise ValueError("no PARAM.SFO")
+    keys, data, count = struct.unpack_from("<III", sfo, 8)
+    for i in range(count):
+        koff, fmt, dlen, _dmax, doff = struct.unpack_from("<HHIII", sfo, 20 + 16 * i)
+        end = sfo.index(b"\x00", keys + koff)
+        if sfo[keys + koff:end] == b"MEMSIZE":
+            if fmt == 0x0404 and dlen >= 4:
+                return struct.unpack_from("<I", sfo, data + doff)[0]
+            return 1 if sfo[data + doff:data + doff + dlen].strip(b"\x00") not in (b"", b"0") else 0
+    return None
+
+
+def is_psp1000(role_txt):
+    return "psp-1000" in (role_txt or "").lower()
+
+
+def memory_guard(stage_dir, role, role_txt):
+    """The problems staging stage_dir to this card would cause (empty = ok)."""
+    if not stage_dir or not os.path.isdir(stage_dir) or not is_psp1000(role_txt):
+        return []
+    bad = []
+    for cur, _dirs, files in os.walk(stage_dir):
+        for name in files:
+            target = name
+            for pfx in ("host-", "join-"):
+                if name.startswith(pfx):
+                    target = name[len(pfx):] if pfx[:-1] == role else None
+                    break
+            if target is None or target.upper() != "EBOOT.PBP":
+                continue
+            p = os.path.join(cur, name)
+            try:
+                mem = eboot_memsize(p)
+            except (OSError, ValueError) as e:
+                bad.append("%s: unreadable (%s)" % (p, e))
+                continue
+            if mem == 1:
+                bad.append("%s: MEMSIZE=1 (64 MiB layout) for a PSP-1000" % p)
+    return bad
+
+
+def card_role_text(drive):
+    try:
+        return open(os.path.join(card_root(drive), "ROLE.TXT"),
+                    encoding="utf-8", errors="replace").read().strip()
+    except OSError:
+        return ""
 
 
 def stage_arm(arm_dirs, arm, dest_root, role, run_id):
@@ -437,6 +511,11 @@ def collect(drive, role, run, logs_dir, stage_dir, more_runs, golden_dir=None,
     console_run = res.get("run", "?")
     arm = _ARM_OF_RUN.get(run, "x")
     stem = "auto%03d-%s-%s" % (int(tag), arm, role)
+    if res.get("status") == "parked":
+        # A parked console ran nothing: whatever is on it is not this cycle's
+        # run, and must never be scored as autoNNN (score_rig globs auto*).
+        stem = "wake%03d-%s" % (int(tag), role)
+    side = ("wake%03d" if res.get("status") == "parked" else "auto%03d")         % int(tag)                    # screenshots and saves, same rule
     src_log = os.path.join(root, "log", "frontend.log")
     # A relaunch-preserved log (console copied an uncollected frontend.log)
     prev = os.path.join(root, "log", "frontend.prev.log")
@@ -493,7 +572,7 @@ def collect(drive, role, run, logs_dir, stage_dir, more_runs, golden_dir=None,
         for name in sorted(os.listdir(logdir)):
             if name.lower().endswith(".bmp"):
                 dst = os.path.join(logs_dir,
-                                   "auto%03d-%s-%s" % (int(tag), role, name))
+                                   "%s-%s-%s" % (side, role, name))
                 if not copy_retry(os.path.join(logdir, name), dst,
                                   why="collect screenshot"):
                     continue
@@ -505,6 +584,27 @@ def collect(drive, role, run, logs_dir, stage_dir, more_runs, golden_dir=None,
     if shots:
         log("  %s %-4s %d screenshot(s): %s"
             % (drive, role, len(shots), ", ".join(shots)))
+
+    # THE RUN'S OTHER LOG FILES (gbadual_hash.txt, shash.txt, stall.txt...):
+    # the per-frame oracles a link arm writes beside frontend.log.  Left on the
+    # card they were never scored, and the next run that writes the same name
+    # destroyed them.  Same naming rule as the log.
+    extra = []
+    if os.path.isdir(logdir):
+        for name in sorted(os.listdir(logdir)):
+            if not name.lower().endswith(".txt"):
+                continue
+            dst = os.path.join(logs_dir, "%s-%s" % (stem, name))
+            if not copy_retry(os.path.join(logdir, name), dst,
+                              why="collect log file"):
+                continue
+            try:
+                os.remove(os.path.join(logdir, name))
+            except OSError:
+                pass
+            extra.append("%s (%d bytes)" % (name, os.path.getsize(dst)))
+    if extra:
+        log("  %s %-4s log files: %s" % (drive, role, ", ".join(extra)))
 
     # PRESERVE THE OUTCOME BEFORE ERASING IT.
     #
@@ -520,7 +620,7 @@ def collect(drive, role, run, logs_dir, stage_dir, more_runs, golden_dir=None,
     if os.path.isdir(romdir):
         for name in sorted(os.listdir(romdir)):
             if name.lower().endswith(".sav"):
-                dst = os.path.join(logs_dir, "auto%03d-%s-%s" % (int(tag), role, name))
+                dst = os.path.join(logs_dir, "%s-%s-%s" % (side, role, name))
                 if not copy_retry(os.path.join(romdir, name), dst,
                                   why="collect save"):
                     continue
@@ -569,6 +669,90 @@ def collect(drive, role, run, logs_dir, stage_dir, more_runs, golden_dir=None,
     except OSError:
         pass
     return res
+
+
+class WindowWatch:
+    """STAGE ONLY INTO A FRESH USB WINDOW (usb_handoff.c publishes
+    handoff/WINDOW.TXT, token=<run>-<n> seconds=<window>, BEFORE each export).
+
+    The console serves its whole window and then pulls the volume
+    (sceUsbDeactivate) whatever the PC is doing; the eject is not a signal it
+    reads.  A card that is already mounted when this loop starts -- parked
+    consoles, which offer 300 s windows back to back -- has a window of
+    UNKNOWN age: copying a 2 MB EBOOT into its last seconds is the corrupted
+    FAT this project has had before.  So a window counts only from the moment
+    its token is seen to CHANGE (or the card seen to appear), and a console is
+    serviced only while at least --window-min-left seconds of it remain.
+    A card with no WINDOW.TXT at all (an older console build) keeps the old
+    behaviour, loudly."""
+
+    def __init__(self, min_left):
+        self.min_left = min_left
+        self.st = {}      # drive -> state of its current window
+        self.said = set()
+
+    def poll(self, drive):
+        d = self.st.setdefault(drive, {"token": None, "t0": None,
+                                       "seconds": None, "absent": False,
+                                       "legacy": False, "polled": False})
+        root = card_root(drive)
+        if not os.path.isdir(root):
+            d["absent"] = True
+            d["polled"] = True
+            return
+        try:
+            with open(os.path.join(root, "handoff", "WINDOW.TXT"),
+                      errors="replace") as fh:
+                kv = dict(l.split("=", 1) for l in fh.read().split() if "=" in l)
+            tok, sec = kv.get("token"), int(kv.get("seconds", "0"))
+        except (OSError, ValueError):
+            tok, sec = None, 0
+        if tok is None:
+            d["legacy"] = True
+        elif tok != d["token"]:
+            # A change seen while polling (or the card seen to appear) dates
+            # the window; the first sight of an already-mounted card does not.
+            fresh = d["polled"] and (d["token"] is not None or d["absent"])
+            d.update(token=tok, seconds=sec, legacy=False,
+                     t0=time.time() if fresh else None)
+        d["absent"] = False
+        d["polled"] = True
+
+    def left(self, drive):
+        """Seconds left in this card's current window; None = unknown age;
+        float('inf') = a card without WINDOW.TXT (older console build)."""
+        d = self.st.get(drive) or {}
+        if d.get("legacy"):
+            return float("inf")
+        if d.get("t0") is None:
+            return None
+        return d["seconds"] - (time.time() - d["t0"])
+
+    def ok(self, drive, role):
+        left = self.left(drive)
+        d = self.st.get(drive) or {}
+        key = (drive, d.get("token"))
+        if left is None:
+            if key not in self.said:
+                self.said.add(key)
+                log("  %s (%s) window %s is of unknown age -- waiting for the "
+                    "next one (up to %ss) before writing anything"
+                    % (drive, role, d.get("token"), d.get("seconds")))
+            return False
+        if left == float("inf"):
+            if (drive, "legacy") not in self.said:
+                self.said.add((drive, "legacy"))
+                log("  %s (%s) has no handoff/WINDOW.TXT: cannot bound the USB "
+                    "window (older console build)" % (drive, role))
+            return True
+        if left < self.min_left:
+            if key + ("short",) not in self.said:
+                self.said.add(key + ("short",))
+                log("  %s (%s) window %s has %.0fs left (< %ds) -- waiting for "
+                    "the next one" % (drive, role, d.get("token"), left,
+                                      self.min_left))
+            return False
+        return True
 
 
 def main():
@@ -631,8 +815,18 @@ def main():
                     help="A=<stageDir>,B=<stageDir>: one stage dir per arm")
     ap.add_argument("--order", default="ABBA",
                     help="arm letters, cycled (default ABBA)")
+    ap.add_argument("--allow-64mib-on-1000", dest="allow_64mib",
+                    action="store_true",
+                    help="stage a MEMSIZE=1 EBOOT to a PSP-1000 card anyway "
+                         "(a deliberate release-flavour arm; the 1000 ignores "
+                         "the flag, but the rig's 1000 runs the 32 MiB harness)")
     ap.add_argument("--allow-appdir", action="store_true",
                     help="permit an --appdir other than %s" % RIG_APPDIR)
+    ap.add_argument("--window-min-left", type=float, default=30,
+                    help="service a console only while this many seconds of "
+                         "its USB window remain (handoff/WINDOW.TXT); 0 "
+                         "disables the check (default 30: staging + flush take ~10 s,"
+                         " and post-run windows are 90 s)")
     ap.add_argument("--poll", type=float, default=2.0)
     ap.add_argument("--timeout", type=float, default=1800,
                     help="seconds to wait for BOTH consoles before giving up")
@@ -640,7 +834,7 @@ def main():
 
     global APPDIR
     APPDIR = args.appdir
-    if APPDIR != RIG_APPDIR and not args.allow_appdir:
+    if APPDIR not in RIG_APPDIRS and not args.allow_appdir:
         print("REFUSING: --appdir %s -- the rig only ever writes to PSP/GAME/%s,"
               " so the owner's own install cannot be touched." % (APPDIR, RIG_APPDIR))
         return 2
@@ -681,6 +875,16 @@ def main():
         if not ok:
             print("REFUSING: %s serviced as %s but %s" % (drive, role, why))
             return 2
+        guard = []
+        for d in ([] if args.allow_64mib else
+                  list(arm_dirs.values()) if args.arms else [args.stage]):
+            guard += memory_guard(d, role, card_role_text(drive))
+        if guard:
+            print("REFUSING: %s (%s, %s) would get a 64 MiB-layout EBOOT; "
+                  "nothing was written:" % (drive, role, card_role_text(drive)))
+            for g in guard:
+                print("    " + g)
+            return 2
         if not os.path.isdir(os.path.join(card_root(drive), "handoff")):
             print("REFUSING: %s (%s) is mounted but has no PSP/GAME/%s/handoff"
                   % (drive, role, APPDIR))
@@ -716,6 +920,11 @@ def main():
         log("WARNING: no --golden. The trade mutates the save, so runs will")
         log("         diverge and are NOT a repeated measurement.")
 
+    windows = WindowWatch(args.window_min_left) \
+        if args.window_min_left > 0 else None
+    if windows:
+        for drive, _role in drives:
+            windows.poll(drive)
     forever = args.forever or args.runs == 0
     if forever:
         log("FOREVER mode: consoles will never be told to STOP.")
@@ -745,6 +954,13 @@ def main():
         waiting_since = time.time()
         next_nag = waiting_since + 300
         while time.time() < deadline and len(ready) < len(drives):
+            # Readiness is re-decided every poll: a console whose window ran
+            # short while its partner finished is not ready any more.
+            if windows:
+                for drive, role in drives:
+                    windows.poll(drive)
+                    if role in ready and not windows.ok(drive, role):
+                        del ready[role]
             now_t = time.time()
             if now_t >= next_nag:
                 missing = ", ".join("%s (%s)" % (d, r)
@@ -766,10 +982,15 @@ def main():
                 # twenty minutes on E:, costing one join log outright and then
                 # desyncing the pair so the next run had no peer.  The file is
                 # complete when it has a status= line; until then keep polling.
-                if parse_result(p) is not None:
+                if parse_result(p) is not None and (
+                        not windows or windows.ok(drive, role)):
                     ready[role] = True
-                    log("  %s (%s) is up" % (drive, role))
-            time.sleep(args.poll)
+                    left = windows.left(drive) if windows else None
+                    log("  %s (%s) is up%s" % (
+                        drive, role, "" if left in (None, float("inf"))
+                        else " (%.0fs left in its window)" % left))
+            if len(ready) < len(drives):
+                time.sleep(args.poll)
 
         if len(ready) < len(drives):
             log("TIMEOUT: only %d/%d consoles appeared. Stopping."
@@ -826,6 +1047,17 @@ def main():
             _NEXT_ARM[0] = nxt
             next_run_id = "%d-%d" % (run + 1, int(time.time()))
             log("  next run: arm %s run_id %s" % (nxt, next_run_id))
+        for drive, role in drives:
+            nd = arm_dirs[_NEXT_ARM[0]] if arm_dirs else args.stage
+            guard = [] if args.allow_64mib else memory_guard(
+                nd, role, card_role_text(drive))
+            if guard:
+                log("  REFUSING to stage %s (%s, %s): a 64 MiB-layout EBOOT for "
+                    "a PSP-1000 -- nothing written, stopping" % (
+                        drive, role, card_role_text(drive)))
+                for g in guard:
+                    log("    " + g)
+                return 2
         for drive, role in drives:
             ok, why = check_role_file(drive, role)
             if not ok:

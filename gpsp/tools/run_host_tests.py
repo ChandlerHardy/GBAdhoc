@@ -145,7 +145,34 @@ def extract_baseline(dest: Path) -> tuple[bool, str]:
         out = dest / rel
         out.parent.mkdir(parents=True, exist_ok=True)
         out.write_bytes(blob.stdout)
-    return True, "extracted %d files at %s" % (len(BASELINE_FILES), BASELINE_COMMIT[:12])
+    ok, gb_detail = extract_gb_baseline(dest / "gb")
+    if not ok:
+        return False, gb_detail
+    return True, "extracted %d files at %s; %s" % (
+        len(BASELINE_FILES), BASELINE_COMMIT[:12], gb_detail)
+
+
+# run_gb_tests proves single-player GB/GBC bit-identical to the 3.0.0 release
+# (gbcore/tests/bitident.c): the whole GB core and adapter of that commit.
+GB_BASELINE_COMMIT = "696ad10a21d92e83400d5fb45a2856e6032d2824"
+GB_BASELINE_PATHS = ("gbcore", "frontend-common/fe_console.h")
+
+
+def extract_gb_baseline(dest: Path) -> tuple[bool, str]:
+    try:
+        names = subprocess.run(
+            ["git", "ls-tree", "-r", "--name-only", GB_BASELINE_COMMIT,
+             *GB_BASELINE_PATHS], cwd=str(REPO), capture_output=True,
+            check=True, text=True).stdout.split()
+    except Exception:
+        return False, "GB baseline commit %s is not in this repository" % GB_BASELINE_COMMIT[:12]
+    for rel in names:
+        blob = subprocess.run(["git", "show", "%s:%s" % (GB_BASELINE_COMMIT, rel)],
+                              cwd=str(REPO), capture_output=True, check=True)
+        out = dest / rel
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_bytes(blob.stdout)
+    return True, "GB baseline %d files at %s" % (len(names), GB_BASELINE_COMMIT[:12])
 
 
 # -------------------------------------------------------------------- suites
@@ -217,11 +244,18 @@ def suites(env: Env, baseline: Path | None):
         # The browser's favourites list (roms/favourites.txt): in-place parse,
         # hashed lookup, add/remove compaction, serialise, and the full-list /
         # full-pool / oversized-file edges.  Pure code shared with the PSP.
+        # Also its sibling beside it on the stick, linkmode.txt, with the
+        # link table and the room names (docs/GBA-LINK-UI.md): the suite
+        # cap is 30, so the two browser-side files share one suite.
         ("fe_favs", True, lambda: None,
          "gcc -std=gnu99 -O1 -g -Wall -Wextra -Werror "
          "-fsanitize=address,undefined -Ifrontend-common "
          "-o /tmp/t_fe_favs tools/test_fe_favs.c && "
-         "ASAN_OPTIONS=detect_leaks=0 /tmp/t_fe_favs"),
+         "ASAN_OPTIONS=detect_leaks=0 /tmp/t_fe_favs && "
+         "gcc -std=gnu99 -O1 -g -Wall -Wextra -Werror "
+         "-fsanitize=address,undefined -Ifrontend-common "
+         "-o /tmp/t_link_mode tools/test_link_mode.c && "
+         "ASAN_OPTIONS=detect_leaks=0 /tmp/t_link_mode"),
 
         ("mystery_gift", True, lambda: None,
          "python3 tools/run_mgift_tests.py"),
@@ -411,10 +445,20 @@ def suites(env: Env, baseline: Path | None):
          "python3 tools/rig/test_hw_loop.py && "
          "python3 tools/rig/test_summarize_battle.py"),
 
+        # + the scale geometry and TRIANGLE presets (integer 2x included),
+        # from the same production file (docs/DISPLAY-FEATURES.md).
         ("video_buffers", True, no_sdk,
          ("gcc -std=gnu99 -w -DGPSP_PLAYABLE -ffunction-sections -fdata-sections "
           "-I%s -Ifrontend-common -Ipsp tools/test_video_buffers.c "
-          "-Wl,--gc-sections -o /tmp/t_vb && /tmp/t_vb") % sdk),
+          "-Wl,--gc-sections -o /tmp/t_vb && /tmp/t_vb && "
+          "gcc -std=gnu99 -w -DGPSP_PLAYABLE -ffunction-sections -fdata-sections "
+          "-I%s -Ifrontend-common -Ipsp tools/test_video_geometry.c "
+          "-Wl,--gc-sections -o /tmp/t_vgeo && /tmp/t_vgeo && "
+          "gcc -std=gnu99 -w -DGPSP_PLAYABLE -DUSE_PSP_RGB565_FORMAT "
+          "-ffunction-sections -fdata-sections "
+          "-I%s -Ifrontend-common -Ipsp tools/test_video_geometry.c "
+          "-Wl,--gc-sections -o /tmp/t_vgeo565 && /tmp/t_vgeo565")
+         % (sdk, sdk, sdk)),
 
         ("perf_loop", False, lambda: None,
          "python3 tools/test_perf_loop.py"),
@@ -446,11 +490,58 @@ def suites(env: Env, baseline: Path | None):
         ("gb", True, lambda: None,
          "python3 tools/run_gb_tests.py"),
 
+        # CONFIG.INI: the reader's bounds, then the control-remap table
+        # (psp/ctl_map.c: defaults == 3.0 over every pad transition, the
+        # conflict rule, validation and save/load) in both build flavours.
+        # One suite because the runner caps the suite count.
         ("fe_ini_bounds", True, lambda: None,
          ("gcc -std=gnu99 -Wall -Wextra -Werror -ffunction-sections "
           "-fdata-sections -Ifrontend-common -o /tmp/t_fe_ini_bounds "
           "tools/test_fe_ini_bounds.c -Wl,--gc-sections && "
-          "/tmp/t_fe_ini_bounds")),
+          "/tmp/t_fe_ini_bounds && "
+          "gcc -std=gnu99 -O1 -g -Wall -Wextra -Werror "
+          "-fsanitize=address,undefined -Ifrontend-common -Ipsp "
+          "-o /tmp/t_ctl_map tools/tests/test_ctl_map.c psp/ctl_map.c "
+          "psp/config_psp.c frontend-common/fe_util.c && "
+          "ASAN_OPTIONS=detect_leaks=0 /tmp/t_ctl_map && "
+          "gcc -std=gnu99 -O1 -g -Wall -Wextra -Werror -DGPSP_PLAYABLE "
+          "-DGPSP_CATCH_SELFTEST -Ifrontend-common -Ipsp "
+          "-o /tmp/t_ctl_map_rel tools/tests/test_ctl_map.c psp/ctl_map.c "
+          "psp/config_psp.c frontend-common/fe_util.c && /tmp/t_ctl_map_rel && "
+          # Save-state delete (docs/CONTROL-REMAP.md section 11): the one
+          # function that names the files a delete removes.  Here because the
+          # runner caps the suite count and this suite owns ctl_map, whose
+          # Controls page sits beside it.
+          "gcc -std=gnu99 -O1 -g -Wall -Wextra -Werror "
+          "-fsanitize=address,undefined -Ifrontend-common -Ipsp "
+          "-o /tmp/t_state_delete tools/tests/test_state_delete.c && "
+          "ASAN_OPTIONS=detect_leaks=0 /tmp/t_state_delete && "
+          # CONFIG.INI read once / written once (fe_ini_doc): the unit tests,
+          # then the same pcfg_load/pcfg_save built on the old per-key path
+          # (-DFE_INI_DOC_LEGACY) against the new one, on a real 3.0.0 and a
+          # real 3.1 beta CONFIG.INI: identical g_pcfg/g_pdisp, identical
+          # saved bytes.  Here for the same reason as the delete test.
+          "gcc -std=gnu99 -O1 -g -Wall -Wextra -Werror "
+          "-fsanitize=address,undefined -Ifrontend-common -Ipsp "
+          "-o /tmp/t_ini_doc tools/tests/test_ini_doc.c psp/ctl_map.c "
+          "psp/config_psp.c frontend-common/fe_util.c && "
+          "gcc -std=gnu99 -O1 -g -Wall -Wextra -Werror -DFE_INI_DOC_LEGACY "
+          "-Ifrontend-common -Ipsp "
+          "-o /tmp/t_ini_doc_legacy tools/tests/test_ini_doc.c psp/ctl_map.c "
+          "psp/config_psp.c frontend-common/fe_util.c && "
+          "ASAN_OPTIONS=detect_leaks=0 /tmp/t_ini_doc "
+          "tools/tests/fixtures/config-3.0.0.ini "
+          "tools/tests/fixtures/config-3.1-beta.ini && "
+          "for c in 3.0.0 3.1-beta; do "
+          "cp tools/tests/fixtures/config-$c.ini /tmp/ini-n-$c.ini && "
+          "cp tools/tests/fixtures/config-$c.ini /tmp/ini-l-$c.ini && "
+          "ASAN_OPTIONS=detect_leaks=0 /tmp/t_ini_doc dump /tmp/ini-n-$c.ini "
+          "/tmp/ini-n-$c.dump && "
+          "/tmp/t_ini_doc_legacy dump /tmp/ini-l-$c.ini /tmp/ini-l-$c.dump && "
+          "cmp /tmp/ini-n-$c.dump /tmp/ini-l-$c.dump && "
+          "cmp /tmp/ini-n-$c.ini /tmp/ini-l-$c.ini || exit 1; "
+          "echo \"PASS $c config: same fields loaded, same bytes saved\"; "
+          "done")),
     ]
 
 

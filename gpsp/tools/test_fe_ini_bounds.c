@@ -31,7 +31,25 @@ int main(void)
   assert(fgets(actual, sizeof(actual), file));
   assert(fclose(file) == 0);
   assert(strcmp(actual, "other = keep\n") == 0);
-  assert(unlink(path) == 0);
   puts("PASS oversized INI update is refused without truncating the existing file");
+
+  /* fe_ini_never: that path reads as absent without being opened, and no
+   * other path is affected. */
+  {
+    unsigned n0, n1, m;
+    char v[32];
+    assert(fe_ini_get(path, "other", v, sizeof(v)) && strcmp(v, "keep") == 0);
+    fe_ini_stats(&n0, &m);
+    fe_ini_never(path);
+    assert(!fe_ini_get(path, "other", v, sizeof(v)));
+    assert(fe_ini_get_int(path, "other", 42) == 42);
+    fe_ini_stats(&n1, &m);
+    assert(n1 == n0);
+    assert(!fe_ini_get("/nonexistent/x.ini", "other", v, sizeof(v)));
+    fe_ini_never(NULL);
+    assert(fe_ini_get(path, "other", v, sizeof(v)) && strcmp(v, "keep") == 0);
+    puts("PASS fe_ini_never skips exactly one path");
+  }
+  assert(unlink(path) == 0);
   return 0;
 }

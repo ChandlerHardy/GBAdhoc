@@ -14,6 +14,9 @@ void osd_chip_session(const char *text);  /* NULL/"" hides the chip */
 void osd_chip_ff(const char *text);       /* NULL/"" hides the chip */
 void osd_chip_fps(const char *text);      /* top-left; NULL/"" hides */
 void osd_draw(void);
+/* Forget every toast and chip: the in-process return to the game list
+ * starts the next game with the OSD a fresh boot has. */
+void osd_reset(void);
 
 #ifdef __cplusplus
 }

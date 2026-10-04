@@ -56,6 +56,117 @@ typedef struct fe_host_config
    /* GB/GBC only: the DMG palette, a GBCORE_PALETTE_* id (0 = Auto: Super
     * Game Boy colours where the game has them, grey otherwise). */
    int gb_palette;
+   /* GBC only: 1 = show CGB colours raw (the 5-to-8-bit expansion); 0, the
+    * default, = through the Game Boy Color LCD model
+    * (gbcore_set_color_correction; docs/GB-PALETTE-FIXES.md). */
+   int gbc_raw_colors;
+   /* GB/GBC, harness measurement only (GPSP_PERF_RIG's `gb_dual_rom`): also
+    * run this second cartridge headless beside the player's, interleaved
+    * one scanline at a time with the cable wired -- the machine pair of a
+    * GB link session (gbcore_dual.h), without the network.  NULL = off.
+    * gb_dual_mirror: the second machine gets the player's buttons (1) or
+    * none (0). */
+   const char *gb_dual_rom;
+   int gb_dual_mirror;
+   unsigned gb_dual_batch;   /* bench: scanlines per turn (gbdual_config) */
+   int gb_bench_headless;    /* bench: the single machine runs headless */
+   /* ...and optionally starts it from this save state (a .stN file). */
+   const char *gb_dual_state;
+#ifdef GBA_LINK
+   /* GBA link mirror, harness bench (docs/GBA-LINK-MIRROR.md): run a second
+    * GBA core on the same cartridge with the cable between them, started
+    * from every state the player's machine loads.  Its buttons are the
+    * player's (gba_dual_mirror) or a frame-stamped script; lookahead in
+    * cycles (0 = default); per-frame hashes of both machines to a file. */
+   int gba_dual;
+   int gba_dual_mirror;
+   int gba_dual_own_rom;
+   const char *gba_dual_script;
+   const char *gba_dual_autopilot;
+   unsigned gba_dual_lookahead;
+   int gba_dual_partner_audio;   /* fe_gbadual_config.partner_audio */
+   int gba_dual_sram_crc;        /* fe_gbadual_config.sram_crc */
+   unsigned gba_dual_b_jit_pin_p1; /* fe_gbadual_config.b_jit_pin_p1 */
+   int gba_link_nolend;          /* 1: keep B's block out of the ROM cache */
+   const char *gba_dual_hash;
+   /* A two-console GBA link-cable session (fe_gblink over fe_gbadual's
+    * machines, docs/GBA-LINK-MIRROR.md section 14): fe_host_gblink_start
+    * works for a GBA game, and a state load no longer restarts the bench
+    * pair.  Off unless the platform asks (harness gblink_role + gba_dual). */
+   int gba_dual_session;
+   /* Section 19: the session owns instance B's memory.  B is NOT loaded at
+    * boot; its static block is lent to this game's ROM cache, and a session
+    * start reloads this game's core without it (and loads B), a session end
+    * the reverse.  gba_session_reserve_kb: heap held across the start's
+    * reload for the session's own buffers (0 = 2560).  gba_reload_note:
+    * the platform's screen during the reload -- phase 0 begin, 1 a step,
+    * 2 done, -1 failed (what = the message for the player). */
+   int gba_dual_late;
+   /* Section 20: a cable session's translation-cache offsets mod 8 KiB, PLUS
+    * ONE (0 = keep: A the single-player pin, B gba_dual_b_jit_pin_p1), per
+    * tier ([0] SMALL = the PSP-1000, [1] LARGE = 3000/Go).  LAYOUT_PIN
+    * builds; applied by the session start's reload, undone by the end's. */
+   unsigned gba_sess_pin_a_p1[2], gba_sess_pin_b_p1[2];
+   unsigned gba_session_reserve_kb;
+   void (*gba_reload_note)(int phase, const char *what);
+   /* Harness `sessmem_fail` (GBA-LINK-MIRROR.md 19.7): the session start
+    * fails on purpose -- 1 the session's heap hold cannot be taken (asks
+    * for 2 GiB), 2 the partner machine cannot be loaded -- so the
+    * single-player restore and "Not enough memory for link play" are
+    * exercised.  0 in every player's build. */
+   int gba_sessmem_fail;
+#endif
+   /* GB link sessions: the platform's library lookup for the partner's
+    * cartridge -- a file of exactly `size` bytes whose header (0x134-0x14F)
+    * matches; the session checks its SHA-1.  NULL = never in the library
+    * (the partner then sends it). */
+   int (*gb_find_rom)(uint32_t size, const uint8_t header[0x1C], char *path,
+                      size_t cap);
+   /* Harness: the autopilot script belongs to a link session, so it waits
+    * (fe_host_autopilot_gate) until the session's machines are running. */
+   int gblink_script_waits;
+   /* GB link sessions hosted here: scanlines slot 0 may run ahead while
+    * the cable is quiet (gbdual_config_t.batch_lines; 0/1 = strict). */
+   unsigned gblink_batch;
+   /* Link sessions start from the running games' save states (the partner
+    * loads yours) and each game continues from its own state afterwards --
+    * no restart either side.  0 = power on from the battery images. */
+   int gblink_live;
+   /* Frames of this player's input repeated in each unreliable input
+    * datagram (fe_gblink_platform.input_copies; 0 = off). */
+   unsigned gblink_input_copies;
+   /* Harness: after a session, boot the game from its battery save (as a
+    * power cycle would) instead of continuing -- the clock check. */
+   int gblink_resume_boot;
+   int gblink_pace_slot0;      /* fe_gblink_local.pace_slot0 */
+   /* Frames between the periodic telemetry lines (heartbeat, fps,
+    * core_prof, gblink_stats); 0 = HEARTBEAT_INTERVAL (600). */
+   unsigned heartbeat_frames;
+   /* Harness A/B only: 1 = write the session's clock stamp back unchanged
+    * (the behaviour before the fix), to show the clock prompt it caused. */
+   int gblink_rtc_keep_session_stamp;
+   /* GB link bulk lane (optional; fe_gblink.h): large unreliable datagrams
+    * to the partner's radio address, and the ones received.  enable(1) at a
+    * session's start, enable(0) at its end.  gb_bulk_max = datagram bytes
+    * (0 = the ordered channel carries transfers); gb_bulk_rate = datagrams
+    * a frame (0 = adaptive). */
+   int (*gb_bulk_enable)(int on);
+   int (*gb_bulk_send)(const uint8_t mac[6], const void *buf, size_t len);
+   int (*gb_bulk_recv)(void *buf, size_t cap);
+   size_t gb_bulk_max;
+   unsigned gb_bulk_rate;
+   /* GB link stall absorption (fe_gblink_platform.wait): while a step waits
+    * for the partner's buttons, pump the network once and return nonzero
+    * if this display frame still has time to finish; `waited_us` = this
+    * step's wait so far.  NULL = a late input loses the display frame. */
+   int (*gblink_wait)(uint32_t waited_us);
+   /* GB link resend requests on the bulk lane (fe_gblink_platform.nack). */
+   int gblink_nack;
+   /* Harness A/B: slot-0 frames between sync hashes (0 = 240, GB and GBA
+    * sessions alike), and the 3.1 beta's byte-wise GB hash
+    * (fe_gblink_local.hash_legacy). */
+   unsigned gblink_hash_every;
+   int gblink_hash_legacy;
 
    /* Optional (ADR-0028/0029): read the core's monotonic perf counters — ROM
     * translation-cache flushes, RAM flushes, 32 KiB ROM page faults. Lets
@@ -171,6 +282,12 @@ int fe_host_boot(const fe_host_config *cfg);
 
 /* One emulated frame: retro_run + periodic SRAM dirty check + heartbeat. */
 void fe_host_run_frame(void);
+/* Force the NEXT fe_host_run_frame's video to be drawn (0) or skipped (1),
+ * overriding the frameskip option; -1 hands the decision back to it.  A
+ * skipped frame is emulated in full but neither rendered nor captured -- the
+ * same contract as the core's own frameskip (video callback with NULL).
+ * Used by the fast-forward draw gate (docs/FF-PRESETS.md); GBA and GB. */
+void fe_host_skip_override(int skip);
 /* Emulation faults the core recovered from by resetting the game (a guest
  * jump to an address that is not code).  Monotonic; the UI toasts on change. */
 unsigned fe_host_guest_faults(void);
@@ -339,6 +456,61 @@ const void *fe_host_netpacket_cb(void);
 
 /* Flush SRAM (dirty-check), retro_unload_game + retro_deinit. */
 void fe_host_shutdown(void);
+/* After fe_host_shutdown, before the next fe_host_boot in the SAME process
+ * (the PSP's in-process return to the game list): the core options back to
+ * what the first boot found, so the next game starts as a fresh boot would. */
+void fe_host_session_reset(void);
+
+/* ---- GB link sessions (fe_gblink.h) -------------------------------------
+ * After fe_np_start_gb has brought the ad-hoc session up: flush and stop the
+ * running game and start the session (host/guest; input delay in frames;
+ * rtc_seed 0 = this console's clock).  fe_host_run_frame then steps it.
+ * fe_host_gblink_state: -1 none, else FE_GBLINK_* (SETUP, RUNNING, ENDING,
+ * DONE, FAILED).  Once DONE or FAILED, fe_host_gblink_close boots the game
+ * again from its (possibly just committed) save. */
+int  fe_host_gblink_start(int is_host, unsigned input_delay, int64_t rtc_seed);
+int  fe_host_gblink_active(void);
+int  fe_host_gblink_state(void);
+void fe_host_gblink_status(char *line1, size_t cap1, char *line2, size_t cap2);
+void fe_host_gblink_progress(int *p1, int *p2);   /* per mille, -1 = none */
+/* The last step of a link session stalled (the frame shown is a repeat). */
+int fe_host_gblink_stalled(void);
+/* Telemetry: take (and reset) the running session's window
+ * (fe_gblink_take_window); 0 when there is no session, else 1.  The step's
+ * absorbed waiting is excluded from core_prof's `core`. */
+struct fe_gblink_window;
+int fe_host_gblink_window(struct fe_gblink_window *out);
+void fe_host_gblink_request_end(void);
+int  fe_host_gblink_close(void);
+/* GBA-LINK-MIRROR.md 19 (harness): a session start's (1) or end's (0)
+ * reload alone.  0 ok, -1 not enough memory (single-player restored), -2 not
+ * in late mode or a session runs, -3 the game could not be reloaded. */
+int  fe_host_gba_sessmem_cycle(int up);
+/* Harness tuning: cartridge/save chunks sent per frame (0 = default). */
+void fe_host_gblink_tune(unsigned bulk_per_frame);
+/* 1 once nothing this console sent the partner is still unacknowledged (or
+ * the partner is gone): only then may the radio go down after a session.
+ * Tearing it down at DONE lost the last FINAL in hardware run hw1 (arm W):
+ * the partner never saw it and ended FAILED, its save unwritten. */
+int  fe_host_gblink_flushed(void);
+/* Harness: stop running the single machine (the game waits, as behind the
+ * pause menu) until a session starts, so its state at link time does not
+ * depend on how long the radio took. */
+void fe_host_gblink_hold(int on);
+/* 1 when the autopilot may take its per-frame step now (always, outside a
+ * link session unless gblink_script_waits). */
+int  fe_host_autopilot_gate(void);
+/* The running session's facts for the LINKING screen (fe_gblink_progress);
+ * 0 when there is no session (out is then FAILED/none), else 1. */
+struct fe_gblink_progress;
+int  fe_host_gblink_facts(struct fe_gblink_progress *out);
+/* 1 when this boot can start a GBA link-cable session (GBA_LINK builds:
+ * instance B loaded for sessions, docs/GBA-LINK-MIRROR.md 14). */
+int  fe_host_gba_cable_ready(void);
+/* GBA cable sessions identify the cartridge by sampled slices (default 1,
+ * fe_gblink_local.rom_sampled); 0 = the streamed whole-file SHA-1.  Both
+ * consoles must agree; harness A/B only. */
+void fe_host_gba_cable_rom_sampled(int on);
 
 #ifdef __cplusplus
 }

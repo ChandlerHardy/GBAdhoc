@@ -166,6 +166,10 @@
 #endif
 #endif
 
+#if defined(ENTRY_GATES) && !defined(SMC_GATE_BITMAP)
+#error "ENTRY_GATES is tested inside the gate bitmap's scan check: it needs SMC_GATE_BITMAP."
+#endif
+
 /* Selective retirement redirects live blocks through a trampoline; a direct
  * link into one without the stable thunk points at a body that has moved. */
 #if (defined(SMC_PARTIAL_DIRECT_LINKS) || defined(SMC_PARTIAL_DIRECT_GATE)) && \

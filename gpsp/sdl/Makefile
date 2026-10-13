@@ -39,6 +39,16 @@ OBJS := obj/main_sdl.o obj/fe_host.o obj/fe_evt.o obj/fe_util.o \
         obj/fe_autopilot.o obj/netpacket_host.o \
         obj/netdrv.o obj/transport_udp.o
 
+# REWIND=1: the rewind prototype (docs/REWIND.md).  Off by default; without
+# it not one line of the rewind code is compiled.
+ifeq ($(REWIND),1)
+CFLAGS += -DREWIND
+OBJS   += obj/fe_rewind.o obj/fe_rewind_pack.o
+endif
+# e.g. EXTRA_CFLAGS=-DGPSP_PERF_RIG for the harness's 1024-step scripts
+# (tools/rewind_test.py with a long input script needs it).
+CFLAGS += $(EXTRA_CFLAGS)
+
 all: gpsp_sdl
 
 gpsp_sdl: $(OBJS) $(CORE_LIB)
@@ -66,7 +76,7 @@ obj/transport_udp.o: $(CORE_DIR)/netdrv/transport_udp.c
 
 $(CORE_LIB):
 	$(MAKE) -C $(CORE_DIR) platform=unix clean
-	$(MAKE) -C $(CORE_DIR) platform=unix -j$(shell nproc)
+	$(MAKE) -C $(CORE_DIR) platform=unix REWIND=$(REWIND) REWIND_MUTANT=$(REWIND_MUTANT) -j$(shell nproc)
 	cd $(CORE_DIR) && ar rcs sdl/$(CORE_LIB) \
 	  $$(find . -name '*.o' \
 	       -not -path './sdl/*' -not -path './psp/*' \

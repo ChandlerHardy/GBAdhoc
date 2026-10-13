@@ -965,6 +965,475 @@ bool retro_unserialize(const void* data, size_t size)
    return gba_load_state(data);
 }
 
+#ifdef REWIND
+/* ---- rewind snapshot image (docs/REWIND.md) -------------------------------
+ * The save-state image, whole, plus what a save state leaves out and a
+ * rewind cannot: the fractional audio-frame accumulator of this file (without
+ * it the frame after a restore hands out one sample more or fewer than it
+ * did the first time), the in-flight part of the sound mix ring
+ * (sound.h), and gbc_sound_wave_update: "the game wrote the wave RAM and the
+ * mixer has not yet turned it into samples".  That flag is consumed by the
+ * next mix, which with the sound switched off (every game's first seconds)
+ * can be hundreds of frames away; a restore that lost it left the wave
+ * channel with the samples of before the write until the game wrote the
+ * wave RAM again (found by rewinding to the first frames after power-on,
+ * which became reachable when a save write stopped ending the history).
+ * Fixed size and fixed layout, so two images can be XORed. */
+#define GPSP_REWIND_EXTRA  (8u + SOUND_REWIND_EXTRA_BYTES)
+
+size_t gpsp_rewind_state_size(void);
+bool gpsp_rewind_gather(void *data, size_t size);
+bool gpsp_rewind_restore(const void *data, size_t size);
+/* 1 = a restore flushes the RAM translation cache only (savestate.c);
+ * 0 = what a state load flushes, ROM and RAM both.  The frontend sets it. */
+u32 gpsp_rewind_light;
+extern u32 gba_rewind_light_restore;
+
+size_t gpsp_rewind_state_size(void)
+{
+   return GBA_STATE_MEM_SIZE + GPSP_REWIND_EXTRA;
+}
+
+/* Measurement (fe_host_rewind_opts.gather_prof): the three pieces of the
+ * serialised gather, timed apart.  gpsp_rewind_gprof(out, clock) installs
+ * the clock (NULL keeps it) and returns count / clear / save / sound totals
+ * in microseconds, zeroing them. */
+static uint64_t (*rw_gp_clock)(void);
+static u32 rw_gp[4];
+
+void gpsp_rewind_gprof(u32 out[4], uint64_t (*clock)(void))
+{
+   if (clock)
+   {
+      extern uint64_t (*gba_rewind_lclock)(void);
+      rw_gp_clock = clock;
+      gba_rewind_lclock = clock;
+   }
+   if (out)
+   {
+      memcpy(out, rw_gp, sizeof(rw_gp));
+      memset(rw_gp, 0, sizeof(rw_gp));
+   }
+}
+
+bool gpsp_rewind_gather(void *data, size_t size)
+{
+   u8 *x = (u8 *)data + GBA_STATE_MEM_SIZE;
+   uint64_t t0 = 0, t1 = 0, t2 = 0;
+   if (size != GBA_STATE_MEM_SIZE + GPSP_REWIND_EXTRA)
+      return false;
+   if (rw_gp_clock) t0 = rw_gp_clock();
+   memset(data, 0, GBA_STATE_MEM_SIZE);
+   if (rw_gp_clock) t1 = rw_gp_clock();
+   gba_save_state(data);
+   if (rw_gp_clock) t2 = rw_gp_clock();
+   memset(x, 0, 8);
+   memcpy(x, &audio_samples_accumulator, sizeof(audio_samples_accumulator));
+   x[4] = (u8)(gbc_sound_wave_update != 0);
+   sound_rewind_extra_save(x + 8);
+   if (rw_gp_clock)
+   {
+      rw_gp[0]++;
+      rw_gp[1] += (u32)(t1 - t0);
+      rw_gp[2] += (u32)(t2 - t1);
+      rw_gp[3] += (u32)(rw_gp_clock() - t2);
+   }
+   return true;
+}
+
+/* ---- the same state, in pieces (fe_rewind_span) ---------------------------
+ * For a snapshot that copies nothing it does not have to: the six big
+ * arrays are compared where they lie, so what is serialised is only the
+ * REST of the save-state image -- everything outside those arrays' bytes,
+ * a few KiB -- plus the sound in flight.
+ *
+ * The rest is produced by the unchanged save-state writers into a scratch
+ * image with gba_rewind_skip_arrays set (gba_memory.h), then gathered from
+ * the byte ranges between the arrays; a restore scatters it back and runs
+ * the unchanged loader with the same flag.  The arrays' places in the image
+ * are found once, from a real image, never assumed. */
+typedef struct gpsp_rewind_arr
+{
+   u32 bytes;
+   u8 *live;
+} gpsp_rewind_arr;
+
+#define RW_ARRAYS 6
+static struct { u32 off, len; } rw_gap[RW_ARRAYS + 1];
+static u32 rw_gaps, rw_rest_bytes;
+
+u32  gpsp_rewind_layout(u8 *scratch, gpsp_rewind_arr arr[RW_ARRAYS]);
+void gpsp_rewind_rest_gather(u8 *scratch, u8 *rest);
+bool gpsp_rewind_rest_restore(u8 *scratch, const u8 *rest, int keep_ram_code);
+int  gpsp_rewind_arrays_restore(const u8 *ref, const u8 *ewram256,
+                                const u8 *vram96, u32 *copied);
+void gpsp_rewind_map_peek(u8 *ewram256, u8 *vram96);
+void gpsp_rewind_map_clean(void);
+u32  gpsp_rewind_audio_bytes(void);
+u32  gpsp_rewind_audio_gather(u8 *dst, u32 stale);
+void gpsp_rewind_audio_restore(const u8 *src);
+int  gpsp_rewind_take_dirty(u8 *ewram256, u8 *vram96);
+void gpsp_rewind_gprof(u32 out[4], uint64_t (*clock)(void));
+
+/* scratch: GBA_STATE_MEM_SIZE bytes, kept by the caller for the two calls
+ * below.  Returns the size of the rest (a multiple of 4), 0 on failure. */
+u32 gpsp_rewind_layout(u8 *scratch, gpsp_rewind_arr arr[RW_ARRAYS])
+{
+   static const char *name[RW_ARRAYS] =
+      { "iwram", "ewram", "vram", "oamram", "palram", "ioregs" };
+   u8 *live[RW_ARRAYS];
+   const u8 *memdoc, *pad;
+   u32 i, at = 0;
+
+   live[0] = &iwram[0x8000];
+   live[1] = ewram;
+   live[2] = vram;
+   live[3] = (u8 *)oam_ram;
+   live[4] = (u8 *)palette_ram;
+   live[5] = (u8 *)io_registers;
+
+   memset(scratch, 0, GBA_STATE_MEM_SIZE);
+   gba_rewind_skip_arrays = 0;
+   gba_save_state(scratch);
+   memdoc = bson_find_key(scratch, "memory");
+   pad = bson_find_key(scratch, "zpadding");
+   if (!memdoc || !pad)
+      return 0;
+   rw_gaps = 0;
+   rw_rest_bytes = 0;
+   for (i = 0; i < RW_ARRAYS; i++)
+   {
+      const u8 *p = bson_find_key(memdoc, name[i]);
+      u32 off;
+      if (!p)
+         return 0;
+      off = (u32)(p + 5 - scratch);        /* past the length and subtype */
+      if (off < at)
+         return 0;                         /* not in the order written */
+      arr[i].bytes = bson_read_u32(p);
+      arr[i].live = live[i];
+      rw_gap[rw_gaps].off = at;
+      rw_gap[rw_gaps].len = off - at;
+      rw_rest_bytes += off - at;
+      rw_gaps++;
+      at = off + arr[i].bytes;
+   }
+   /* ...and from the last array up to the padding's bytes.  The padding
+    * and the terminator after it never change. */
+   rw_gap[rw_gaps].off = at;
+   rw_gap[rw_gaps].len = (u32)(pad + 5 - scratch) - at;
+   rw_rest_bytes += rw_gap[rw_gaps].len;
+   rw_gaps++;
+   /* + the accumulator and the wave-RAM flag */
+   rw_rest_bytes = (rw_rest_bytes + 8 + 3) & ~3u;
+   return rw_rest_bytes;
+}
+
+void gpsp_rewind_rest_gather(u8 *scratch, u8 *rest)
+{
+   u32 i, n = 0;
+   gba_rewind_skip_arrays = 1;
+   gba_save_state(scratch);
+   gba_rewind_skip_arrays = 0;
+   for (i = 0; i < rw_gaps; i++)
+   {
+      memcpy(rest + n, scratch + rw_gap[i].off, rw_gap[i].len);
+      n += rw_gap[i].len;
+   }
+   memcpy(rest + n, &audio_samples_accumulator, 4);
+   n += 4;
+   rest[n++] = (u8)(gbc_sound_wave_update != 0);
+   while (n < rw_rest_bytes)
+      rest[n++] = 0;
+}
+
+/* The arrays must already be in place (the palette is converted and the
+ * video counters reloaded from them). */
+/* Measurement (gather_prof): of a restore's time outside the arrays, the
+ * sound-ring clear and the state loader.  count / clear / load, zeroed. */
+/* out: count, sound-ring clear, loader, copying the rest into the image,
+ * then the loader's own five parts (savestate.c, gba_rewind_lprof). */
+static u32 rw_rp[4];
+void gpsp_rewind_rprof(u32 out[9]);
+void gpsp_rewind_rprof(u32 out[9])
+{
+   extern u32 gba_rewind_lprof[5];
+   memcpy(out, rw_rp, sizeof(rw_rp));
+   memcpy(out + 4, gba_rewind_lprof, sizeof(gba_rewind_lprof));
+   memset(rw_rp, 0, sizeof(rw_rp));
+   memset(gba_rewind_lprof, 0, sizeof(gba_rewind_lprof));
+}
+
+bool gpsp_rewind_rest_restore(u8 *scratch, const u8 *rest, int keep_ram_code)
+{
+   u32 i, n = 0;
+   uint64_t t0 = 0, t1 = 0, tc = 0;
+   bool ok;
+   if (rw_gp_clock) tc = rw_gp_clock();
+   for (i = 0; i < rw_gaps; i++)
+   {
+      memcpy(scratch + rw_gap[i].off, rest + n, rw_gap[i].len);
+      n += rw_gap[i].len;
+   }
+   /* The scratch may be a buffer shared with ordinary state saves: its last
+    * byte is the document's terminator whoever wrote it last. */
+   scratch[GBA_STATE_MEM_SIZE - 1] = 0;
+   gba_rewind_skip_arrays = 1;
+   gba_rewind_light_restore = !gpsp_rewind_light ? 0 : keep_ram_code ? 2 : 1;
+   if (rw_gp_clock) t0 = rw_gp_clock();
+   if (gpsp_rewind_light)
+   {
+      sound_rewind_clear_inflight();
+      gba_rewind_ring_cleared = 1;
+   }
+   if (rw_gp_clock) t1 = rw_gp_clock();
+   ok = gba_load_state(scratch);
+   if (rw_gp_clock)
+   {
+      rw_rp[0]++;
+      rw_rp[1] += (u32)(t1 - t0);
+      rw_rp[2] += (u32)(rw_gp_clock() - t1);
+      rw_rp[3] += (u32)(t0 - tc);
+   }
+   gba_rewind_ring_cleared = 0;
+   gba_rewind_light_restore = 0;
+   gba_rewind_skip_arrays = 0;
+   if (ok)
+   {
+      memcpy(&audio_samples_accumulator, rest + n, 4);
+      gbc_sound_wave_update = rest[n + 4];
+   }
+   return ok;
+}
+
+/* ---- the arrays back from the reference, only where they can differ ------
+ * ref: the six arrays as they lie in the reference image (IWRAM, EWRAM,
+ * VRAM, OAM, palette, I/O).  ewram256 / vram96: pages (1 KiB) that may
+ * differ from the reference, NULL = all of them.  IWRAM and the three small
+ * arrays are always copied whole.
+ *
+ * Returns 1 when a byte under translated RAM code changed -- then the RAM
+ * translation cache has to go (gpsp_rewind_rest_restore, keep_ram_code = 0).
+ * Code is only ever inside the tracked ranges (cpu_threaded.c), so only
+ * what is copied there is compared first.  Driver 2 runs its engine from
+ * EWRAM: its code pages do not change, and it no longer retranslates 280 KB
+ * after every restore.
+ *
+ * VRAM pages copied are marked in vram_clean for the renderer, as a store
+ * would have. */
+#ifdef HAVE_DYNAREC
+extern u32 iwram_code_min, iwram_code_max, ewram_code_min, ewram_code_max;
+#endif
+
+/* Does [off, off + len) of a RAM (live vs the reference) differ anywhere
+ * under translated code?  tags: that RAM's code-tag half, same offsets (a
+ * nonzero tag = an instruction translated from there).  Looked at a word at
+ * a time: a word with any tag in it counts whole, which is at least as wide
+ * as what the store stubs themselves check.  Only the tracked code range
+ * [cmin, cmax) can hold tags at all. */
+static int rw_code_differs(const u8 *live, const u8 *ref, const u8 *tags,
+                           u32 off, u32 len, u32 cmin, u32 cmax, u32 size)
+{
+#ifdef HAVE_DYNAREC
+   u32 lo, hi, i;
+   if (!cmax)
+      return 0;                         /* no translated code in this RAM */
+   if (cmax > cmin)
+   {
+      lo = cmin & ~15u;
+      hi = cmax + 8 < size ? cmax + 8 : size;
+   }
+   else
+   {
+      lo = 0;
+      hi = size;
+   }
+   if (off + len <= lo || off >= hi)
+      return 0;
+   if (lo < off)
+      lo = off;
+   if (hi > off + len)
+      hi = off + len;
+   lo &= ~3u;
+   hi = (hi + 3u) & ~3u;
+   for (i = lo; i < hi; i += 4)
+      if (*(const u32 *)(tags + i) &&
+          *(const u32 *)(live + i) != *(const u32 *)(ref + i))
+         return 1;
+   return 0;
+#else
+   (void)live; (void)ref; (void)tags; (void)off; (void)len; (void)cmin;
+   (void)cmax; (void)size;
+   return 0;
+#endif
+}
+
+int gpsp_rewind_arrays_restore(const u8 *ref, const u8 *ewram256,
+                               const u8 *vram96, u32 *copied)
+{
+   int code = 0;
+   u32 p, n = 0;
+#ifdef HAVE_DYNAREC
+   u32 icmin = iwram_code_min, icmax = iwram_code_max;
+   u32 ecmin = ewram_code_min, ecmax = ewram_code_max;
+#else
+   u32 icmin = 0, icmax = 0, ecmin = 0, ecmax = 0;
+#endif
+
+   code |= rw_code_differs(&iwram[0x8000], ref, iwram, 0, 0x8000, icmin, icmax,
+                           0x8000);
+   memcpy(&iwram[0x8000], ref, 0x8000);
+   ref += 0x8000;
+   n += 0x8000;
+
+   if (!ewram256)
+   {
+      code |= rw_code_differs(ewram, ref, ewram + 0x40000, 0, 0x40000, ecmin,
+                              ecmax, 0x40000);
+      memcpy(ewram, ref, 0x40000);
+      n += 0x40000;
+   }
+   else
+      for (p = 0; p < 256; p++)
+         if (ewram256[p])
+         {
+            code |= rw_code_differs(ewram, ref, ewram + 0x40000, p << 10, 1024,
+                                    ecmin, ecmax, 0x40000);
+            memcpy(ewram + (p << 10), ref + (p << 10), 1024);
+            n += 1024;
+         }
+   ref += 0x40000;
+
+   if (!vram96)
+   {
+      memcpy(vram, ref, sizeof(vram));
+      memset(vram_clean, 0, sizeof(vram_clean));
+      n += sizeof(vram);
+   }
+   else
+      for (p = 0; p < 96; p++)
+         if (vram96[p])
+         {
+            memcpy(vram + (p << 10), ref + (p << 10), 1024);
+            vram_clean[p] = 0;
+            vram_clean[VRAM_DIRTY_ANY] = 0;
+            n += 1024;
+         }
+   ref += sizeof(vram);
+
+   memcpy(oam_ram, ref, sizeof(oam_ram));
+   ref += sizeof(oam_ram);
+   memcpy(palette_ram, ref, sizeof(palette_ram));
+   ref += sizeof(palette_ram);
+   memcpy(io_registers, ref, sizeof(io_registers));
+   n += sizeof(oam_ram) + sizeof(palette_ram) + sizeof(io_registers);
+   if (copied)
+      *copied = n;
+   return code;
+}
+
+/* The written-page map as it stands, without taking it (1 = written). */
+void gpsp_rewind_map_peek(u8 *ewram256, u8 *vram96)
+{
+   u32 p;
+   for (p = 0; p < 256; p++)
+      ewram256[p] = (u8)(!gba_rewind_map_ok ||
+                         !gba_rewind_clean[RW_CLEAN_EWRAM + p]);
+   for (p = 0; p < 96; p++)
+      vram96[p] = (u8)(!gba_rewind_map_ok ||
+                       !gba_rewind_clean[RW_CLEAN_VRAM + p]);
+}
+
+/* The machine was just made equal to the reference: nothing is written. */
+void gpsp_rewind_map_clean(void)
+{
+   memset(gba_rewind_clean, 1, RW_CLEAN_BYTES);
+}
+
+void gpsp_rewind_marks_want(int on);
+void gpsp_rewind_marks_want(int on)
+{
+   gba_rewind_marks_wanted = on ? 1u : 0u;
+}
+
+int gpsp_rewind_marks_ok(void);
+int gpsp_rewind_marks_ok(void)
+{
+   return (int)gba_rewind_map_ok;
+}
+
+extern u32 gba_rewind_clock_frames;
+void gpsp_rewind_clock_sync(void);
+void gpsp_rewind_clock_mode(int frames);
+void gpsp_rewind_clock_mode(int frames)
+{
+   /* leaving the mode: one last sync, so the wall clock takes over from
+    * where the frame clock stood and never from behind it */
+   if (!frames && gba_rewind_clock_frames)
+      gpsp_rewind_clock_sync();
+   gba_rewind_clock_frames = frames ? 1u : 0u;
+}
+
+u32 gpsp_rewind_audio_bytes(void)
+{
+   return SOUND_REWIND_EXTRA_BYTES;
+}
+
+u32 gpsp_rewind_audio_gather(u8 *dst, u32 stale)
+{
+   return sound_rewind_extra_save_part(dst, stale);
+}
+
+void gpsp_rewind_audio_restore(const u8 *src)
+{
+   sound_rewind_extra_load(src);
+}
+
+/* The rewind's written-page map (gba_memory.h, gba_rewind_clean), handed
+ * over and started afresh: out[p] != 0 = page p (1 KiB) may have been
+ * written since the last call.  0 = the map cannot be trusted (the dynarec
+ * could not be given it): the outputs are untouched and the caller must
+ * read everything. */
+/* Somebody wrote guest memory past every store path (the frontend's
+ * poke): no page can be called clean. */
+void gpsp_rewind_mark_all(void);
+void gpsp_rewind_mark_all(void)
+{
+   RW_MARK_ALL();
+}
+
+int gpsp_rewind_take_dirty(u8 *ewram256, u8 *vram96)
+{
+   u32 p;
+   if (!gba_rewind_map_ok)
+      return 0;
+   for (p = 0; p < 256; p++)
+      ewram256[p] = (u8)!gba_rewind_clean[RW_CLEAN_EWRAM + p];
+   for (p = 0; p < 96; p++)
+      vram96[p] = (u8)!gba_rewind_clean[RW_CLEAN_VRAM + p];
+   memset(gba_rewind_clean, 1, RW_CLEAN_BYTES);
+   return 1;
+}
+
+bool gpsp_rewind_restore(const void *data, size_t size)
+{
+   const u8 *x = (const u8 *)data + GBA_STATE_MEM_SIZE;
+   if (size != GBA_STATE_MEM_SIZE + GPSP_REWIND_EXTRA)
+      return false;
+   gba_rewind_light_restore = gpsp_rewind_light;
+   if (!gba_load_state(data))
+   {
+      gba_rewind_light_restore = 0;
+      return false;
+   }
+   gba_rewind_light_restore = 0;
+   memcpy(&audio_samples_accumulator, x, sizeof(audio_samples_accumulator));
+   gbc_sound_wave_update = x[4];
+   sound_rewind_extra_load(x + 8);
+   return true;
+}
+#endif /* REWIND */
+
 void retro_cheat_reset(void)
 {
    cheat_clear();
@@ -1002,6 +1471,18 @@ void retro_cheat_set(unsigned index, bool enabled, const char* code)
       break;
    case CheatNoError:
       break;
+#ifdef GPSP_CHEATS
+   /* The strict parser's own reasons (cheats.h).  The PSP frontend never
+    * comes through here (fe_cheats.c shows the reason on the Cheats page);
+    * another libretro frontend gets the words. */
+   case CheatErrorSyntax:
+   case CheatErrorGameShark:
+   case CheatErrorRegion:
+   case CheatErrorAlign:
+   case CheatErrorMixed:
+      show_warning_message("Cheat type is not supported!", 2500);
+      break;
+#endif
    };
 }
 
@@ -1453,6 +1934,14 @@ void retro_run(void)
 
    input_poll_cb();
    update_input();
+
+#ifdef GPSP_CHEATS
+   /* The one fixed point codes run at (cheats.h): after this frame's input is
+    * latched (CodeBreaker button tests read KEYINPUT), before the CPU runs.
+    * No active cheat, or a link session => not even the call. */
+   if (cheats_active && !cheats_suspended)
+      cheats_apply_frame();
+#endif
 
    rumble_frame_reset();
 

@@ -51,8 +51,22 @@ typedef struct fe_host_config
    void (*yield_thread)(void);
    /* Optional wall clock (seconds since 1970) for GB/GBC cartridge RTCs.
     * NULL = C time(), which on a PSP is roughly uptime and resets MBC3
-    * clocks (Pokemon Gold/Silver/Crystal) on every boot. */
+    * clocks (Pokemon Gold/Silver/Crystal) on every boot.  For a GB/GBC game
+    * this is UTC: it stamps the save's clock trailer, which every other
+    * emulator reads and writes as UTC.  (A GBA link session also seeds its
+    * cartridge clock from it; there it is the date the game shows.) */
    time_t (*wallclock)(void);
+   /* GB/GBC saves written before the stamp was UTC (fe_host.c, "the
+    * clock trailer's stamp is UTC").
+    * Releases up to 3.5.0 stamped the trailer with wallclock_legacy -- on
+    * the PSP, local time.  A trailer that does not carry the mark this
+    * frontend now writes, stamped at or before gb_rtc_legacy_before on THAT
+    * clock, is read on that clock: exactly the arithmetic those releases
+    * did, so a player's clock does not jump by the UTC offset on the first
+    * load after the upgrade.  Any other trailer is UTC.  NULL / 0 (every
+    * host test, and any platform whose stamps were always UTC): all UTC. */
+   time_t (*wallclock_legacy)(void);
+   long long gb_rtc_legacy_before;
    /* GB/GBC only: the DMG palette, a GBCORE_PALETTE_* id (0 = Auto: Super
     * Game Boy colours where the game has them, grey otherwise). */
    int gb_palette;
@@ -87,6 +101,15 @@ typedef struct fe_host_config
    int gba_dual_partner_audio;   /* fe_gbadual_config.partner_audio */
    int gba_dual_sram_crc;        /* fe_gbadual_config.sram_crc */
    unsigned gba_dual_b_jit_pin_p1; /* fe_gbadual_config.b_jit_pin_p1 */
+   int gba_dual_cable_fast;      /* fe_gbadual_config.cable_fast */
+   int gba_dual_step_max_ms;     /* fe_gbadual_config.step_max_ms */
+   /* fe_gblink_layout.core_mask: the guest-visible core switches this
+    * console runs (bit 0 TIMER_LAZY); a session checks both ends agree */
+   unsigned gba_core_mask;
+   /* Bench only: start the pair at the first frame from the player's
+    * power-on machine (no state file needed).  Without it, or a state load,
+    * the bench runs ONE machine (GBA-LINK-MIRROR.md 21). */
+   int gba_dual_cold;
    int gba_link_nolend;          /* 1: keep B's block out of the ROM cache */
    const char *gba_dual_hash;
    /* A two-console GBA link-cable session (fe_gblink over fe_gbadual's
@@ -425,6 +448,16 @@ int fe_host_sram_service_io(void);
 int  fe_host_sram_ff_nudge(int ff_active);
 /* Harness A/B: 0 disables the yield (detection and logging stay on). */
 void fe_host_sram_ff_nudge_enable(int on);
+/* Ask the writer thread for a save scan now (the PSP's suspend callback).
+ * Safe from any thread: it only sets a flag and wakes the writer. */
+void fe_host_sram_request_scan(void);
+
+/* Harness only (psp sleep_sim_sav / sram_exit_retry; see fe_host.c).  The
+ * first returns 1 if a .sav handle was open to kill. */
+#ifdef GPSP_PERF_RIG
+int fe_host_sram_test_kill_handle(void);
+void fe_host_sram_test_exit_retry(int on);
+#endif
 
 /* CRC32 of the live 128 KiB SRAM buffer right now (autopilot save-detect). */
 uint32_t fe_host_sram_crc_now(void);
@@ -471,6 +504,13 @@ void fe_host_session_reset(void);
 int  fe_host_gblink_start(int is_host, unsigned input_delay, int64_t rtc_seed);
 int  fe_host_gblink_active(void);
 int  fe_host_gblink_state(void);
+/* "Fast link" (two frames of buttons per packet, GBA Link Cable sessions):
+ * fe_host_set_fast_link is this console's own setting, read when a session
+ * starts -- it decides only when this console hosts.  fe_host_fast_link is
+ * what the running session uses: 1 / 0, -1 with no GBA cable session;
+ * *source (optional) = FE_GBLINK_FL_* (fe_gblink.h). */
+void fe_host_set_fast_link(int on);
+int  fe_host_fast_link(int *source);
 void fe_host_gblink_status(char *line1, size_t cap1, char *line2, size_t cap2);
 void fe_host_gblink_progress(int *p1, int *p2);   /* per mille, -1 = none */
 /* The last step of a link session stalled (the frame shown is a repeat). */
@@ -511,6 +551,263 @@ int  fe_host_gba_cable_ready(void);
  * fe_gblink_local.rom_sampled); 0 = the streamed whole-file SHA-1.  Both
  * consoles must agree; harness A/B only. */
 void fe_host_gba_cable_rom_sampled(int on);
+
+#ifdef REWIND
+/* ---- rewind (PROTOTYPE; docs/REWIND.md, fe_rewind.h) ----------------------
+ * Compiled only with -DREWIND, and inert until fe_host_rewind_enable().
+ * GBA games only; refused while any link session exists (lockstep and the
+ * emulated wireless adapter cannot go back in time). */
+typedef struct fe_host_rewind_opts
+{
+   /* The player's setting: megabytes of history, 1..8 (clamped); 0 = 2.
+    * ring_bytes, when nonzero, overrides it exactly (tests: tiny rings). */
+   uint32_t ring_mib;
+   uint32_t ring_bytes;
+   uint32_t interval;       /* frames between snapshots; 0 = 6 */
+   uint32_t max_frames;     /* longest rewind in frames; 0 = 16384 */
+   /* THE SAVE IS PERMANENT UNDER REWIND (the owner's rule, docs/REWIND.md
+    * 17): a rewind never changes the cartridge save, in memory or in the
+    * file, and a save write does not end the history.  There is no option.
+    * save_quiet: N, the frames the save chip (and the link port) must have
+    * been left alone before play may continue from a frame a rewind stops
+    * on (0 = 60); a release inside moves to the nearest frame outside.
+    * rlog_bytes: the log of save bytes the game read, served again to the
+    * frames a rewind re-runs (0 = 131072; a power of two).
+    * sav_mutant: TESTS ONLY.  1 = re-run frames read the live save, 2 =
+    * re-run frames write the save, 4 = a rewind may stop anywhere. */
+   uint32_t save_quiet;
+   uint32_t rlog_bytes;
+   int sav_mutant;
+   /* 1 = frames run during fast-forward are recorded like any others;
+    * 0 = fast-forward is a barrier. */
+   int ff_rewindable;
+   /* Test instruments.  hash_path: one line per frame run ("F") and per
+    * frame shown backwards ("R"), see tools/rewind_check.py.  redo_inputs:
+    * after a rewind, the frames that were gone back over are played again
+    * with their LOGGED inputs instead of the platform's. */
+   const char *hash_path;
+   int redo_inputs;
+   /* With hash_path: write the image hashed for timeline frame dump_frame,
+    * every time that frame is run, to dump_dir/state_<n>_<k>.bin (0 = the
+    * RW_DUMP_FRAME / RW_DUMP_DIR environment, where there is one). */
+   uint32_t dump_frame;
+   const char *dump_dir;
+   /* 0 (default) = a restore keeps the ROM translation cache and flushes
+    * only the RAM one; 1 = what a state load does, both.  The default is
+    * the cheaper one AND the exact one: emptying the ROM cache changes where
+    * its blocks begin, and with that the instruction a frame ends on
+    * (docs/REWIND.md section 6). */
+   int full_flush_restore;
+   /* Emulated frames a rewind tick may run at most (fe_rewind_config.burst;
+    * 0 = 2), and the time after which it stops running more
+    * (fe_rewind_config.tick_budget_us; 0 = no limit). */
+   uint32_t burst;
+   uint32_t tick_budget_us;
+   /* Test instrument: from timeline frame fuzz_from on (0 = off) the buttons
+    * are a fixed pseudo-random function of the frame number and fuzz_seed,
+    * whatever the platform or a script says. */
+   uint32_t fuzz_from, fuzz_seed;
+   /* 1 = keep no pictures or sound and present nothing while rewinding:
+    * the picture simply holds.  For a platform whose picture does not come
+    * out of the core's video callback (the PSP's second-core renderer) until
+    * its own capture path exists; everything else -- snapshots, restores,
+    * re-runs, the timeline -- is the real thing, so it can be measured. */
+   int no_capture;
+   /* How a snapshot reads the state (fe_host.c, "how the state reaches a
+    * snapshot").  inplace: the big arrays are compared in the machine's own
+    * memory, nothing is copied; 0 = the whole image is serialised first.
+    * dirty (with inplace): pages nothing wrote to since the last snapshot
+    * are not read at all, by the core's written-page map (gba_memory.h).
+    * Bit 0 = VRAM, bit 1 = EWRAM; 3 = both. */
+   int inplace;
+   int dirty;
+   /* Test instrument: after every snapshot compare the whole machine with
+    * the reference (fe_rewind_config.verify).  A difference is a page the
+    * map hid: EVT rewind_verify_fail, and anomalies at exit is nonzero. */
+   int verify;
+   /* Measurement: time the pieces of the serialised (inplace = 0) gather
+    * separately; EVT rewind_gprof on the heartbeat cadence. */
+   int gather_prof;
+   /* Wall-clock pacing of snapshots (fe_rewind_config.pace_us): 0 = one
+    * every `interval` frames however fast they run. */
+   uint32_t pace_us;
+   /* NO SPEED REGRESSION: a snapshot is not taken on a frame that has no
+    * time for it.  slack_margin_us != 0 turns it on: after a normal-speed
+    * frame whose core time + this margin (what the platform itself needs
+    * per frame: presenting, sound) + the cost of the last snapshots would
+    * pass the frame period, the snapshot waits for a frame with room, at
+    * most max_span frames (0 = 8 * interval).  A game with no room at all
+    * then pays for one snapshot every max_span frames instead of every
+    * interval. */
+   uint32_t slack_margin_us;
+   uint32_t max_span;
+   /* 1 = a restore copies back only the pages that can differ from the
+    * snapshot (the written-page map plus what the deltas stepped over
+    * changed), keeps translated RAM code when no byte under it changed and
+    * clears only the stretch of the sound ring in flight.  0 = everything,
+    * as stage 2 did.  Needs inplace; the page part needs dirty. */
+   int fast_restore;
+   /* 1 = while recording the cartridge clock is base + frames, brought up
+    * to the wall clock when a snapshot is taken (gba_memory.c,
+    * gba_rewind_clock_frames): a re-run frame reads the second it read the
+    * first time.  0 = the wall clock at every read, as without rewind. */
+   int clock_frames;
+   /* THE PICTURES.  A captured picture is pix_rows rows of pix_pitch
+    * pixels, of which 240 x 160 are the game's (0, 0 = 240 x 160).
+    * pix_begin, when set, is called before EVERY frame the rewind runs or
+    * records with the slot that frame's picture belongs in (NULL: this
+    * frame keeps none).  It returns 1 if the platform's own renderer will
+    * draw into the slot -- then pix_end() after the frame says whether it
+    * did -- or 0 for "copy the core's picture there yourself".
+    * show, when set, replaces the usual video sink while rewinding: present
+    * this slot (NULL = this frame has no picture, keep what is up). */
+   uint32_t pix_pitch, pix_rows;
+   int  (*pix_begin)(uint16_t *slot);
+   int  (*pix_end)(void);
+   void (*show)(const uint16_t *slot);
+   /* THE SOUND while rewinding.  0 = the frames gone back over are heard
+    * backwards; 1 = silence (their samples are not kept either); 2 =
+    * silence, and the frames a held rewind re-runs skip this emulator's own
+    * sound synthesis (the game's sound code on the emulated CPU runs as
+    * ever).  Those frames are then not exact copies of the first pass in
+    * the sound buffer, so the machine is restored once more when the
+    * control is let go (fe_rewind_taint). */
+   int sound_mode;
+   /* Seconds of history to aim for (fe_rewind_set_target; 0 = snapshots at
+    * a fixed distance), and the most frames between two snapshots it may
+    * stretch to. */
+   uint32_t target_s, gap_max;
+} fe_host_rewind_opts;
+
+typedef struct fe_host_rewind_info
+{
+   int      active;         /* a rewind is in progress */
+   uint32_t back_frames;    /* how far behind its starting point it is */
+   uint32_t avail_frames;   /* how much further back it can go */
+   uint32_t ring_used, ring_bytes, records;
+   /* The control is held and there is nothing earlier to show, and why
+    * (FE_RW_LIMIT_*): what the readout says at the stop. */
+   int      at_limit;
+   int      limit_reason;
+   uint32_t now_frame, mach_frame;   /* timeline: on screen / the machine */
+   uint32_t stepped;        /* frames the last tick went back */
+   /* What things have been costing, microseconds (0 = not seen yet): a
+    * normal frame, a frame re-run with / without a picture, a restore
+    * (unpacking included).  For a platform that picks how often to show a
+    * picture from what the game can sustain. */
+   uint32_t frame_us, rerun_pic_us, rerun_head_us, restore_us;
+   uint32_t ring_granted;   /* bytes of ring actually obtained */
+} fe_host_rewind_info;
+
+/* Why the history starts where it does. */
+#define FE_RW_LIMIT_HISTORY 0   /* the buffer: this is as far back as it holds
+                                 * (or recording began here) */
+#define FE_RW_LIMIT_SAVE    1   /* the game has read more of its save since
+                                 * than the read log holds */
+#define FE_RW_LIMIT_STATE   2   /* a state was loaded here */
+#define FE_RW_LIMIT_CHEAT   3   /* the cheat list changed here */
+#define FE_RW_LIMIT_OTHER   4   /* anything else */
+#define FE_RW_LIMIT_SERIAL  5   /* the game used the link port here */
+#define FE_RW_LIMIT_SLEEP   6   /* the console slept here */
+#define FE_RW_LIMIT_POKE    7   /* the frontend wrote the game's memory */
+#define FE_RW_LIMIT_OFF     8   /* not recorded: a link session, or
+                                 * fast-forward when that is not kept */
+#define FE_RW_LIMIT_N       9
+
+/* Optional, before reserve/enable: a block of memory the platform already
+ * holds that the rewind may live in instead of the heap (the PSP's volatile
+ * pool).  It is used from the END downwards; fe_host_rewind_pool_low() says
+ * how far down it reached, so the owner of the other end can check the two
+ * do not meet.  If everything does not fit, the delta ring alone goes to the
+ * heap; if not even the rest fits, the pool is not used.
+ *
+ * fe_host_rewind_suspend: the pool is about to be taken away (PSP sleep).
+ * Recording stops, the history is gone, nothing points into the pool any
+ * more; a heap ring is kept.  fe_host_rewind_resume(base, bytes) starts
+ * again with the same options in the pool as it is now (NULL, 0 = none:
+ * heap).  Both are safe to call when rewind is off. */
+void  fe_host_rewind_set_pool(void *base, size_t bytes);
+void *fe_host_rewind_pool_low(void);
+void  fe_host_rewind_suspend(void);
+int   fe_host_rewind_resume(void *base, size_t bytes);
+/* ENDING THE HISTORY IN THE MIDDLE OF A REWIND (docs/REWIND.md 22).  While a
+ * rewind is in progress the machine is not at the frame on screen: it is
+ * re-running old frames, perhaps in the middle of an old save sequence, with
+ * the save write-protected.  Play may only go on from a frame the no-land
+ * rule has vetted, so whoever is about to take the history away (a sleep),
+ * or to do anything else to the machine (a state save, the menu), calls
+ *   fe_host_rewind_land(budget_us)
+ * first, on the emulation thread: it lets the control go and runs the
+ * rewind's own ticks until play may resume (1) or the budget is spent (0;
+ * budget 0 = as long as it takes).  fe_host_rewind_busy() says whether there
+ * is anything to land.
+ * A history that is nevertheless ended unlanded (fe_host_rewind_suspend
+ * after a 0) continues from where the machine stands when that frame passes
+ * the same rule, and otherwise the game is RESET before its next frame (a
+ * cartridge switched off and on: it starts from the save, which no re-run
+ * frame ever touched).  fe_host_rewind_abandon(): the history was suspended
+ * and will not be resumed (the platform gave the rewind up). */
+int   fe_host_rewind_busy(void);
+/* 1 = right now the machine stands on a frame play may not continue from
+ * (inside an old save sequence that a later save has overtaken): the moment
+ * a platform should not let the history be taken away at all, if it can
+ * help it (the PSP holds the power switch off, psp_rewind_pwr). */
+int   fe_host_rewind_unvetted(void);
+int   fe_host_rewind_land(uint32_t budget_us);
+/* Before a fe_host_rewind_suspend: the history's own memory cannot be
+ * believed (the pool was kept across a sleep that tore nothing down), so a
+ * rewind in progress cannot be vetted from it: it counts as unvetted. */
+void  fe_host_rewind_distrust(void);
+void  fe_host_rewind_abandon(void);
+/* How often that last resort was taken (the platform tells the player). */
+unsigned fe_host_rewind_resets(void);
+
+/* Before fe_host_boot, with the options the game will record with (NULL =
+ * it will not): tells the core whether its store paths need to mark written
+ * pages at all.  A game started without it records with every page read at
+ * every snapshot; a game started with NULL pays nothing for the feature.
+ * fe_host_rewind_reserve does this too. */
+void fe_host_rewind_prepare(const fe_host_rewind_opts *o);
+
+/* Reserve the memory (one malloc, here and never again) and start recording.
+ * Call after fe_host_boot.  0 = ok.
+ * fe_host_rewind_reserve, optional, takes that memory EARLIER with the same
+ * options -- before fe_host_boot, on a platform whose core then fills the
+ * heap with the cartridge (the PSP-1000).  0 = ok; enable then uses it. */
+int  fe_host_rewind_reserve(const fe_host_rewind_opts *o);
+int  fe_host_rewind_enable(const fe_host_rewind_opts *o);
+/* NULL when rewind can be used now, else why not ("off", "gb", "link"). */
+const char *fe_host_rewind_blocked(void);
+/* Tell the recorder whether the platform is fast-forwarding. */
+void fe_host_rewind_set_ff(int ff);
+/* Call once per display tick, BEFORE deciding to run a frame, with the
+ * level of the rewind control (1 = down).  There is no begin or end: any
+ * pattern of presses is fine (fe_rewind.h).
+ *   2 (FE_RW_PLAY)  not rewinding: call fe_host_run_frame() as usual
+ *   1 (FE_RW_SHOW)  an earlier frame was presented through the usual sinks
+ *   0 (FE_RW_HOLD)  the picture holds this tick (start of the history, or
+ *                   the machine is on its way to the frame on screen)
+ * Do not run a frame on 1 or 0. */
+int  fe_host_rewind_tick(int held);
+/* The same, going back up to `step` frames in the tick (fe_rewind.h);
+ * fe_host_rewind_info.stepped says how many it managed.  step == 0 while
+ * held: a tick between two pictures (the work goes on, nothing is shown). */
+int  fe_host_rewind_tick_step(int held, uint32_t step);
+/* The cadence the platform shows at: one picture every `stride` frames
+ * (fe_rewind_set_stride).  quiet: the sound of the frames gone over is not
+ * played (it is, played backwards, only at one picture a frame a tick). */
+void fe_host_rewind_set_cadence(uint32_t stride, int quiet);
+/* What the next ticks may spend re-running frames (fe_rewind_set_budget). */
+void fe_host_rewind_set_tick_budget(uint32_t us);
+/* 1 (default): a frame re-run without a picture is run as a skipped frame,
+ * so the core does not capture it for a renderer either. */
+void fe_host_rewind_set_head_skip(int on);
+/* 1 while the core is re-running an old frame for the rewind (inside
+ * fe_host_rewind_tick).  For platform hooks the core calls mid-frame: such a
+ * frame must not be presented, posted to a renderer or counted. */
+int  fe_host_rewind_replaying(void);
+void fe_host_rewind_info_get(fe_host_rewind_info *out);
+#endif
 
 #ifdef __cplusplus
 }

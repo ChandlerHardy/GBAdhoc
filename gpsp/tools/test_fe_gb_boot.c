@@ -244,7 +244,8 @@ static uint32_t get32(const uint8_t *p)
 /* A save written by the previous (SameBoy) core or VBA-M/BGB: cart RAM plus
  * the clock trailer.  The clock must resume where it was plus the time the
  * console was off; the RAM must survive; a 44-byte (32-bit stamp) trailer
- * works too; and a stamp from the future resets the clock. */
+ * works too; and a stamp from the future adds no time (the registers stand:
+ * it used to reset the clock). */
 static int run_old_save_import(unsigned trailer, int future)
 {
    static uint8_t rom[0x8000], ram[RTC_RAM], img[RTC_RAM + RTC_TRAILER],
@@ -301,9 +302,9 @@ static int run_old_save_import(unsigned trailer, int future)
    t = disk + RTC_RAM;
    if (future)
    {
-      /* Not real clock data: the clock restarts from zero. */
-      CHECK(get32(t) == 0 && get32(t + 4) == 0 && get32(t + 8) == 0 &&
-            get32(t + 12) == 0);
+      /* The console's clock is behind the save: day 5, 03:02:10 still. */
+      CHECK(get32(t) == 10 && get32(t + 4) == 2 && get32(t + 8) == 3 &&
+            get32(t + 12) == 5 && (get32(t + 16) & 1) == 0);
    }
    else
    {
@@ -316,7 +317,7 @@ static int run_old_save_import(unsigned trailer, int future)
    unlink(save_path);
    unlink(rom_path);
    printf("frontend old save import: trailer=%u %s\n", trailer,
-          future ? "future stamp -> clock reset" : "clock advanced 100 s");
+          future ? "future stamp -> clock kept" : "clock advanced 100 s");
    return 0;
 }
 

@@ -83,7 +83,11 @@ enum
    GBALINK_RUN_FRAME   = 1,   /* the machine completed a frame              */
    GBALINK_RUN_HORIZON = 2,   /* reached the time it was allowed to run to  */
    GBALINK_RUN_BLOCKED = 3,   /* needs the other port's reply first         */
-   GBALINK_RUN_ERROR   = 4
+   GBALINK_RUN_ERROR   = 4,
+   /* Progress guard (section 22): the core made more scheduler calls in one
+    * run than any run can need, or was told to stop (gbalink_abort).  The
+    * machine stands at a postponed update_gba call; the pair must end. */
+   GBALINK_RUN_OVERRUN = 5
 };
 
 /* Per-instance counters (telemetry, tests). */
@@ -93,6 +97,14 @@ typedef struct gbalink_inst_stats
    uint32_t ev_in, ev_late;          /* events applied / applied after due */
    uint32_t late_max;                /* worst lateness, cycles             */
    uint32_t mp_xfers, n_xfers;       /* completed transfers on this port   */
+   /* gbalink_fast = 2 (the checking mode): disagreements between the fast
+    * path's answer and the full walk's, and the first one.  fm_where: 1 the
+    * cached first-event time is not the queue's, 2 the full path did
+    * something where the fast path would have skipped, 3 next_event's two
+    * answers differ. */
+   uint32_t fast_checks, fast_mismatch, fm_where;
+   uint64_t fm_cached, fm_true, fm_now;
+   uint32_t run_calls_max;           /* most scheduler calls in one run    */
 } gbalink_inst_stats;
 
 typedef struct gbalink_inst_ops

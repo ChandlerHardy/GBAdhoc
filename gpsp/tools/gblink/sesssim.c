@@ -16,6 +16,12 @@
  *           [lib_h=DIR] [lib_g=DIR] [desync_at=FRAME] [payload=BYTES]
  *           [quit_after=FRAMES] [room=SLOTS] [skew=SECONDS]
  *           [corrupt_rom=N]   (the Nth ROM chunk arrives with a flipped bit)
+ *           [bad_config=K]    (the host's CONFIG arrives altered: 1 delay
+ *                              200, 2 hash interval 0, 3 batch 0, 4 batch
+ *                              60000, 5 delay 60 + batch 1232: the largest
+ *                              a guest accepts)
+ *           [bad_ready=K]     (1: the host's READY arrives 2 bytes long;
+ *                              2: a READY reaches the guest before HELLO)
  *           [st_h=STATE] [st_g=STATE]  a LIVE link: each console links from
  *                         its running game, this gbcore save state
  *           (a script's `disconnect` asks its console to end the session)
@@ -135,20 +141,50 @@ static uint64_t bytes_sent[2];
 static uint32_t rnd(void) { rng = rng * 1103515245u + 12345u; return rng >> 8; }
 
 static int corrupt_rom;                 /* flip a byte of one ROM chunk */
+static int bad_config;                  /* alter the host's CONFIG in flight */
+static int bad_ready;                   /* alter / forge the host's READY */
 
 static int net_send(int from, const void *buf, size_t len)
 {
    msg_t *m;
    uint64_t due;
+   if (bad_ready == 2 && from == 0)
+   {
+      /* ahead of everything the host says, HELLO included */
+      static const uint8_t ready[1] = { 0x07 };
+      bad_ready = 0;
+      sim("ready_forged_before_hello");
+      net_send(0, ready, 1);
+   }
    if (len > payload)
    {
       sim("oversize from=%d len=%u", from, (unsigned)len);
       exit(3);
    }
    m = (msg_t *)calloc(1, sizeof(*m));
-   m->data = (uint8_t *)malloc(len);
+   m->data = (uint8_t *)malloc(len + 1);
    memcpy(m->data, buf, len);
    m->len = len;
+   if (bad_config && from == 0 && len == 14 && m->data[0] == 0x02)
+   {
+      switch (bad_config)
+      {
+      case 1: m->data[1] = 200; break;
+      case 2: m->data[10] = m->data[11] = 0; break;
+      case 3: m->data[12] = m->data[13] = 0; break;
+      case 4: m->data[12] = 0x60; m->data[13] = 0xEA; break;
+      default: m->data[1] = 60; m->data[12] = 0xD0; m->data[13] = 0x04; break;
+      }
+      sim("config_altered kind=%d", bad_config);
+      bad_config = 0;
+   }
+   if (bad_ready == 1 && from == 0 && len == 1 && m->data[0] == 0x07)
+   {
+      m->data[1] = 0;
+      m->len = 2;
+      bad_ready = 0;
+      sim("ready_altered len=2");
+   }
    if (corrupt_rom && len > 64 && m->data[0] == 0x04 && --corrupt_rom == 0)
    {
       m->data[40] ^= 0x10;               /* damaged in flight */
@@ -402,6 +438,8 @@ int main(int argc, char **argv)
    payload = (size_t)atoi(arg(argc, argv, "payload", "144"));
    room_slots = (unsigned)atoi(arg(argc, argv, "room", "256"));
    corrupt_rom = atoi(arg(argc, argv, "corrupt_rom", "0"));
+   bad_config = atoi(arg(argc, argv, "bad_config", "0"));
+   bad_ready = atoi(arg(argc, argv, "bad_ready", "0"));
    bulk_loss = (unsigned)atoi(arg(argc, argv, "bulk_loss", "0"));
    bulk_cap = (unsigned)atoi(arg(argc, argv, "bulk_cap", "0"));
    arq_loss = (unsigned)atoi(arg(argc, argv, "arq_loss", "0"));

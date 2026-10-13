@@ -212,7 +212,7 @@ the off-white scrim's blend rounding (§2), not the backdrop.
    make ○ unbindable alone.
 3. **The conflict plate** is the design's sentence with real labels:
    *△ was Video preset  -  Video preset is now blank (disabled)*. The same
-   plate also carries refusals (*A unchanged: game buttons take one button*),
+   plate also carries refusals (*A unchanged: this one takes a single button*),
    the reset prompt, and the capture timeout. A plain rebind shows no plate,
    because its chip already shows it. The plate clears on the next d-pad press
    and the footer returns.

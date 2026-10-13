@@ -29,6 +29,16 @@
  *
  *   --hash OUT       one line per completed frame per slot:
  *                    "s=<slot> f=<frame> r=.. i=.. e=.. io=.. p=.. o=.. v=.."
+ *   --fast           the cable fast path on in both cores (gbalink_fast):
+ *                    a pure speed switch, --hash must be byte-identical
+ *   --fast2          its checking mode (gbalink_fast = 2): the full path
+ *                    decides, the fast path's answers are compared with it;
+ *                    "fastchk:" prints the count and the first disagreement
+ *                    and the exit code is 8 if there was one
+ *   --stress SEED    TEST: random run horizons inside the stepping rule's
+ *                    limits and random extra pumps (gbalink_pair_config
+ *                    stress_seed); SEED | 0x80000000 = the pumps only, which
+ *                    must leave --hash unchanged.  Deterministic per seed.
  *   --solo           no link: slot 0 alone, stepped by retro_run (the
  *                    reference for the yield-invisibility test)
  *   --yield-every C  solo through the link machinery with only slot 0 and a
@@ -364,6 +374,114 @@ static int load_script(const char *path, script_t *sc, unsigned cap)
    return 0;
 }
 
+/* ---- DRPROF_TWIN: the PAIR under the dynarec twin's instruction counter ----
+ * (tools/drprof/Makefile `pair`, docs/GBA-LINK-MIRROR.md 23).  Built for
+ * platform=drprof-mipsel and run under qemu-mipsel with drprof_plugin.so:
+ * instance A's translation caches are published in drprof_ctl (same block
+ * and marks as tools/drprof/dr_host.c), so A's emitted code is split by role
+ * and class; instance B is the renamed copy, counted per gbab_* symbol
+ * (dr_symcat.py gives each the category of the symbol it was renamed from;
+ * its caches are the buckets gbab_rom/ram_translation_cache).  Scenes are cut
+ * at slot-0 frames given by --scenes "0:boot,2600:pre,3000:fight,...". */
+#ifdef DRPROF_TWIN
+extern unsigned char rom_translation_cache[], ram_translation_cache[];
+extern unsigned char *drprof_stub_end;
+extern unsigned short *drprof_rom_map, *drprof_ram_map;
+extern unsigned int tmemld[11][16], tmemst[4][16];
+struct drprof_ctl_s
+{
+   uint32_t magic, version, kind, frame, seg;
+   uint32_t rom_base, rom_size, ram_base, ram_size, stub_end;
+   uint32_t rom_map, ram_map;
+   char     name[48];
+};
+struct drprof_ctl_s drprof_ctl;
+__attribute__((noinline, used)) void drprof_host_mark(void)
+{
+   __asm__ volatile("" ::: "memory");
+}
+static void dr_mark(uint32_t kind, const char *name)
+{
+   drprof_ctl.kind = kind;
+   if (name)
+      snprintf(drprof_ctl.name, sizeof(drprof_ctl.name), "%s", name);
+   drprof_host_mark();
+}
+static struct { uint32_t f; char name[40]; } dr_sc[16];
+static unsigned dr_nsc, dr_isc;
+static const char *dr_stubmap;
+static void dr_scenes_parse(const char *s)
+{
+   while (*s && dr_nsc < 16)
+   {
+      char *e;
+      unsigned k = 0;
+      dr_sc[dr_nsc].f = (uint32_t)strtoul(s, &e, 0);
+      if (*e != ':')
+         break;
+      for (s = e + 1; *s && *s != ',' && k < 39; s++)
+         dr_sc[dr_nsc].name[k++] = *s;
+      dr_sc[dr_nsc++].name[k] = 0;
+      if (*s == ',')
+         s++;
+   }
+}
+/* The geometry must be published before ANY emulated instruction runs: the
+ * plugin classifies each qemu translation block once, at its first
+ * execution, and a block of instance A's cache met before the geometry is
+ * known stays "?" for the whole run. */
+static void dr_geom(void)
+{
+   drprof_ctl.magic = 0x46505244u;
+   drprof_ctl.version = 1;
+   drprof_ctl.rom_base = (uint32_t)(uintptr_t)rom_translation_cache;
+   drprof_ctl.ram_base = (uint32_t)(uintptr_t)ram_translation_cache;
+   drprof_ctl.rom_size = 10u * 1024 * 1024;
+   drprof_ctl.ram_size = 512u * 1024;
+   drprof_ctl.stub_end = (uint32_t)(uintptr_t)drprof_stub_end;
+   drprof_ctl.rom_map = (uint32_t)(uintptr_t)drprof_rom_map;
+   drprof_ctl.ram_map = (uint32_t)(uintptr_t)drprof_ram_map;
+   if (dr_stubmap)
+   {
+      static const char *rg[16] = { "bios", "open1", "ewram", "iwram", "io",
+         "pal", "vram", "oam", "rom8", "rom9", "romA", "romB", "romC",
+         "eeprom", "backup", "openF" };
+      static const char *ld[11] = { "ld_u8", "ld_s8", "ld_u16", "ld_u16u1",
+         "ld_s16", "ld_s16u1", "ld_u32", "ld_u32u1", "ld_u32u2", "ld_u32u3",
+         "ld_a32" };
+      static const char *st[4] = { "st_u8", "st_u16", "st_u32", "st_a32" };
+      FILE *sm = fopen(dr_stubmap, "w");
+      unsigned o, r;
+      if (sm)
+      {
+         for (o = 0; o < 11; o++)
+            for (r = 0; r < 16; r++)
+               fprintf(sm, "%08x %s_%s\n", tmemld[o][r] -
+                       (unsigned)(uintptr_t)rom_translation_cache, ld[o], rg[r]);
+         for (o = 0; o < 4; o++)
+            for (r = 0; r < 16; r++)
+               fprintf(sm, "%08x %s_%s\n", tmemst[o][r] -
+                       (unsigned)(uintptr_t)rom_translation_cache, st[o], rg[r]);
+         fprintf(sm, "%08x stub_end\n",
+                 (unsigned)((uintptr_t)drprof_stub_end -
+                            (uintptr_t)rom_translation_cache));
+         fclose(sm);
+      }
+   }
+}
+static void dr_begin(void)
+{
+   dr_mark(3 /* DRM_START */, "start");
+}
+static void dr_frame(uint32_t frame)
+{
+   drprof_ctl.frame = frame;
+   while (dr_isc < dr_nsc && frame >= dr_sc[dr_isc].f)
+      dr_mark(2 /* DRM_SCENE */, dr_sc[dr_isc++].name);
+   dr_mark(1 /* DRM_FRAME */, NULL);
+}
+#endif
+
 /* ---- autopilot host hooks, one set per slot -------------------------------- */
 static uint32_t g_ap_mask[2];      /* retropad mask the engine injected */
 static int g_use_ap;
@@ -521,6 +639,9 @@ int main(int argc, char **argv)
    long frames = 1000, load_at = 30, yield_every = 0;
    uint64_t lookahead = 0;          /* 0 = GBALINK_DEFAULT_LOOKAHEAD */
    int swap = 0, solo = 0, shared_rom = 0, i, s;
+   uint32_t stress = 0;
+   int headless1 = 0;
+   int fast_bad = 0;
    long rom_cap = 32;
    gbalink_pair pair;
    gbalink_pair_config cfg;
@@ -552,6 +673,31 @@ int main(int argc, char **argv)
       else if (!strcmp(argv[i], "--shared-rom")) shared_rom = 1;
       else if (ARG("--rom-cap")) rom_cap = strtol(argv[++i], NULL, 0);
       else if (!strcmp(argv[i], "--solo")) solo = 1;
+      /* the cable fast path in both cores (gbalink_core.c gbalink_fast,
+       * docs/GBA-LINK-MIRROR.md 21): --hash must not change */
+      else if (!strcmp(argv[i], "--fast") || !strcmp(argv[i], "--fast2") ||
+               !strcmp(argv[i], "--fast3"))
+      {
+         /* --fast3: the fast path plus the lean inline hooks (section 23) */
+         extern uint32_t gbalink_fast, gbab_gbalink_fast;
+         gbalink_fast = gbab_gbalink_fast =
+            argv[i][6] ? (uint32_t)(argv[i][6] - '0') : 1;
+      }
+      else if (ARG("--stress")) stress = (uint32_t)strtoul(argv[++i], NULL, 0);
+      /* slot 1 never draws and mixes no sound, as the partner machine on a
+       * console (the profile's machine B) */
+      else if (!strcmp(argv[i], "--headless1")) headless1 = 1;
+      /* ...and its sound ring is not read out (gba_link_headless_audio = 2) */
+      else if (!strcmp(argv[i], "--headless1q"))
+      {
+         extern uint32_t gbalink_headless_audio, gbab_gbalink_headless_audio;
+         headless1 = 1;
+         gbalink_headless_audio = gbab_gbalink_headless_audio = 2;
+      }
+#ifdef DRPROF_TWIN
+      else if (ARG("--scenes")) dr_scenes_parse(argv[++i]);
+      else if (ARG("--stubmap")) dr_stubmap = argv[++i];
+#endif
       else if (ARG("--save-state")) g_save_state_path = argv[++i];
       else if (ARG("--save-out0")) g_save_out[0] = argv[++i];
       else if (ARG("--ram-dump"))
@@ -634,6 +780,9 @@ int main(int argc, char **argv)
          free(b);
       }
    }
+#ifdef DRPROF_TWIN
+   dr_geom();
+#endif
    for (i = 0; i < load_at; i++)
    {
       api_inst[0].run();
@@ -720,14 +869,22 @@ int main(int argc, char **argv)
       cfg.lookahead = lookahead;
       cfg.local_slot = 0;
       cfg.on_frame = on_frame;
+      cfg.stress_seed = stress;
+      cfg.headless[1] = headless1;
       if (g_use_ap)
          cfg.input = ap_input;
       /* both drawn on the desktop, so dumps work; rendering is not guest
        * state */
       gbalink_pair_init(&pair, &g_ops[0], &g_ops[1], &cfg);
+#ifdef DRPROF_TWIN
+      dr_begin();
+#endif
       while (pair.frames[0] < (uint32_t)frames)
       {
          int r;
+#ifdef DRPROF_TWIN
+         dr_frame(pair.frames[0]);
+#endif
          /* The input ring holds 256 frames: keep it 64 ahead of each slot
           * (a session feeds it from the network the same way). */
          for (s = 0; s < 2 && !g_use_ap; s++)
@@ -768,6 +925,22 @@ int main(int argc, char **argv)
          printf("guard: idle_runs=%u step_runs_max=%u peer_frames_max=%u\n",
                 pair.st.idle_runs, pair.st.step_runs_max,
                 pair.st.step_peer_frames_max);
+         /* the fast path's checking mode and the per-run call guard
+          * (docs/GBA-LINK-MIRROR.md section 22) */
+         printf("fastchk: checks=%u/%u mismatch=%u/%u run_calls_max=%u/%u\n",
+                st[0].fast_checks, st[1].fast_checks, st[0].fast_mismatch,
+                st[1].fast_mismatch, st[0].run_calls_max,
+                st[1].run_calls_max);
+         for (s = 0; s < 2; s++)
+            if (st[s].fast_mismatch)
+            {
+               fast_bad = 1;
+               printf("fastchk: FIRST slot=%d where=%u cached=%llu true=%llu "
+                      "now=%llu\n", s, st[s].fm_where,
+                      (unsigned long long)st[s].fm_cached,
+                      (unsigned long long)st[s].fm_true,
+                      (unsigned long long)st[s].fm_now);
+            }
       }
    }
    for (s = 0; s < 2; s++)
@@ -802,5 +975,5 @@ int main(int argc, char **argv)
    }
    if (g_hash)
       fclose(g_hash);
-   return 0;
+   return fast_bad ? 8 : 0;
 }

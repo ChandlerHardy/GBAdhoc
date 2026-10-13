@@ -62,6 +62,25 @@ void sound_frequency_changed(void);
 
 /* Drop pending ring contents and realign producers/consumer (rate change). */
 void sound_flush_ring(void);
+#ifdef REWIND
+/* Rewind only (docs/REWIND.md).  A save state leaves out the mix ring, so a
+ * load plays up to a frame of silence; a rewind restores every few frames
+ * and must not.  These carry the part of the ring that is still in flight
+ * (mixed, not yet read out): at most SOUND_REWIND_WINDOW entries from the
+ * read position, as 16-bit values when they all fit, else 32-bit. */
+#define SOUND_REWIND_WINDOW       8192u
+#define SOUND_REWIND_EXTRA_BYTES  (8u + SOUND_REWIND_WINDOW * 4u)
+void sound_rewind_extra_save(u8 *dst);          /* writes EXTRA_BYTES */
+/* The same into a buffer whose first `stale` bytes may hold an older save
+ * and whose rest is zero: only what is needed is written.  Returns the
+ * bytes now in use (header included). */
+u32  sound_rewind_extra_save_part(u8 *dst, u32 stale);
+void sound_rewind_extra_load(const u8 *src);    /* after sound_read_savestate */
+/* The quick restore: zero the in-flight stretch, then load with
+ * gba_rewind_ring_cleared set so the loader does not clear the whole ring. */
+void sound_rewind_clear_inflight(void);
+extern u32 gba_rewind_ring_cleared;
+#endif
 
 #define GBA_SOUND_FREQUENCY   (64 * 1024)
 
@@ -156,8 +175,9 @@ extern u32 gbc_sound_buffer_index;
 extern u32 gbc_sound_last_cpu_ticks;
 
 extern u32 sound_on;
-#ifdef GBA_LINK
-/* A GBA link session's headless partner machine (gbalink_core.c): no
+#if defined(GBA_LINK) || defined(REWIND)
+/* (REWIND: the frames a held rewind re-runs, when its sound is off.)
+ * A GBA link session's headless partner machine (gbalink_core.c): no
  * samples are mixed into its sound buffer -- nobody hears it -- while every
  * game-visible effect of the sound hardware (FIFO consumption and the DMA
  * refills it triggers, PSG length/envelope/sweep and SOUNDCNT_X) runs

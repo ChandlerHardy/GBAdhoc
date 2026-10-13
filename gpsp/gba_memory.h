@@ -333,6 +333,94 @@ extern u8 vram[1024 * 96];
 #define VRAM_DIRTY_ANY       VRAM_DIRTY_PAGES
 #define VRAM_DIRTY_MAP_BYTES (VRAM_DIRTY_PAGES + 32)
 extern u8  vram_clean[VRAM_DIRTY_MAP_BYTES];
+#ifdef REWIND
+/* Rewind (docs/REWIND.md).
+ * gba_rewind_skip_arrays: memory_write_savestate / memory_read_savestate
+ * leave the six big arrays (IWRAM, EWRAM, VRAM, OAM, palette, I/O) alone --
+ * the image keeps their headers, the rewind moves the bytes itself.
+ *
+ * gba_rewind_clean[]: the rewind's OWN written-page map, 1 KiB pages, same
+ * inverted sense as vram_clean (1 = clean, 0 = written) for the same reason
+ * (the MIPS stubs have $zero to store and nothing known nonzero).
+ *     [RW_CLEAN_EWRAM + p]  EWRAM page p, 0..255
+ *     [256 .. 263]          spill: a block store through an EWRAM stack
+ *                           pointer marks page p and p + 1 without a bounds
+ *                           check (mips_emit.h, the SP trampoline)
+ *     [RW_CLEAN_VRAM + p]   VRAM page p, 0..95
+ * It is separate from vram_clean on purpose: that map has several consumers
+ * that clear it (the ME post, the mid-frame log every scanline), and a
+ * snapshot that trusted "whatever is still marked" lost every page one of
+ * them had taken.  This one is cleared by the rewind only.
+ *
+ * THE RULE: every writer of EWRAM or VRAM bytes marks, BEFORE or WITH the
+ * write.  A page written and not marked is a snapshot that silently differs
+ * from the machine.  The writers are: the dynarec store stubs and the
+ * SP-relative block-store path (mips/mips_emit.h, x86/x86_stub.S), the C
+ * store macros and DMA (gba_memory.c), cheats (cheats.c), and reset / state
+ * load, which mark everything.  IWRAM, OAM, palette and I/O have no map:
+ * they are small and always compared.  The harness key rewind_verify
+ * (fe_host.c) checks the rule on every snapshot. */
+#define RW_PAGE_SHIFT   10
+#define RW_CLEAN_EWRAM  0
+#define RW_CLEAN_VRAM   264
+#define RW_CLEAN_BYTES  (RW_CLEAN_VRAM + 96)
+extern u32 gba_rewind_skip_arrays;
+/* THE SAVE IS PERMANENT UNDER REWIND (docs/REWIND.md 17).
+ * gba_rewind_backup_ro: while nonzero the cartridge save (SRAM, flash,
+ * EEPROM) cannot be written: every statement that would change a byte of it
+ * is skipped and counted in gba_rewind_backup_ro_hits (gba_memory.c,
+ * BACKUP_RO; the chip's command state still runs).  The frontend sets it
+ * around every frame it RE-RUNS for a rewind, so nothing a rewind does can
+ * alter the bytes the save file's writer copies.
+ * The read log: on the first pass every byte of the save's contents the
+ * game reads is appended at gba_rewind_rlog_pos (a byte ring of
+ * gba_rewind_rlog_mask + 1 bytes; positions are absolute and wrap at 2^32);
+ * with the write-protect on, a read is answered from the log at that
+ * position instead, because the contents may be newer than when the frame
+ * first ran.  The frontend keeps _pos with every snapshot and puts it back
+ * on a restore; _end is where the first pass stopped logging.  _served /
+ * _miss: re-run reads answered from the log / with nothing logged for them
+ * (the live byte is returned; must stay 0).  gba_rewind_rlog == NULL: no
+ * log, reads are the live contents.
+ * gba_rewind_bk_acc: bit 0 = the game wrote to the chip (data or command),
+ * bit 1 = it read save contents; the frontend clears it per frame. */
+extern u32 gba_rewind_backup_ro;
+extern u32 gba_rewind_backup_ro_hits;
+extern u32 gba_rewind_bk_acc;
+extern u8 *gba_rewind_rlog;
+extern u32 gba_rewind_rlog_mask, gba_rewind_rlog_pos, gba_rewind_rlog_end;
+extern u32 gba_rewind_rlog_served, gba_rewind_rlog_miss, gba_rewind_rlog_mutant;
+u32 gba_rewind_backup_busy(void);
+extern u8  gba_rewind_clean[RW_CLEAN_BYTES];
+/* 0 = the dynarec's stubs could not be given the map (it must sit within a
+ * 16-bit offset of the register block on MIPS): then nobody may trust it. */
+extern u32 gba_rewind_map_ok;
+extern u32 gba_rewind_marks_wanted;   /* gba_memory.c */
+/* off: byte offset into the array; n: bytes written (1..4). */
+/* REWIND_COUNT=1 (measurement, tools/rewind_marks.sh): how many stores the
+ * marks ride on.  Run with the interpreter, where every store comes through
+ * these macros: [0] EWRAM stores, [1] VRAM stores. */
+#ifdef REWIND_COUNT
+extern u32 gba_rewind_cnt[2];
+#define RW_CNT(i) (gba_rewind_cnt[i]++)
+#else
+#define RW_CNT(i) ((void)0)
+#endif
+#define RW_MARK_EWRAM(off, n)                                                 \
+  do {                                                                        \
+    RW_CNT(0);                                                                \
+    gba_rewind_clean[RW_CLEAN_EWRAM + ((off) >> RW_PAGE_SHIFT)] = 0;          \
+    gba_rewind_clean[RW_CLEAN_EWRAM +                                         \
+                     (((off) + (n) - 1) >> RW_PAGE_SHIFT)] = 0;               \
+  } while (0)
+#define RW_MARK_VRAM(off)                                                     \
+  (RW_CNT(1), gba_rewind_clean[RW_CLEAN_VRAM + ((off) >> RW_PAGE_SHIFT)] = 0)
+#define RW_MARK_ALL()  memset(gba_rewind_clean, 0, sizeof(gba_rewind_clean))
+#else
+#define RW_MARK_EWRAM(off, n) ((void)0)
+#define RW_MARK_VRAM(off)     ((void)0)
+#define RW_MARK_ALL()         ((void)0)
+#endif
 extern u32 vram_dirty_marks;
 extern u8 bios_rom[1024 * 16];
 // Double buffer used for SMC detection

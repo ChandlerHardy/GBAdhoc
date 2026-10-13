@@ -346,6 +346,16 @@ typedef struct nd_config
    /* Spill cap override (payloads per peer); 0 = ND_SPILL_MAX. Tests drive
     * this to force the unrecoverable path deterministically. */
    uint32_t spill_max;
+   /* ACK RIDING (docs/GBA-LINK-MIRROR.md 28); 0 = off, the behaviour every
+    * build so far has: a DATA frame received in a tick is acked in that
+    * tick, as a bare ACK when nothing of ours is due.  N > 0: the ack waits
+    * up to N microseconds for an outgoing unicast (DATA or PING) to carry
+    * it, and goes bare only when that wait runs out.  A duplicate or
+    * out-of-order DATA frame is still acked at once (the sender is already
+    * retransmitting).  In a lockstep session each side sends one small DATA
+    * frame per emulated frame, so every ack finds a ride and the bare ACKs
+    * -- half of all packets on the air -- disappear. */
+   uint32_t ack_ride_us;
    /* OPTIONAL profiling clock (ADR-0021). When non-NULL netdrv_pump splits
     * its own cost into nd_stats.prof_rx_us / prof_arq_us. Costs 4 extra
     * clock reads per pump, so it is only sane once the pump is called ~once
@@ -468,6 +478,10 @@ void netdrv_get_stats(const netdrv *nd, nd_stats *out);
 /* Publish this console's rate. Cheap; call once per measurement window.
  * 0 disables reporting (PING goes back to a bare keepalive). */
 void netdrv_set_local_fps(netdrv *nd, unsigned fps_x100);
+/* nd_config.ack_ride_us, changed on a live driver (0 = off).  This console's
+ * own business: the peer needs no notice and no matching value. */
+void netdrv_set_ack_ride(netdrv *nd, uint32_t us);
+uint32_t netdrv_ack_ride(const netdrv *nd);
 
 /* Slowest ACTIVE peer that has reported a rate, in hundredths.
  * 0 = no peer has reported one (no session, or all peers are silent/old). */

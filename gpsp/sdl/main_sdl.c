@@ -134,12 +134,136 @@ static int g_ff;             /* uncapped fast-forward active this frame */
  * where psp/main_psp.c posts the ME render.  Absent otherwise. */
 extern void me_timing_sim_frame_end(void) __attribute__((weak));
 
+#ifdef REWIND
+/* ---- rewind, desktop wiring (PROTOTYPE; docs/REWIND.md) -------------------
+ * Hold BACKSPACE (or `rewind N` in a script) to go back.  The readout is
+ * deliberately plain -- "REWIND -0:07.3" and a bar of the history that is
+ * left -- drawn into a copy of the frame so that a frame dump shows what the
+ * player saw. */
+static int      g_rw_enabled;
+/* --rtc-pin: the cartridge clock's base is a fixed date instead of the
+ * moment the game was loaded, so that two separate runs are the same machine
+ * (the rewind fuzz test compares a run against another run). */
+extern time_t (*gpsp_wallclock)(void);
+static time_t   g_rtc_pin;
+static time_t rtc_pinned(void) { return g_rtc_pin; }
+static uint16_t g_shown[FE_GBA_WIDTH * FE_GBA_HEIGHT];
+static int      g_shown_valid;
+static unsigned g_tick;               /* display ticks since boot */
+static long g_flush_ram_at, g_flush_ram_every;   /* --flush-ram-at N K */
+extern void flush_translation_cache_ram(void);
+static long     g_shown_from = -1, g_shown_to = -1;   /* --dump-shown */
+static FILE    *g_audio_fp;                           /* --dump-audio */
+
+/* 5x7 glyphs, one byte per row, bit 4 = leftmost. */
+static const struct { char c; unsigned char r[7]; } g_rw_font[] = {
+   { '0', { 0x0E, 0x11, 0x13, 0x15, 0x19, 0x11, 0x0E } },
+   { '1', { 0x04, 0x0C, 0x04, 0x04, 0x04, 0x04, 0x0E } },
+   { '2', { 0x0E, 0x11, 0x01, 0x02, 0x04, 0x08, 0x1F } },
+   { '3', { 0x1F, 0x02, 0x04, 0x02, 0x01, 0x11, 0x0E } },
+   { '4', { 0x02, 0x06, 0x0A, 0x12, 0x1F, 0x02, 0x02 } },
+   { '5', { 0x1F, 0x10, 0x1E, 0x01, 0x01, 0x11, 0x0E } },
+   { '6', { 0x06, 0x08, 0x10, 0x1E, 0x11, 0x11, 0x0E } },
+   { '7', { 0x1F, 0x01, 0x02, 0x04, 0x08, 0x08, 0x08 } },
+   { '8', { 0x0E, 0x11, 0x11, 0x0E, 0x11, 0x11, 0x0E } },
+   { '9', { 0x0E, 0x11, 0x11, 0x0F, 0x01, 0x02, 0x0C } },
+   { '-', { 0x00, 0x00, 0x00, 0x1F, 0x00, 0x00, 0x00 } },
+   { ':', { 0x00, 0x0C, 0x0C, 0x00, 0x0C, 0x0C, 0x00 } },
+   { '.', { 0x00, 0x00, 0x00, 0x00, 0x00, 0x0C, 0x0C } },
+   { 'R', { 0x1E, 0x11, 0x11, 0x1E, 0x14, 0x12, 0x11 } },
+   { 'E', { 0x1F, 0x10, 0x10, 0x1E, 0x10, 0x10, 0x1F } },
+   { 'W', { 0x11, 0x11, 0x11, 0x15, 0x15, 0x15, 0x0A } },
+   { 'I', { 0x0E, 0x04, 0x04, 0x04, 0x04, 0x04, 0x0E } },
+   { 'N', { 0x11, 0x19, 0x15, 0x13, 0x11, 0x11, 0x11 } },
+   { 'D', { 0x1E, 0x11, 0x11, 0x11, 0x11, 0x11, 0x1E } },
+   { 'S', { 0x0F, 0x10, 0x10, 0x0E, 0x01, 0x01, 0x1E } },
+   { 'T', { 0x1F, 0x04, 0x04, 0x04, 0x04, 0x04, 0x04 } },
+   { 'A', { 0x0E, 0x11, 0x11, 0x1F, 0x11, 0x11, 0x11 } },
+};
+
+static void rw_rect(int x, int y, int w, int h, uint16_t c)
+{
+   int i, j;
+   for (j = y; j < y + h; j++)
+      for (i = x; i < x + w; i++)
+         if (i >= 0 && i < FE_GBA_WIDTH && j >= 0 && j < FE_GBA_HEIGHT)
+            g_shown[j * FE_GBA_WIDTH + i] = c;
+}
+
+static void rw_text(int x, int y, const char *s, uint16_t c)
+{
+   for (; *s; s++, x += 6)
+   {
+      unsigned g, r, b;
+      for (g = 0; g < sizeof(g_rw_font) / sizeof(g_rw_font[0]); g++)
+         if (g_rw_font[g].c == *s)
+            break;
+      if (g == sizeof(g_rw_font) / sizeof(g_rw_font[0]))
+         continue;                     /* space / unknown */
+      for (r = 0; r < 7; r++)
+         for (b = 0; b < 5; b++)
+            if (g_rw_font[g].r[r] & (0x10 >> b))
+               rw_rect(x + (int)b, y + (int)r, 1, 1, c);
+   }
+}
+
+static void rw_overlay(void)
+{
+   fe_host_rewind_info inf;
+   char t[32];
+   unsigned cs, total, w;
+
+   fe_host_rewind_info_get(&inf);
+   if (!inf.active)
+      return;
+   cs = (unsigned)(inf.back_frames * 10.0 / FE_GBA_FPS);   /* tenths */
+   snprintf(t, sizeof(t), "REWIND -%u:%02u.%u", cs / 600, (cs / 10) % 60,
+            cs % 10);
+   rw_rect(0, 0, FE_GBA_WIDTH, 19, 0x0000);
+   rw_text(6, 3, t, 0xFFFF);
+   /* The bar is the history: full at the moment the rewind began, empty
+    * when there is nothing further back. */
+   total = inf.back_frames + inf.avail_frames;
+   w = total ? (unsigned)((uint64_t)inf.avail_frames * 228u / total) : 0;
+   rw_rect(6, 13, 228, 3, 0x4208);
+   rw_rect(6, 13, (int)w, 3, inf.avail_frames ? 0xFFFF : 0xF800);
+   if (!inf.avail_frames)
+      rw_text(162, 3, "START", 0xF800);
+}
+/* --rewind-sleep-every: a sleep throws the input log away with the rest, so
+ * the frames after it take whatever the platform's buttons are.  In the
+ * fuzz test that is only "the same game" once the buttons are a function of
+ * the frame number: no test sleep before that point of the timeline. */
+static int rw_sleep_ok(uint32_t fuzz_from)
+{
+   fe_host_rewind_info inf;
+   fe_host_rewind_info_get(&inf);
+   return !fuzz_from || inf.mach_frame > fuzz_from;
+}
+#endif /* REWIND */
+
 static void plat_video_frame(const uint16_t *pix, unsigned w, unsigned h,
                              size_t pitch)
 {
    (void)w; (void)h;   /* texture is fixed 240x160 */
    if (me_timing_sim_frame_end)
       me_timing_sim_frame_end();
+#ifdef REWIND
+   if (g_rw_enabled)
+   {
+      if (pix)
+      {
+         unsigned y;
+         for (y = 0; y < FE_GBA_HEIGHT; y++)
+            memcpy(g_shown + y * FE_GBA_WIDTH,
+                   (const uint8_t *)pix + y * pitch, FE_GBA_WIDTH * 2);
+         g_shown_valid = 1;
+         rw_overlay();
+         pix = g_shown;
+         pitch = FE_GBA_WIDTH * 2;
+      }
+   }
+#endif
    if (!have_video)
       return;
    if (g_ff && (fe_host_frame_count() & FF_PRESENT_MASK))
@@ -153,6 +277,10 @@ static void plat_video_frame(const uint16_t *pix, unsigned w, unsigned h,
 
 static void plat_audio_frames(const int16_t *lr, size_t frames)
 {
+#ifdef REWIND
+   if (g_audio_fp && (long)g_tick >= g_shown_from && (long)g_tick < g_shown_to)
+      fwrite(lr, 4, frames, g_audio_fp);
+#endif
    if (!audio_dev || g_ff)   /* FF mutes audio: queue drains to silence */
       return;
    if (SDL_GetQueuedAudioSize(audio_dev) > AUDIO_QUEUE_MAX_BYTES)
@@ -407,6 +535,40 @@ static void sess_poll_evt(void)
    prev = p;
 }
 
+#ifdef REWIND
+/* Test instruments (tools/rewind_savetest.py).  The save FILE as it is on
+ * disk right now: a rewind must not have touched it between "begin" (the
+ * control goes down) and "end" (play resumes). */
+#include <sys/stat.h>
+#include <unistd.h>
+#include "fe_util.h"
+static const char *g_sav_note_path;
+static void sav_note(const char *when)
+{
+   struct stat st;
+   uint32_t crc = 0;
+   FILE *f;
+   if (!g_sav_note_path || stat(g_sav_note_path, &st) != 0)
+   {
+      fe_evt("rewind_savefile when=%s absent", when);
+      return;
+   }
+   f = fopen(g_sav_note_path, "rb");
+   if (f)
+   {
+      static uint8_t buf[4096];
+      size_t n;
+      while ((n = fread(buf, 1, sizeof(buf), f)) > 0)
+         crc = fe_crc32(crc, buf, n);
+      fclose(f);
+   }
+   fe_evt("rewind_savefile when=%s size=%ld mtime_ns=%lld crc=%08x", when,
+          (long)st.st_size,
+          (long long)st.st_mtim.tv_sec * 1000000000ll + st.st_mtim.tv_nsec,
+          (unsigned)crc);
+}
+#endif
+
 int main(int argc, char **argv)
 {
    const char *rom_path  = NULL;
@@ -416,8 +578,11 @@ int main(int argc, char **argv)
    const char *dump_dir  = ".";
    const char *script    = NULL;
    const char *state_path = NULL;   /* --state: load at frame 30, as the PSP rig */
+   const char *state_out = NULL;    /* --state-save-at N FILE: fixture authoring */
+   long state_save_at = 0;
    long autoexit = 0, dump_at = 0, dump_every = 0;
    int scale = 2, no_pacing = 0, force_sram_write = 0, force_ff = 0;
+   int rtc_wall = 0;
    int rfu_pace = -1;   /* -1 = leave default; >=0 = rfu_set_frame_pace(n) */
    int rfu_cush = -1;   /* -1 = leave default; >=0 = rfu_set_cushion(n)    */
    int exit_code = 0;
@@ -430,11 +595,149 @@ int main(int argc, char **argv)
    const char *net_join = NULL;     /* "ip:port" */
    const char *nick = "sdl";
    udp_transport *udp = NULL;
+#ifdef REWIND
+   fe_host_rewind_opts rw_opts;
+   int rw_want = 0;
+   long rw_at = 0;                /* --rewind-at: start recording here */
+   /* Tests of the PSP's memory arrangement: --rewind-pool N gives the
+    * rewind an N-byte block to live in from the end downwards (the volatile
+    * pool); --rewind-sleep-every T takes it away every T ticks, fills it
+    * with rubbish and hands it back, as a sleep and wake would. */
+   size_t rw_pool_bytes = 0;
+   uint8_t *rw_pool = NULL;
+   long rw_sleep_every = 0;
+   /* --rewind-sleep-tick N (tools/rewind_sleeptest.py): ONE sleep (suspend,
+    * the pool overwritten, resume) at the Nth tick on which a rewind is in
+    * progress.  --rewind-sleep-mach F: the same at the first such tick the
+    * machine stands at or before frame F. */
+   long rw_sleep_tick = 0, rw_sleep_seen = 0;
+   int rw_slept_let_go = 0;     /* ...and the player's hand is off the control */
+   /* --rewind-sleep-budget US: what the park point may spend landing the
+    * rewind before the sleep (psp/main_psp.c psp_rewind_land).  0 = as long
+    * as it takes; -1 = nothing at all (the budget was spent: the path that
+    * has to be safe without a landing). */
+   long rw_sleep_budget = 0;
+   unsigned long rw_sleep_mach = 0;
+   /* --rewind-wall-sim N: publish a wall clock that gains a second every N
+    * display ticks (rewind ticks included, as real time passes during a
+    * rewind), so the clock a re-run frame would read has moved on. */
+   long rw_wall_sim = 0;
+   /* --rewind-step K: a held tick goes back 1..K frames (it varies with the
+    * tick number), as the PSP's speed ramp does. */
+   long rw_step = 1;
+   /* --rewind-stride S --rewind-period P: the PSP's even cadence -- S frames
+    * back every P ticks, a picture kept only for the frames landed on. */
+   long rw_stride = 0, rw_period = 1;
+   memset(&rw_opts, 0, sizeof(rw_opts));
+   rw_opts.ff_rewindable = 1;
+#endif
 
    for (i = 1; i < argc; i++)
    {
       if (!strcmp(argv[i], "--rom") && i + 1 < argc)
          rom_path = argv[++i];
+#ifdef REWIND
+      else if (!strcmp(argv[i], "--rewind"))
+         rw_want = 1;
+      else if (!strcmp(argv[i], "--rtc-pin") && i + 1 < argc)
+      {
+         g_rtc_pin = (time_t)strtoll(argv[++i], NULL, 0);
+         gpsp_wallclock = rtc_pinned;
+      }
+      else if (!strcmp(argv[i], "--rewind-at") && i + 1 < argc)
+         rw_at = strtol(argv[++i], NULL, 0);
+      else if (!strcmp(argv[i], "--rewind-ring") && i + 1 < argc)
+         rw_opts.ring_bytes = (uint32_t)strtoul(argv[++i], NULL, 0);
+      else if (!strcmp(argv[i], "--rewind-interval") && i + 1 < argc)
+         rw_opts.interval = (uint32_t)strtoul(argv[++i], NULL, 0);
+      else if (!strcmp(argv[i], "--rewind-max-frames") && i + 1 < argc)
+         rw_opts.max_frames = (uint32_t)strtoul(argv[++i], NULL, 0);
+      else if (!strcmp(argv[i], "--rewind-cross-save") ||
+               !strcmp(argv[i], "--rewind-stop-at-save"))
+         ;                         /* (former choices: the save is permanent) */
+      else if (!strcmp(argv[i], "--rewind-save-quiet") && i + 1 < argc)
+         rw_opts.save_quiet = (uint32_t)strtoul(argv[++i], NULL, 0);
+      else if (!strcmp(argv[i], "--rewind-rlog") && i + 1 < argc)
+         rw_opts.rlog_bytes = (uint32_t)strtoul(argv[++i], NULL, 0);
+      else if (!strcmp(argv[i], "--rewind-sav-mutant") && i + 1 < argc)
+         rw_opts.sav_mutant = (int)strtol(argv[++i], NULL, 0);
+      else if (!strcmp(argv[i], "--rewind-no-ff"))
+         rw_opts.ff_rewindable = 0;
+      else if (!strcmp(argv[i], "--rewind-hash") && i + 1 < argc)
+         rw_opts.hash_path = argv[++i];
+      else if (!strcmp(argv[i], "--rewind-redo"))
+         rw_opts.redo_inputs = 1;
+      else if (!strcmp(argv[i], "--rewind-full-flush"))
+         rw_opts.full_flush_restore = 1;
+      else if (!strcmp(argv[i], "--rewind-inplace"))
+         rw_opts.inplace = 1;
+      else if (!strcmp(argv[i], "--rewind-dirty") && i + 1 < argc)
+         rw_opts.dirty = (int)strtol(argv[++i], NULL, 0);
+      else if (!strcmp(argv[i], "--rewind-verify"))
+         rw_opts.verify = 1;
+      else if (!strcmp(argv[i], "--rewind-dump-frame") && i + 2 < argc)
+      {
+         rw_opts.dump_frame = (uint32_t)strtoul(argv[++i], NULL, 0);
+         rw_opts.dump_dir = argv[++i];
+      }
+      else if (!strcmp(argv[i], "--rewind-step") && i + 1 < argc)
+         rw_step = strtol(argv[++i], NULL, 0);
+      else if (!strcmp(argv[i], "--rewind-target") && i + 1 < argc)
+         rw_opts.target_s = (uint32_t)strtoul(argv[++i], NULL, 0);
+      else if (!strcmp(argv[i], "--rewind-max-span") && i + 1 < argc)
+         rw_opts.max_span = (uint32_t)strtoul(argv[++i], NULL, 0);
+      else if (!strcmp(argv[i], "--rewind-stride") && i + 1 < argc)
+         rw_stride = strtol(argv[++i], NULL, 0);
+      else if (!strcmp(argv[i], "--rewind-period") && i + 1 < argc)
+         rw_period = strtol(argv[++i], NULL, 0);
+      else if (!strcmp(argv[i], "--rewind-sound") && i + 1 < argc)
+         rw_opts.sound_mode = (int)strtol(argv[++i], NULL, 0);
+      else if (!strcmp(argv[i], "--rewind-budget-us") && i + 1 < argc)
+         rw_opts.tick_budget_us = (uint32_t)strtoul(argv[++i], NULL, 0);
+      else if (!strcmp(argv[i], "--rewind-fast-restore"))
+         rw_opts.fast_restore = 1;
+      else if (!strcmp(argv[i], "--rewind-clock"))
+         rw_opts.clock_frames = 1;
+      else if (!strcmp(argv[i], "--rewind-slack-us") && i + 1 < argc)
+         rw_opts.slack_margin_us = (uint32_t)strtoul(argv[++i], NULL, 0);
+      else if (!strcmp(argv[i], "--rewind-pitch") && i + 1 < argc)
+         rw_opts.pix_pitch = (uint32_t)strtoul(argv[++i], NULL, 0);
+      else if (!strcmp(argv[i], "--rewind-wall-sim") && i + 1 < argc)
+         rw_wall_sim = strtol(argv[++i], NULL, 0);
+      else if (!strcmp(argv[i], "--rewind-gprof"))
+         rw_opts.gather_prof = 1;
+      else if (!strcmp(argv[i], "--rewind-pool") && i + 1 < argc)
+         rw_pool_bytes = (size_t)strtoul(argv[++i], NULL, 0);
+      else if (!strcmp(argv[i], "--rewind-sleep-every") && i + 1 < argc)
+         rw_sleep_every = strtol(argv[++i], NULL, 0);
+      else if (!strcmp(argv[i], "--rewind-sleep-tick") && i + 1 < argc)
+         rw_sleep_tick = strtol(argv[++i], NULL, 0);
+      else if (!strcmp(argv[i], "--rewind-sleep-budget") && i + 1 < argc)
+         rw_sleep_budget = strtol(argv[++i], NULL, 0);
+      else if (!strcmp(argv[i], "--rewind-sleep-mach") && i + 1 < argc)
+         rw_sleep_mach = strtoul(argv[++i], NULL, 0);
+      else if (!strcmp(argv[i], "--rewind-pace-us") && i + 1 < argc)
+         rw_opts.pace_us = (uint32_t)strtoul(argv[++i], NULL, 0);
+      else if (!strcmp(argv[i], "--rewind-burst") && i + 1 < argc)
+         rw_opts.burst = (uint32_t)strtoul(argv[++i], NULL, 0);
+      else if (!strcmp(argv[i], "--flush-ram-at") && i + 2 < argc)
+      {
+         g_flush_ram_at    = strtol(argv[++i], NULL, 0);
+         g_flush_ram_every = strtol(argv[++i], NULL, 0);
+      }
+      else if (!strcmp(argv[i], "--rewind-fuzz") && i + 2 < argc)
+      {
+         rw_opts.fuzz_from = (uint32_t)strtoul(argv[++i], NULL, 0);
+         rw_opts.fuzz_seed = (uint32_t)strtoul(argv[++i], NULL, 0);
+      }
+      else if (!strcmp(argv[i], "--dump-shown") && i + 2 < argc)
+      {
+         g_shown_from = strtol(argv[++i], NULL, 0);
+         g_shown_to   = strtol(argv[++i], NULL, 0);
+      }
+      else if (!strcmp(argv[i], "--dump-audio") && i + 1 < argc)
+         g_audio_fp = fopen(argv[++i], "wb");
+#endif
       else if (!strcmp(argv[i], "--bios-dir") && i + 1 < argc)
          bios_dir = argv[++i];
       else if (!strcmp(argv[i], "--save") && i + 1 < argc)
@@ -455,10 +758,17 @@ int main(int argc, char **argv)
          no_pacing = 1;
       else if (!strcmp(argv[i], "--ff"))
          force_ff = 1;
+      else if (!strcmp(argv[i], "--rtc-wall"))
+         rtc_wall = 1;      /* the cartridge clock = time(), as on the PSP */
       else if (!strcmp(argv[i], "--script") && i + 1 < argc)
          script = argv[++i];
       else if (!strcmp(argv[i], "--state") && i + 1 < argc)
          state_path = argv[++i];
+      else if (!strcmp(argv[i], "--state-save-at") && i + 2 < argc)
+      {
+         state_save_at = strtol(argv[++i], NULL, 0);
+         state_out = argv[++i];
+      }
       else if (!strcmp(argv[i], "--force-sram-write"))
          force_sram_write = 1;
       else if (!strcmp(argv[i], "--host"))
@@ -509,6 +819,11 @@ int main(int argc, char **argv)
           * then equal a --me-capture-test run's CPU images frame for frame. */
          me_capture_buf  = g_mecap_test_buf;
          me_capture_mode = 1;
+      }
+      else if (!strcmp(argv[i], "--me-vram-always") && i + 1 < argc)
+      {
+         extern int me_log_vram_always;
+         me_log_vram_always = atoi(argv[++i]) != 0;
       }
       else if (!strcmp(argv[i], "--me-midlog") && i + 1 < argc)
          g_me_midlog = atoi(argv[++i]);
@@ -564,6 +879,9 @@ int main(int argc, char **argv)
    }
 
    fe_evt_init(log_path, 1);
+#ifdef REWIND
+   g_sav_note_path = save_path;
+#endif
 
    if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO) != 0)
    {
@@ -724,7 +1042,151 @@ int main(int argc, char **argv)
             uint64_t w0 = net_now_us();
             fe_np_pump();  /* deliver inbound packets between retro_run calls */
             fe_autopilot_frame();
+            if (rtc_wall)
+            {
+               extern volatile long long gpsp_rtc_wall;
+               gpsp_rtc_wall = (long long)time(NULL);
+            }
+#ifdef REWIND
+            g_tick++;
+            if (rw_wall_sim)
+            {
+               extern volatile long long gpsp_rtc_wall;
+               gpsp_rtc_wall = 1700000000ll + (long long)(g_tick / rw_wall_sim);
+            }
+            if (rw_want && fe_host_frame_count() >= (unsigned)rw_at)
+            {
+               /* The one allocation rewind ever makes (at boot unless a
+                * measurement asked for later with --rewind-at). */
+               rw_want = 0;
+               if (rw_pool_bytes && (rw_pool = (uint8_t *)malloc(rw_pool_bytes)))
+                  fe_host_rewind_set_pool(rw_pool, rw_pool_bytes);
+               if (fe_host_rewind_enable(&rw_opts) == 0)
+                  g_rw_enabled = 1;
+            }
+            if (g_rw_enabled && rw_sleep_every && g_tick % rw_sleep_every == 0 &&
+                rw_sleep_ok(rw_opts.fuzz_from))
+            {
+               fe_host_rewind_suspend();
+               if (rw_pool)
+                  memset(rw_pool, 0xA5, rw_pool_bytes);
+               if (fe_host_rewind_resume(rw_pool, rw_pool_bytes) != 0)
+                  g_rw_enabled = 0;
+            }
+            if (g_rw_enabled && (rw_sleep_tick || rw_sleep_mach))
+            {
+               /* One sleep in the middle of a rewind (review finding 1,
+                * docs/REWIND.md 22). */
+               fe_host_rewind_info inf;
+               fe_host_rewind_info_get(&inf);
+               if (inf.active &&
+                   ((rw_sleep_tick && ++rw_sleep_seen == rw_sleep_tick) ||
+                    (rw_sleep_mach && inf.mach_frame <= rw_sleep_mach)))
+               {
+                  fe_evt("rewind_sleep_test tick=%ld mach=%u now=%u",
+                         rw_sleep_seen, (unsigned)inf.mach_frame,
+                         (unsigned)inf.now_frame);
+                  rw_sleep_tick = 0;
+                  rw_sleep_mach = 0;
+                  rw_slept_let_go = 1;
+                  /* what the PSP's loop does when the power callback asks
+                   * it to park: land first, then let the history go */
+                  if (rw_sleep_budget >= 0)
+                     (void)fe_host_rewind_land((uint32_t)rw_sleep_budget);
+                  fe_host_rewind_suspend();
+                  if (rw_pool)
+                     memset(rw_pool, 0xA5, rw_pool_bytes);
+                  if (fe_host_rewind_resume(rw_pool, rw_pool_bytes) != 0)
+                     g_rw_enabled = 0;
+               }
+            }
+            {
+               /* The control is a level, sampled once a tick; the rewind
+                * decides whether this tick runs a frame.  A rewind tick is
+                * always at display speed, whatever fast-forward says. */
+               int ff = g_ff, play = 1;
+               if (g_rw_enabled)
+               {
+                  fe_host_rewind_info inf;
+                  int held = fe_autopilot_rewind() ||
+                     SDL_GetKeyboardState(NULL)[SDL_SCANCODE_BACKSPACE];
+                  if (rw_slept_let_go)
+                  {
+                     /* the scripted hold that was slept through is over */
+                     if (!fe_autopilot_rewind())
+                        rw_slept_let_go = 0;
+                     held = 0;
+                  }
+                  static int rw_was;
+                  static long rw_ticks, rw_kill = -2;
+                  if (rw_kill == -2)
+                     rw_kill = getenv("RW_KILL_TICK")
+                                  ? atol(getenv("RW_KILL_TICK")) : -1;
+                  fe_host_rewind_info_get(&inf);
+                  if (held && !rw_was && !inf.active)
+                  {
+                     sav_note("begin");
+                     rw_was = 1;
+                  }
+                  if (held || inf.active)
+                     g_ff = 0;
+                  if (rw_stride > 0)
+                  {
+                     fe_host_rewind_set_cadence((uint32_t)rw_stride,
+                                                rw_stride > 1 || rw_period > 1);
+                     play = fe_host_rewind_tick_step(
+                               held, g_tick % (unsigned)(rw_period > 0 ? rw_period : 1)
+                                        ? 0u : (uint32_t)rw_stride) == 2;
+                  }
+                  else
+                  play = fe_host_rewind_tick_step(
+                            held, (uint32_t)(1 + (g_tick * 7u) % (unsigned)rw_step)) == 2;
+                  /* (tests) a kill in the middle of a rewind: no flush, no
+                   * close, nothing */
+                  if (!play && ++rw_ticks == rw_kill)
+                     _exit(9);
+                  if (play && !held && rw_was)
+                  {
+                     sav_note("end");
+                     rw_was = 0;
+                  }
+               }
+               if (play)
+               {
+                  /* Test instrument (docs/REWIND.md 16.2): drop the RAM
+                   * translation cache before chosen frames of a run that
+                   * never rewinds, to show what the block layout alone
+                   * does to a picture. */
+                  static long played;
+                  played++;
+                  if (g_flush_ram_at > 0 && played >= g_flush_ram_at &&
+                      (played == g_flush_ram_at ||
+                       (g_flush_ram_every > 0 &&
+                        (played - g_flush_ram_at) % g_flush_ram_every == 0)))
+                  {
+                     static long n;
+                     flush_translation_cache_ram();
+                     if (!n++)
+                        fprintf(stderr, "flush-ram-at: first at frame %ld\n",
+                                played);
+                  }
+                  g_ff = ff;
+                  fe_host_rewind_set_ff(g_ff);
+                  fe_host_run_frame();
+               }
+            }
+            if (g_shown_valid && (long)g_tick >= g_shown_from &&
+                (long)g_tick < g_shown_to)
+            {
+               char path[600];
+               snprintf(path, sizeof(path), "%s/shown_%06ld.bmp", dump_dir,
+                        (long)g_tick - g_shown_from);
+               (void)fe_bmp_write_rgb565(path, g_shown, FE_GBA_WIDTH,
+                                         FE_GBA_HEIGHT, FE_GBA_WIDTH * 2);
+            }
+#else
             fe_host_run_frame();
+#endif
             fe_np_prof_frame((uint32_t)(net_now_us() - w0));
          }
          rfu_trace_drain();
@@ -760,6 +1222,12 @@ int main(int argc, char **argv)
             }
          }
 
+         if (state_out && fe_host_frame_count() >= (unsigned)state_save_at)
+         {
+            (void)fe_host_state_save(state_out);
+            state_out = NULL;
+         }
+
          if (g_trace_n && (fe_host_frame_count() % 300) == 0)
             trace_emit();
 
@@ -779,6 +1247,10 @@ int main(int argc, char **argv)
       }
    }
 
+#ifdef REWIND
+   if (g_audio_fp)
+      fclose(g_audio_fp);
+#endif
    fe_np_stop();
    if (udp)
       udp_transport_destroy(udp);

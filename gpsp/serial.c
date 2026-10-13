@@ -79,10 +79,30 @@ uint16_t serial_mul_siocnt() {
   return ret;
 }
 
+#ifdef REWIND
+/* Rewind (docs/REWIND.md, "what is outside a snapshot").  Whatever is on the
+ * other end of the serial port -- the emulated wireless adapter (rfu.c, a
+ * large state machine with wall-clock timeouts), the cable, the multiplayer
+ * protocol -- keeps its state OUTSIDE the save-state image, exactly as the
+ * cartridge save does.  A frame in which the game drove the port cannot be
+ * re-run to the same result (found on Pokemon Emerald: it probes for the
+ * adapter in its first frames, and a re-run of those frames met an adapter
+ * that had already answered).  Every call into one of those devices from a
+ * guest write bumps this; the frontend ends the history there.  A port with
+ * nothing on it, or the Game Boy Player (whose state IS saved), does not:
+ * Pokemon Pinball drives the port every frame for the rumble. */
+u32 gba_rewind_serial_gen;
+#define RW_SERIAL_TOUCHED() (gba_rewind_serial_gen++)
+#else
+#define RW_SERIAL_TOUCHED() ((void)0)
+#endif
+
 cpu_alert_type write_rcnt(u16 value) {
 #ifdef GBA_LINK
-  if (serial_mode == SERIAL_MODE_CABLE)
+  if (serial_mode == SERIAL_MODE_CABLE) {
+    RW_SERIAL_TOUCHED();
     return gbalink_write_rcnt(value);
+  }
 #endif
   u16 oldval = read_ioreg(REG_RCNT);
   u32 pvmode = get_serial_mode(oldval, read_ioreg(REG_RCNT));
@@ -94,14 +114,18 @@ cpu_alert_type write_rcnt(u16 value) {
   case SERIAL_MODE_GPIO:
     // Check if we are pulling PD high. This resets the RFU module.
     if (serial_mode == SERIAL_MODE_RFU) {
-      if ((value & 0x20) && !(oldval & 0x02))
+      if ((value & 0x20) && !(oldval & 0x02)) {
+        RW_SERIAL_TOUCHED();
         rfu_reset();
+      }
     }
     break;
 
   case SERIAL_MODE_MULTI:
-    if (pvmode != nwmode)
+    if (pvmode != nwmode) {
+      RW_SERIAL_TOUCHED();
       serialproto_reset();   // Reset multiplayer emulation states.
+    }
 
     // Update SI/SD/ID/Error fields
     write_ioreg(REG_SIOCNT, (read_ioreg(REG_SIOCNT) & 0xFF83) | serial_mul_siocnt());
@@ -116,8 +140,10 @@ cpu_alert_type write_rcnt(u16 value) {
 
 cpu_alert_type write_siocnt(u16 value) {
 #ifdef GBA_LINK
-  if (serial_mode == SERIAL_MODE_CABLE)
+  if (serial_mode == SERIAL_MODE_CABLE) {
+    RW_SERIAL_TOUCHED();
     return gbalink_write_siocnt(value);
+  }
 #endif
   u16 oldval = read_ioreg(REG_SIOCNT);
   u16 newval = (value & 0x7F8B) | (oldval & 0x0004);
@@ -140,6 +166,7 @@ cpu_alert_type write_siocnt(u16 value) {
         u32 rval;
         u32 cph_t = core_phase_enter(CORE_PHASE_FINE);
         cph_rfux++;
+        RW_SERIAL_TOUCHED();
         rval = rfu_transfer(read_ioreg32(REG_SIODATA32_L));
         core_phase_leave(CORE_PHASE_FINE, &cph_rfut, cph_t);
         write_ioreg(REG_SIODATA32_L, rval & 0xFFFF);
@@ -183,8 +210,10 @@ cpu_alert_type write_siocnt(u16 value) {
     break;
 
   case SERIAL_MODE_MULTI:
-    if (pvmode != nwmode)
+    if (pvmode != nwmode) {
+      RW_SERIAL_TOUCHED();
       serialproto_reset();   // Reset multiplayer emulation states.
+    }
 
     // Update SI/SD/ID/Error fields
     newval = (newval & 0xFF83) | serial_mul_siocnt();
@@ -196,10 +225,13 @@ cpu_alert_type write_siocnt(u16 value) {
         CLOCK_CYC_57600_16BIT, CLOCK_CYC_115200_16BIT };
       serial_irq_cycles = tim[newval & 0x3] * (netplay_num_clients + 1);
 
-      if (serial_mode == SERIAL_MODE_SERIAL_POKE)
+      if (serial_mode == SERIAL_MODE_SERIAL_POKE) {
+        RW_SERIAL_TOUCHED();
         serialpoke_master_send();
-      else if (serial_mode == SERIAL_MODE_SERIAL_AW1 || serial_mode == SERIAL_MODE_SERIAL_AW2)
+      } else if (serial_mode == SERIAL_MODE_SERIAL_AW1 || serial_mode == SERIAL_MODE_SERIAL_AW2) {
+        RW_SERIAL_TOUCHED();
         serialaw_master_send();
+      }
     }
 
     break;
@@ -215,7 +247,7 @@ cpu_alert_type write_siocnt(u16 value) {
 u32 serial_next_event() {
 #ifdef GBA_LINK
   if (serial_mode == SERIAL_MODE_CABLE)
-    return gbalink_next_event();
+    return gbalink_next_event_q();
 #endif
   if (serial_irq_cycles)
     return serial_irq_cycles;
@@ -227,7 +259,7 @@ bool update_serial(unsigned cycles) {
   DRPH_SCOPE(DRPH_SERIAL);
 #ifdef GBA_LINK
   if (serial_mode == SERIAL_MODE_CABLE)
-    return gbalink_update_serial();
+    return gbalink_update_serial_q();
 #endif
   // Might wanna check if the connected device has some update (IRQ).
   switch (serial_mode) {

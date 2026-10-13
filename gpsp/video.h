@@ -140,6 +140,9 @@ typedef struct
  * which is where the log's old values come from.  NULL = VRAM tracking off
  * (palette and OAM are still logged). */
 extern u8 *me_vram_shadow;
+/* 1 (default): per-line VRAM tracking on every frame; 0: only after a frame
+ * that needed it (video_me_log.h). */
+extern int me_log_vram_always;
 /* The frontend's "the ME has copied the dirty pages, clear the map" step.
  * Must go through the core so page invalidation for the shadow is not lost. */
 void me_vram_map_consumed(void);

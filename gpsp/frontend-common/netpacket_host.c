@@ -286,6 +286,26 @@ static void np_log(void *user, const char *line)
  *     seconds -- measured retx_age 1895 ms mean / 3515 ms max at 59.73 fps.
  *   rto_min_us -- the adaptive estimator's floor, 200 ms on this build. */
 static uint32_t np_rto_first_max_us, np_rto_min_us;
+/* ACK RIDING (netdrv.h nd_config.ack_ride_us).  Two values, kept apart:
+ *   np_ack_ride_product  what a GBA Link Cable session rides at WHILE IT
+ *                        RUNS (fe_np_ack_ride_session(1) at RUNNING, (0) at
+ *                        its close).  Never applied to a session's setup
+ *                        (one-directional traffic: a lone ack would wait the
+ *                        whole ride and can outlast the first RTO), nor to
+ *                        any other kind of session.
+ *   np_ack_ride_us       a harness nd_ack_ride_us value, FIXED: in force
+ *                        from the session's creation for every kind of
+ *                        session, 0 included; fe_np_ack_ride_session then
+ *                        leaves it alone.  Only fe_np_set_ack_ride latches. */
+static uint32_t np_ack_ride_us;
+static uint32_t np_ack_ride_product;
+static int np_ack_ride_fixed;    /* a harness value is in force */
+void fe_np_set_ack_ride(uint32_t us) { np_ack_ride_us = us; np_ack_ride_fixed = 1; }
+void fe_np_set_ack_ride_product(uint32_t us) { np_ack_ride_product = us; }
+uint32_t fe_np_ack_ride_now(void)
+{
+   return np.nd ? netdrv_ack_ride(np.nd) : 0u;
+}
 
 void fe_np_set_arq_timers(uint32_t rto_first_max_us, uint32_t rto_min_us)
 {
@@ -376,6 +396,7 @@ static int fe_np_start_internal(const fe_np_config *cfg, int gb_mode)
     * records exactly what a silent struct-layout skew costs on this project. */
    nc.rto_first_max_us = np_rto_first_max_us;
    nc.retx_us          = np_rto_min_us;
+   nc.ack_ride_us      = np_ack_ride_fixed ? np_ack_ride_us : 0u;
    np.nd = netdrv_create(cfg->transport, &cb, &nc);
    if (!np.nd)
    {
@@ -647,4 +668,18 @@ uint32_t fe_np_txq_now(void)
       return 0;
    netdrv_get_stats(np.nd, &st);
    return st.txq_now;
+}
+
+/* A GBA Link Cable session's acks ride (np_ack_ride_product, 30 ms by
+ * default: psp/main_psp.c PLAY_ND_ACK_RIDE_US) from the moment it is RUNNING
+ * -- both consoles then send a packet every frame or two for an ack to ride
+ * on -- until its close; Fast link or not (hardware: Street Fighter 45.2 ->
+ * 47.6 fps with riding alone).  Setup, every other session and the time
+ * after the close keep the immediate ack.  A harness nd_ack_ride_us value
+ * wins, 0 included. */
+void fe_np_ack_ride_session(int on)
+{
+   if (np_ack_ride_fixed || !np.nd)
+      return;
+   netdrv_set_ack_ride(np.nd, on ? np_ack_ride_product : 0u);
 }

@@ -6,11 +6,11 @@
  * ME_CAP_VALIDATE (~61k frames, THIS slim capture struct).  What this file
  * adds is the two-phase hardware protocol:
  *
- *   phase 1 — SNAPSHOT: copy the live core vram/oam/palette into the PRX's
- *             own arrays (cached reads, invalidate first), then publish
- *             input_seq so the host resumes emulating the next frame.
+ *   phase 1 — SNAPSHOT: copy the live core vram/oam/palette into the
+ *             engine's own copies (cached reads, invalidate first), then
+ *             publish input_seq so the host resumes emulating the next frame.
  *   phase 2 — RENDER:   replay the me_capture_frame through update_scanline()
- *             into an ME-local buffer, then write pitched rows to the host's
+ *             into the engine's frame buffer, then write pitched rows to the host's
  *             staging buffer (uncached, so the GE sees them with no ME
  *             writeback), and return a frame checksum.
  *
@@ -29,8 +29,41 @@ extern "C" {
 #define VRAM_DIRTY_SHIFT 10
 #define VRAM_DIRTY_PAGES ((1024 * 96) >> VRAM_DIRTY_SHIFT)
 
-/* ME-local frame buffer the renderer draws into (PRX BSS, cached-fast). */
-static u16 me_out[GBA_SCREEN_PITCH * (160 + 1)];
+/* THE WORK AREA (me_mbox.h): the VRAM mirror, the OBJ lists and the frame the
+ * renderer draws into are the host's memory, named in every render desc.  The
+ * first two are video.cc's (me_render_data.c holds the pointers it reads);
+ * the frame is ours.  All three are set at the top of every render, from that
+ * render's desc, and used by nothing outside it -- so there is no pointer here
+ * that can outlive the memory it names. */
+extern "C" {
+extern u8 *me_work_vram, *me_work_vram_obj, *me_work_obj;
+void me_obj_lists_reset(void);          /* video.cc */
+}
+static u16 *me_out;
+/* The two sides agree on sizes through me_mbox.h alone; these are the shapes
+ * the renderer actually uses (video.cc: obj_priority_list[5][160][128]). */
+static_assert(GBA_SCREEN_PITCH * (160 + 1) * sizeof(u16) <= ME_WORK_OUT_BYTES,
+              "the renderer's frame does not fit ME_WORK_OUT_BYTES");
+static_assert(5 * 160 * 128 == ME_WORK_OBJ_BYTES && 1024 * 96 == ME_WORK_VRAM_BYTES,
+              "ME_WORK_* no longer match the renderer's buffers");
+static_assert((ME_WORK_BYTES & 63u) == 0 && (ME_WORK_OBJ_OFF & 63u) == 0 &&
+              (ME_WORK_OUT_OFF & 63u) == 0,
+              "the work area must be whole 64-byte cache lines");
+
+/* The work area this module last brought to a known state, and the host's
+ * generation for it.  Module .bss, so zero -- "none" -- after every load; the
+ * host's generations start at 1. */
+static unsigned int me_work_seen, me_work_gen_seen;
+
+/* Called by the dispatcher every time the ME comes out of reset.  The host
+ * rebuilds the renderer after a sleep and says so with a new work_gen; this
+ * is the same statement made from our side, for the sleep the host did not
+ * manage to tear down for (main_psp.c, power_cb: teardown_skipped). */
+extern "C" void me_render_boot(void)
+{
+   me_work_seen     = 0;
+   me_work_gen_seen = 0;
+}
 
 /* Invalidate a main-RAM span in the ME D-cache before a cached read, so we see
  * the host's freshly written data and never a stale line. */
@@ -53,6 +86,7 @@ extern "C" unsigned int me_render_run(volatile me_mbox *mb, unsigned int seq)
    me_render_desc *d = (me_render_desc *)(mb->arg0 & ~0x40000000u);
    const me_capture_frame *cap;
    unsigned int sum = 0;
+   unsigned int work, fresh;
 
    me_inv((unsigned int)d, sizeof(*d));
    if (!d->vram || !d->capture || !d->out || !d->out_pitch)
@@ -60,6 +94,25 @@ extern "C" unsigned int me_render_run(volatile me_mbox *mb, unsigned int seq)
       mb->input_seq = seq;           /* never leave the host waiting */
       return 0;
    }
+   /* NO WORK AREA, NO RENDER.  There is nothing in this module to fall back
+    * on -- that is the point of the change -- so a desc without a usable area
+    * is refused, out loud: the host reads refused_seq when it retires the
+    * command and goes back to drawing on the main CPU.  Whole cache lines
+    * only (see me_mbox.h), and at least the size this module was built for. */
+   work = d->work & ~0x40000000u;
+   if (!work || (work & 63u) || d->work_bytes < ME_WORK_BYTES)
+   {
+      mb->refused_seq = seq;
+      mb->input_seq   = seq;
+      return 0;
+   }
+   me_work_vram     = (u8 *)(work + ME_WORK_VRAM_OFF);
+   me_work_vram_obj = me_work_vram + 0x10000;
+   me_work_obj      = (u8 *)(work + ME_WORK_OBJ_OFF);
+   me_out           = (u16 *)(work + ME_WORK_OUT_OFF);
+   /* A work area we have not seen holds nothing of ours, whatever the host's
+    * dirty map says about VRAM: see work_gen in me_mbox.h. */
+   fresh = (work != me_work_seen || d->work_gen != me_work_gen_seen);
 
    /* ---- phase 1: snapshot the live core arrays ------------------------- */
    /* VRAM: copy only the pages the host marked dirty.
@@ -74,7 +127,7 @@ extern "C" unsigned int me_render_run(volatile me_mbox *mb, unsigned int seq)
     * vram_clean == 0 means "no map": copy everything. The host sets that on
     * the first frame and after any teardown/resume, when this eDRAM mirror
     * cannot be trusted to be a correct base to patch. */
-   if (d->vram_clean)
+   if (d->vram_clean && !fresh)
    {
       const unsigned char *cl =
          (const unsigned char *)(d->vram_clean & ~0x40000000u);
@@ -88,14 +141,14 @@ extern "C" unsigned int me_render_run(volatile me_mbox *mb, unsigned int seq)
             continue;                       /* clean: eDRAM copy still valid */
          me_inv((unsigned int)(src + (p << VRAM_DIRTY_SHIFT)),
                 1u << VRAM_DIRTY_SHIFT);
-         memcpy(vram + (p << VRAM_DIRTY_SHIFT),
+         memcpy(me_work_vram + (p << VRAM_DIRTY_SHIFT),
                 src + (p << VRAM_DIRTY_SHIFT), 1u << VRAM_DIRTY_SHIFT);
       }
    }
    else
    {
       me_inv(d->vram & ~0x40000000u, 1024 * 96);
-      memcpy(vram, (const void *)(d->vram & ~0x40000000u), 1024 * 96);
+      memcpy(me_work_vram, (const void *)(d->vram & ~0x40000000u), 1024 * 96);
    }
    me_inv(d->oam     & ~0x40000000u, 512 * 2);
    memcpy(oam_ram, (const void *)(d->oam & ~0x40000000u), 512 * 2);
@@ -114,6 +167,20 @@ extern "C" unsigned int me_render_run(volatile me_mbox *mb, unsigned int seq)
    }
 #endif
    mb->input_seq = seq;              /* host may resume emulation NOW */
+
+   if (fresh)
+   {
+      /* Bring the rest of a new area to what a freshly loaded module had in
+       * its .bss: no OBJ lists, a black frame.  After input_seq, because the
+       * host spins on that and this is 180 KB through a 16 KiB cache; it
+       * happens once per renderer build, not per frame.  VRAM needs nothing
+       * here -- the copy above just replaced all of it. */
+      me_obj_lists_reset();
+      memset(me_work_obj, 0, ME_WORK_OBJ_BYTES);
+      memset(me_out, 0, ME_WORK_OUT_BYTES);
+      me_work_seen     = work;
+      me_work_gen_seen = d->work_gen;
+   }
 
    /* ---- phase 2: render from the capture ------------------------------- */
    cap = (const me_capture_frame *)(d->capture & ~0x40000000u);

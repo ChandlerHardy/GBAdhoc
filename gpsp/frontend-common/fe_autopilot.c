@@ -46,6 +46,9 @@ enum ap_op
    , OP_STATE                 /* harness only -- see fe_autopilot_state_pending */
    , OP_DISCONNECT            /* harness only -- fe_autopilot_disconnect_pending */
 #endif
+#ifdef REWIND
+   , OP_REWIND                /* hold the rewind control (fe_autopilot_rewind) */
+#endif
 };
 
 /* Only ever read by an fe_evt argument, so it disappears with telemetry. */
@@ -91,6 +94,9 @@ static uint32_t sram_ref_crc;   /* waitsram reference */
 static int      status = 2;     /* 0 run, 1 done, -1 fail, 2 none */
 static int      ff_on;
 static int      dump_req;
+#ifdef REWIND
+static int      rewind_now;    /* this tick is a rewind tick, not a frame */
+#endif
 #ifdef GPSP_PERF_RIG
 static int      state_req;     /* harness only: `state` asked for a reload */
 static int      disc_req;      /* harness only: `disconnect` ends a link */
@@ -249,6 +255,13 @@ int fe_autopilot_load(const char *path)
       else if (!strcmp(tok[0], "disconnect") && ntok == 1)
       {
          st->op = OP_DISCONNECT;
+      }
+#endif
+#ifdef REWIND
+      else if (!strcmp(tok[0], "rewind") && ntok == 2)
+      {
+         st->op = OP_REWIND;
+         st->frames = parse_num(tok[1]);
       }
 #endif
       else if (!strcmp(tok[0], "dump") && ntok == 1)
@@ -673,6 +686,17 @@ static int run_step(void)
          return 2;
       return 1;
 
+#ifdef REWIND
+   case OP_REWIND:
+      /* N display ticks with the rewind control held.  The frontend shows
+       * an earlier frame instead of running one (fe_autopilot_rewind). */
+      fe_host_input_inject(0);
+      rewind_now = 1;
+      if (++step_frame >= st->frames)
+         return 2;
+      return 1;
+#endif
+
    case OP_HOLD:
       fe_host_input_inject(st->buttons);
       if (++step_frame >= st->frames)
@@ -798,6 +822,9 @@ void fe_autopilot_frame(void)
 {
    int chain;
 
+#ifdef REWIND
+   rewind_now = 0;
+#endif
    if (status != 0)
    {
       if (loaded)
@@ -852,6 +879,13 @@ int fe_autopilot_ff(void)
 {
    return loaded && ff_on;
 }
+
+#ifdef REWIND
+int fe_autopilot_rewind(void)
+{
+   return loaded && rewind_now;
+}
+#endif
 
 int fe_autopilot_dump_pending(void)
 {

@@ -168,12 +168,13 @@ int main(int argc, char **argv)
    FILE *hf = NULL;
    fe_host_config cfg;
    unsigned seg = 0, f;
-   int i, started = 0;
+   int i, started = 0, fbhash = 0;
 
    for (i = 1; i < argc; i++)
    {
 #define ARG(n) (!strcmp(argv[i], n) && i + 1 < argc)
-      if (ARG("--rom")) rom = argv[++i];
+      if (!strcmp(argv[i], "--fbhash")) fbhash = 1;
+      else if (ARG("--rom")) rom = argv[++i];
       else if (ARG("--bios-dir")) bios = argv[++i];
       else if (ARG("--save")) save = argv[++i];
       else if (ARG("--state")) state = argv[++i];
@@ -318,13 +319,33 @@ int main(int argc, char **argv)
       }
 
       if (hf)
+      {
          fprintf(hf, "f=%u s=%u a=%08x n=%lu r=%08x pc=%08x i=%08x e=%08x "
-                 "io=%08x p=%08x o=%08x v=%08x\n",
+                 "io=%08x p=%08x o=%08x v=%08x",
                  fe_host_frame_count(), seg, g_ahash, g_asamples,
                  fnv32w(reg, 17 * 4), reg[15],
                  fnv32w(iwram + 0x8000, 0x8000), fnv32w(ewram, 0x40000),
                  fnv32w(io_registers, 0x400), fnv32w(palette_ram, 0x400),
                  fnv32w(oam_ram, 0x400), fnv32w(vram, 96 * 1024));
+         /* --fbhash (dr_corpus.py): the rendered picture as well, row by
+          * row (pitch-safe).  Catches a mid-frame raster difference that
+          * the end-of-frame state hashes would not.  Opt-in so the line
+          * stays comparable with the PSP harness `shash` format. */
+         if (fbhash)
+         {
+            uint32_t fh = 2166136261u;
+            unsigned y;
+            if (g_pix)
+               for (y = 0; y < 160; y++)
+               {
+                  uint32_t rh = fnv32w((const uint8_t *)g_pix + y * g_pitch,
+                                       240 * 2);
+                  fh = (fh ^ rh) * 16777619u;
+               }
+            fprintf(hf, " fb=%08x", fh);
+         }
+         fputc('\n', hf);
+      }
       if (dump_dir && g_pix)
       {
          int want = fe_autopilot_dump_pending();

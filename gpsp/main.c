@@ -772,6 +772,41 @@ void rand_seed(u32 data) {
 }
 
 
+#ifdef TIMER_LAZY
+/* TIMER_LAZY=1 (build) + timer_lazy (run time; harness `timer_lazy = 1`).
+ * PROTOTYPE, OFF by default, NOT a pure speed switch: it changes guest-
+ * visible timing (docs/GBA-LINK-MIRROR.md 26; owner-approved as a prototype
+ * only, 2026-10-11).
+ *
+ * Today every overflow of a running timer is a scheduler event: the CPU is
+ * stopped exactly there.  For a timer that raises no interrupt and feeds no
+ * cascade, the overflow has nothing the CPU must see at that instant -- for
+ * a direct-sound timer it pops one FIFO sample and, every 16th time, asks
+ * for the refill DMA.  With the switch on such a timer no longer stops the
+ * CPU; its overflows (all of them: the loop below) are processed at the
+ * next scheduler call, which is at most one H-blank edge (960 cycles) away.
+ *
+ * What a game can observe:
+ *   - the sound FIFO's refill DMA (and the cycles it steals) happens up to
+ *     960 cycles later than today;
+ *   - the CPU is no longer interrupted at those overflows, so where
+ *     update_gba's overshoot clamp applies moves, and with it the cycle
+ *     count of everything that follows;
+ *   - the timer's counter register is refreshed at scheduler calls, as
+ *     today, but no longer at the overflow itself.
+ * Timers with their interrupt enabled, and timers a cascade timer counts,
+ * keep their exact events. */
+#ifndef TIMER_LAZY_DEFAULT
+#define TIMER_LAZY_DEFAULT 0
+#endif
+u32 timer_lazy = TIMER_LAZY_DEFAULT;
+#define TIMER_IS_LAZY(i)                                                      \
+   (timer_lazy && !timer[i].irq &&                                            \
+    !((i) != 3 && timer[(i) + 1].status == TIMER_CASCADE))
+#else
+#define TIMER_IS_LAZY(i) 0
+#endif
+
 static unsigned update_timers(irq_type *irq_raised, unsigned completed_cycles)
 {
    unsigned i, ret = 0;
@@ -790,6 +825,9 @@ static unsigned update_timers(irq_type *irq_raised, unsigned completed_cycles)
       if(timer[i].count > 0)
          continue;
 
+#ifdef TIMER_LAZY
+      do {      /* a lazy timer may have overflowed more than once */
+#endif
       /* irq_raised value range: IRQ_TIMER0, IRQ_TIMER1, IRQ_TIMER2, IRQ_TIMER3 */
       if(timer[i].irq)
          *irq_raised |= (IRQ_TIMER0 << i);
@@ -823,6 +861,10 @@ static unsigned update_timers(irq_type *irq_raised, unsigned completed_cycles)
       }
 
       timer[i].count += (timer[i].reload << timer[i].prescale);
+#ifdef TIMER_LAZY
+      } while (timer_lazy && timer[i].count <= 0 &&
+               timer[i].status == TIMER_PRESCALE);
+#endif
    }
    return ret;
 }
@@ -928,6 +970,26 @@ static inline int serial_idle_fast(unsigned cycles)
 }
 #endif
 
+#ifdef SCHED_FAST
+/* SCHED_FAST=1 (build) + sched_fast (run time; harness `sched_fast = 1`):
+ * scheduler fast paths, OFF by default (docs/GBA-LINK-MIRROR.md 24).  Pure
+ * speed: the machine is identical with it on or off.
+ *
+ * 1. THE INTERRUPT CHECK.  update_gba called check_and_raise_interrupts on
+ *    every iteration (845 a frame per machine in Street Fighter's fight,
+ *    1,358 in an Advance Wars 2 battle) and flag_interrupt for every raised
+ *    source.  Both of check_and_raise_interrupts' effects -- waking a HALT
+ *    and entering the vector (which also ends STOP) -- require
+ *    (IE & IF) != 0 (cpu.h cpu_halt_wake_requested, cpu_irq_delivery_enabled),
+ *    so with IE & IF == 0 the call can only return 0 and is skipped.
+ *    flag_interrupt is `IF |= raised` plus a check_interrupt() whose result
+ *    update_gba discards; the OR is done here. */
+#ifndef SCHED_FAST_DEFAULT
+#define SCHED_FAST_DEFAULT 0
+#endif
+u32 sched_fast = SCHED_FAST_DEFAULT;
+#endif
+
 u32 function_cc update_gba(int remaining_cycles)
 {
   DRPH_SCOPE(DRPH_UPD);
@@ -939,7 +1001,7 @@ u32 function_cc update_gba(int remaining_cycles)
   /* Link cable stepper (gbalink_core.c): postpone this whole call -- the
    * dynarec returns to the stepper, which later makes exactly this call with
    * exactly this argument.  Invisible to the guest. */
-  if (serial_mode == SERIAL_MODE_CABLE && gbalink_entry_yield(remaining_cycles))
+  if (serial_mode == SERIAL_MODE_CABLE && gbalink_entry_yield_q(remaining_cycles))
     return 0x80000000;
 #endif
   trace_update_gba(remaining_cycles);
@@ -1004,6 +1066,18 @@ u32 function_cc update_gba(int remaining_cycles)
     // Timers can trigger DMA (usually sound) and consume cycles
     dma_cycles = update_timers(&irq_raised, completed_cycles);
     // Check for serial port IRQs as well.
+#ifdef GBA_LINK
+    /* Cable mode: serial_idle_fast takes the full path for it and
+     * update_serial only forwards, so call the cable hook itself (inline
+     * when the lean hooks are on, serial.h).  Same answer, ~60 MIPS
+     * instructions fewer per iteration (docs/GBA-LINK-MIRROR.md 23). */
+    if (serial_mode == SERIAL_MODE_CABLE)
+    {
+      if (gbalink_update_serial_q())
+        irq_raised |= IRQ_SERIAL;
+    }
+    else
+#endif
 #ifdef SERIAL_IDLE_FAST
     if (!serial_idle_fast(completed_cycles))
 #endif
@@ -1136,9 +1210,15 @@ u32 function_cc update_gba(int remaining_cycles)
           vcount = 0;
           dispstat &= ~0x01;
 
+#ifndef GPSP_CHEATS
           /* If there's no cheat hook, run on vblank! */
           if (cheat_master_hook == ~0U)
              process_cheats();
+#endif
+          /* GPSP_CHEATS: codes run at the top of retro_run instead -- the same
+           * guest instant (this vcount-228 edge ends the frame) but outside
+           * the dynarec, where invalidating translated code is safe
+           * (cheats.h; docs/CHEATS.md section 5). */
 
 /*        printf("frame update (%x), %d instructions total, %d RAM flushes\n",
            reg[REG_PC], instruction_count - last_frame, flush_ram_count);
@@ -1210,6 +1290,18 @@ u32 function_cc update_gba(int remaining_cycles)
       write_ioreg(REG_DISPSTAT, dispstat);
     }
 
+#ifdef SCHED_FAST
+    if (sched_fast)
+    {
+      if (irq_raised)
+        write_ioreg(REG_IF, read_ioreg(REG_IF) | irq_raised);
+      if ((read_ioreg(REG_IE) & read_ioreg(REG_IF)) &&
+          check_and_raise_interrupts())
+        changed_pc = 0x40000000;
+    }
+    else
+#endif
+    {
     // Flag any V/H blank interrupts, DMA IRQs, Vcount, etc.
     if (irq_raised)
       flag_interrupt(irq_raised);
@@ -1217,12 +1309,18 @@ u32 function_cc update_gba(int remaining_cycles)
     // Raise any pending interrupts. This changes the CPU mode.
     if (check_and_raise_interrupts())
       changed_pc = 0x40000000;
+    }
 
     // Figure out when we need to stop CPU execution. The next event is
     // a video event or a timer event, whatever happens first.
     execute_cycles = MAX(video_count, 0);
     {
+#ifdef GBA_LINK
+      u32 cc = serial_mode == SERIAL_MODE_CABLE ? gbalink_next_event_q()
+                                                : serial_next_event();
+#else
       u32 cc = serial_next_event();
+#endif
       execute_cycles = MIN(execute_cycles, cc);
     }
 
@@ -1244,7 +1342,7 @@ u32 function_cc update_gba(int remaining_cycles)
 
     for (i = 0; i < 4; i++)
     {
-       if (timer[i].status == TIMER_PRESCALE &&
+       if (timer[i].status == TIMER_PRESCALE && !TIMER_IS_LAZY(i) &&
            timer[i].count < execute_cycles)
           execute_cycles = timer[i].count;
     }
@@ -1254,7 +1352,7 @@ u32 function_cc update_gba(int remaining_cycles)
      * calls update_gba(0), which is exactly the next iteration. */
     if (serial_mode == SERIAL_MODE_CABLE &&
         reg[CPU_HALT_STATE] != CPU_ACTIVE && !frame_complete &&
-        gbalink_halt_yield())
+        gbalink_halt_yield_q())
     {
       gbalink_reseed_snapshot();
       return 0x80000000;

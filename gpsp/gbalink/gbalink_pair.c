@@ -20,6 +20,7 @@ void gbalink_pair_init(gbalink_pair *p, const gbalink_inst_ops *s0,
       p->cfg.lookahead = 2 * p->cfg.child_margin;   /* else nothing advances */
    p->last_ran = -1;
    p->running = -1;
+   p->stress_state = p->cfg.stress_seed;
    gbalink_bus_reset();
    p->m[0].begin(0, p->cfg.headless[0]);
    p->m[1].begin(1, p->cfg.headless[1]);
@@ -58,11 +59,19 @@ static int pair_fail(gbalink_pair *p, int err, uint32_t runs, uint32_t peer)
    return GBALINK_PAIR_ERROR;
 }
 
+static uint32_t pair_rand(gbalink_pair *p)
+{
+   uint32_t x = p->stress_state;
+   x ^= x << 13; x ^= x >> 17; x ^= x << 5;
+   return p->stress_state = x;
+}
+
 int gbalink_pair_step(gbalink_pair *p)
 {
    unsigned blocked_run = 0, idle_run = 0;
    uint32_t runs = 0, peer = 0;
    uint64_t blocked_at[2] = { ~(uint64_t)0, ~(uint64_t)0 };  /* per slot */
+   uint64_t t0 = (p->cfg.now_us && p->cfg.step_us_max) ? p->cfg.now_us() : 0;
 
    if (p->error)
       return GBALINK_PAIR_ERROR;
@@ -75,6 +84,37 @@ int gbalink_pair_step(gbalink_pair *p)
       uint64_t horizon = s ? n0 - p->cfg.child_margin
                            : n1 + p->cfg.lookahead;
       int r;
+
+      /* No step may run forever (section 22): every run is bounded by the
+       * core's own guard, the runs by STEP_RUNS_MAX, and the whole step by
+       * the wall clock. */
+      /* the clock every 8 runs.  Every 32 (as first built) never read it
+       * in a healthy step (~20 runs), so a step made of a few very slow
+       * runs was bounded only by the core's 2,000,000-call guard per run
+       * (review finding 6, 2026-10-11).  Two reads in a healthy step. */
+      if (p->cfg.now_us && p->cfg.step_us_max && runs && !(runs & 7) &&
+          p->cfg.now_us() - t0 > p->cfg.step_us_max)
+         return pair_fail(p, GBALINK_PAIR_E_TIMEOUT, runs, peer);
+      if (p->stress_state)
+      {
+         /* TEST ONLY: any horizon inside the rule's limits, and a pump of
+          * either machine at a time the rule would not make one. */
+         uint32_t x = pair_rand(p);
+         if (p->cfg.stress_seed & 0x80000000u)
+            ;                           /* pumps only: the rule's horizons */
+         else if (s)
+         {
+            uint64_t span = n0 - p->cfg.child_margin - n1;
+            horizon = n1 + 1 + (span > 1 ? x % span : 0);
+         }
+         else
+         {
+            uint64_t lo = (n0 > n1 ? n0 : n1) + 1, hi = n1 + p->cfg.lookahead;
+            horizon = hi > lo ? lo + x % (hi - lo + 1) : hi;
+         }
+         if (x & 0x30000)
+            p->m[(x >> 18) & 1].pump();
+      }
 
       if (p->m[s].need_begin())
       {
@@ -159,6 +199,8 @@ int gbalink_pair_step(gbalink_pair *p)
          if (++blocked_run > 4)
             return pair_fail(p, GBALINK_PAIR_E_DEADLOCK, runs, peer);
          break;
+      case GBALINK_RUN_OVERRUN:
+         return pair_fail(p, GBALINK_PAIR_E_OVERRUN, runs, peer);
       default:
          return pair_fail(p, GBALINK_PAIR_E_RUN, runs, peer);
       }

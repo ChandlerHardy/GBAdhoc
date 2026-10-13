@@ -67,7 +67,6 @@ int main(void)
 
    host.save_path = path;
    sram_have_blk = 1;
-   sram_have_crc = 1;
    sram_full_req = 0;
    sram_scan_req = 0;
    sram_fp = NULL;

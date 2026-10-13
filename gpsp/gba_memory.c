@@ -390,6 +390,71 @@ u8 gamepak_backup[1024 * 128];
  * because core defines and symbols do not reach frontend-only builds. */
 volatile u32 backup_write_gen = 0;
 #define backup_mark_written() (backup_write_gen++)
+/* REWIND (docs/REWIND.md 17: the save is permanent under rewind).
+ * BACKUP_RO() is true while the save is write-protected (a frame being
+ * re-run for a rewind, gba_memory.h) and counts the attempt.  It guards
+ * every statement that changes a BYTE of the save, and only those: the
+ * chip's command state machine (flash modes, the EEPROM bit counters) runs
+ * as always, because that state is in the snapshot and a re-run frame has
+ * to leave it exactly as the first run did.
+ * BACKUP_DATA(a) is every read of a byte of the save's CONTENTS (not the
+ * flash ID, not the EEPROM's ready bit).  On the first pass the byte read is
+ * appended to the read log; in a re-run frame the answer comes from the log,
+ * because the contents may be newer than they were when the frame first ran
+ * and the game must see what it saw then.  BACKUP_WR() marks a frame in
+ * which the game wrote to the chip at all (data or command). */
+#ifdef REWIND
+extern u32 gba_rewind_backup_ro, gba_rewind_backup_ro_hits;
+u32 gba_rewind_rlog_mutant;   /* tests: 1 = re-runs read the live save,
+                               * 2 = re-runs write it */
+#define BACKUP_RO_MARK() (gba_rewind_backup_ro && !(gba_rewind_rlog_mutant & 2))
+#define BACKUP_RO() (BACKUP_RO_MARK() && (gba_rewind_backup_ro_hits++, 1))
+u32 gba_rewind_bk_acc;
+u8 *gba_rewind_rlog;
+u32 gba_rewind_rlog_mask, gba_rewind_rlog_pos, gba_rewind_rlog_end;
+u32 gba_rewind_rlog_served, gba_rewind_rlog_miss;
+#define BACKUP_WR() (gba_rewind_bk_acc |= 1)
+static u8 rewind_backup_data(u32 a, u32 fresh)
+{
+  u8 v = gamepak_backup[a];
+  if (!gba_rewind_rlog)
+    return v;
+  gba_rewind_bk_acc |= 2;
+  /* fresh == 0: a further bit of the EEPROM byte fetched last (the log has
+   * one entry per byte, not per bit) */
+  if (gba_rewind_backup_ro)
+  {
+    u32 left = gba_rewind_rlog_end - gba_rewind_rlog_pos + (fresh ? 0 : 1);
+    if (gba_rewind_rlog_mutant & 1)
+      return v;                       /* test: re-runs read the live save */
+    if (left - 1 < gba_rewind_rlog_mask + 1)   /* 1 .. size */
+    {
+      gba_rewind_rlog_served++;
+      if (fresh)
+        return gba_rewind_rlog[gba_rewind_rlog_pos++ & gba_rewind_rlog_mask];
+      return gba_rewind_rlog[(gba_rewind_rlog_pos - 1) & gba_rewind_rlog_mask];
+    }
+    /* Nothing logged for this read: the re-run is not the first pass (or
+     * the log was cut).  Counted; the frontend ends the history. */
+    gba_rewind_rlog_miss++;
+    return v;
+  }
+  if (fresh)
+  {
+    gba_rewind_rlog[gba_rewind_rlog_pos++ & gba_rewind_rlog_mask] = v;
+    gba_rewind_rlog_end = gba_rewind_rlog_pos;
+  }
+  return v;
+}
+#define BACKUP_DATA(a)        rewind_backup_data((a), 1)
+#define BACKUP_DATA_BIT(a, k) rewind_backup_data((a), (k) == 0)
+#else
+#define BACKUP_RO() 0
+#define BACKUP_RO_MARK() 0
+#define BACKUP_WR() ((void)0)
+#define BACKUP_DATA(a)        gamepak_backup[(a)]
+#define BACKUP_DATA_BIT(a, k) gamepak_backup[(a)]
+#endif
 
 u32 dma_bus_val;
 dma_transfer_type dma[4];
@@ -479,6 +544,44 @@ void (*gpsp_heap_census)(const char *where);
  * vram_clean[VRAM_DIRTY_ANY]: a 128-byte block never straddles the 0x8000
  * boundary where the stub's sign-extended low half would change the lui. */
 u8  vram_clean[VRAM_DIRTY_MAP_BYTES] __attribute__((aligned(128)));
+#ifdef REWIND
+u32 gba_rewind_skip_arrays;
+u32 gba_rewind_backup_ro;
+u32 gba_rewind_backup_ro_hits;
+u32 gba_rewind_map_ok = 1;
+/* Set by the frontend BEFORE the game is loaded when the rewind will be
+ * recording: the MIPS emitter then builds the store stubs with the page
+ * marks.  Left 0 (the Settings toggle off, a link game) the stubs are the
+ * ones a build without REWIND emits and the marks cost nothing. */
+u32 gba_rewind_marks_wanted;
+#ifdef REWIND_COUNT
+u32 gba_rewind_cnt[2];
+#endif
+#if !defined(MIPS_ARCH)
+/* On MIPS the map lives beside the register block (mips_stub.S). */
+u8  gba_rewind_clean[RW_CLEAN_BYTES];
+#endif
+/* An array of the state image: its header always, its bytes unless the
+ * rewind is moving them itself. */
+#define RW_ARR_WRITE(p, key, value, vlen)       \
+  do {                                          \
+    if (gba_rewind_skip_arrays) {               \
+      *p++ = 0x05;                              \
+      bson_write_cstring(p, key);               \
+      bson_write_u32(p, vlen);                  \
+      *p++ = 0;                                 \
+      p += vlen;                                \
+    } else {                                    \
+      bson_write_bytes(p, key, value, vlen);    \
+    }                                           \
+  } while (0)
+#define RW_ARR_READ(doc, key, buf, cnt) \
+  (gba_rewind_skip_arrays || bson_read_bytes(doc, key, buf, cnt))
+#else
+#define RW_ARR_WRITE(p, key, value, vlen) \
+  do { bson_write_bytes(p, key, value, vlen); } while (0)
+#define RW_ARR_READ(doc, key, buf, cnt) bson_read_bytes(doc, key, buf, cnt)
+#endif
 u32 vram_dirty_marks;
 bool gamepak_mirror_1m;     /* 1MiB Classic NES/Famicom Mini mirror mode */
 static u8 *gamepak_mini_rom;
@@ -570,7 +673,7 @@ u8 read_backup(u32 address)
     backup_type = BACKUP_SRAM;
 
   if(backup_type == BACKUP_SRAM)
-    value = gamepak_backup[address];
+    value = BACKUP_DATA(address);
   else if(flash_mode == FLASH_ID_MODE)
   {
     if (flash_bank_cnt == FLASH_SIZE_128KB)
@@ -605,7 +708,7 @@ u8 read_backup(u32 address)
   else
   {
     u32 fulladdr = address + 64*1024*flash_bank_num;
-    value = gamepak_backup[fulladdr];
+    value = BACKUP_DATA(fulladdr);
   }
 
   return value;
@@ -652,6 +755,7 @@ void function_cc write_eeprom(u32 unused_address, u32 value)
 #ifdef GBA_LINK
   backup_writes++;   /* gba_memory.h */
 #endif
+  BACKUP_WR();
   switch(eeprom_mode)
   {
     case EEPROM_BASE_MODE:
@@ -694,21 +798,25 @@ void function_cc write_eeprom(u32 unused_address, u32 value)
         else
         {
           eeprom_mode = EEPROM_WRITE_MODE;
-          memset(gamepak_backup + eeprom_address, 0, 8);
-          backup_mark_written();
+          if (!BACKUP_RO())
+            memset(gamepak_backup + eeprom_address, 0, 8);
+          if (!BACKUP_RO_MARK())
+            backup_mark_written();
         }
       }
       break;
 
     case EEPROM_WRITE_MODE:
-      gamepak_backup[eeprom_address + (eeprom_counter / 8)] |=
-       (value & 0x01) << (7 - (eeprom_counter % 8));
+      if (!BACKUP_RO())
+        gamepak_backup[eeprom_address + (eeprom_counter / 8)] |=
+         (value & 0x01) << (7 - (eeprom_counter % 8));
       eeprom_counter++;
       if(eeprom_counter == 64)
       {
         eeprom_counter = 0;
         eeprom_mode = EEPROM_WRITE_FOOTER_MODE;
-        backup_mark_written();   /* the 8-byte block is now complete */
+        if (!BACKUP_RO_MARK())
+          backup_mark_written();   /* the 8-byte block is now complete */
       }
       break;
 
@@ -779,7 +887,8 @@ u32 function_cc read_eeprom(void)
       break;
 
     case EEPROM_READ_MODE:
-      value = (gamepak_backup[eeprom_address + (eeprom_counter / 8)] >>
+      value = (BACKUP_DATA_BIT(eeprom_address + (eeprom_counter / 8),
+                               eeprom_counter % 8) >>
        (7 - (eeprom_counter % 8))) & 0x01;
       eeprom_counter++;
       if(eeprom_counter == 64)
@@ -1226,6 +1335,7 @@ void function_cc write_backup(u32 address, u32 value)
 
   if(backup_type == BACKUP_EEPROM)
     return;
+  BACKUP_WR();
 
   if(backup_type == BACKUP_UNKN)
     backup_type = BACKUP_SRAM;
@@ -1282,9 +1392,11 @@ void function_cc write_backup(u32 address, u32 value)
           // Erase chip
           if(flash_mode == FLASH_ERASE_MODE)
           {
-            memset(gamepak_backup, 0xFF, 1024 * 128);
+            if (!BACKUP_RO())
+              memset(gamepak_backup, 0xFF, 1024 * 128);
             flash_mode = FLASH_BASE_MODE;
-            backup_mark_written();
+            if (!BACKUP_RO_MARK())
+              backup_mark_written();
           }
           break;
 
@@ -1293,7 +1405,7 @@ void function_cc write_backup(u32 address, u32 value)
       }
       flash_command_position = 0;
     }
-    if(backup_type == BACKUP_SRAM)
+    if(backup_type == BACKUP_SRAM && !BACKUP_RO())
     {
       gamepak_backup[0x5555] = value;
       backup_mark_written();
@@ -1311,10 +1423,12 @@ void function_cc write_backup(u32 address, u32 value)
     {
       // Erase sector
       u32 fulladdr = (address & 0xF000) + 64*1024*flash_bank_num;
-      memset(&gamepak_backup[fulladdr], 0xFF, 1024 * 4);
+      if (!BACKUP_RO())
+        memset(&gamepak_backup[fulladdr], 0xFF, 1024 * 4);
       flash_mode = FLASH_BASE_MODE;
       flash_command_position = 0;
-      backup_mark_written();
+      if (!BACKUP_RO_MARK())
+        backup_mark_written();
     }
     else
 
@@ -1331,13 +1445,15 @@ void function_cc write_backup(u32 address, u32 value)
     {
       // Write value to flash ROM
       u32 fulladdr = address + 64*1024*flash_bank_num;
-      gamepak_backup[fulladdr] = value;
+      if (!BACKUP_RO())
+        gamepak_backup[fulladdr] = value;
       flash_mode = FLASH_BASE_MODE;
-      backup_mark_written();
+      if (!BACKUP_RO_MARK())
+        backup_mark_written();
     }
     else
 
-    if(backup_type == BACKUP_SRAM)
+    if(backup_type == BACKUP_SRAM && !BACKUP_RO())
     {
       // Write value to SRAM
       gamepak_backup[address] = value;
@@ -1356,6 +1472,7 @@ void function_cc write_backup(u32 address, u32 value)
 #define vram_mark(addr)                                                       \
   vram_clean[(addr) >> VRAM_DIRTY_SHIFT] = 0;                                 \
   vram_clean[VRAM_DIRTY_ANY] = 0;                                             \
+  RW_MARK_VRAM(addr);                                                         \
   vram_dirty_marks++                                                          \
 
 #define write_vram8()                                                         \
@@ -1425,6 +1542,7 @@ s32 rtc_bit_count;
  * rate, which would rewind the in-game clock every few minutes.
  * frame_counter wraps after ~2.27 years of continuous emulation. */
 static s64 rtc_base_time = 0;
+#include "rtc_clock.h"
 
 /* Cycles per frame at the native rate; same divisor at the 60FPS
  * overclock since GBC_BASE_RATE scales correspondingly. */
@@ -1446,6 +1564,19 @@ static s64 rtc_base_time = 0;
  * as before. */
 time_t (*gpsp_wallclock)(void) = NULL;
 
+/* THE WALL CLOCK FOR THE CARTRIDGE (rtc_clock.h).  The frontend publishes
+ * the console's real clock here, a few times a second, in the same encoding
+ * gpsp_wallclock returns; 0 = not published, and the cartridge clock is then
+ * base + frames exactly as before.  Nothing in the core sets it: a frontend
+ * that never heard of it (the desktop rigs, the libretro core, a link
+ * session's second machine) keeps the repeatable frame clock. */
+volatile s64 gpsp_rtc_wall = 0;
+/* Nonzero: use the frame clock even when a wall clock is published.  Set by
+ * a link session (fe_gbadual.c), whose two consoles must compute the same
+ * machine. */
+int gpsp_rtc_frames_only = 0;
+static s64 rtc_last_shown;
+
 /* No real clock reads earlier than this (2000-01-01), so an older base can
  * only have come from the broken source above. */
 #define RTC_PLAUSIBLE_EPOCH  ((s64)946684800)
@@ -1462,14 +1593,38 @@ static s64 rtc_now(void)
   return (s64)t;
 }
 
+static s64 rtc_boot_time;     /* the base as taken at content load (telemetry) */
 static void rtc_init_base_time(void)
 {
   rtc_base_time = rtc_now();
+  rtc_boot_time = rtc_base_time;
 }
+
+#ifdef REWIND
+/* THE CLOCK WHILE A REWIND IS RECORDING (docs/REWIND.md).  The wall clock is
+ * an input the snapshots do not hold: a frame re-run for a rewind would read
+ * a later second than it did the first time.  So while this is set the clock
+ * is base + frames, both of which ARE in a snapshot, and the base is brought
+ * up to the wall clock only at the moments a snapshot is taken on the first
+ * pass (gpsp_rewind_clock_sync).  A re-run from that snapshot then computes
+ * exactly what the first pass computed, and the clock is never further from
+ * the console's than one snapshot interval of fast-forward. */
+u32 gba_rewind_clock_frames;
+void gpsp_rewind_clock_sync(void);
+#endif
 
 static time_t rtc_current_time(void)
 {
   s64 elapsed = (s64)((double)frame_counter * GBA_FRAME_SECONDS);
+#ifdef REWIND
+  if (gba_rewind_clock_frames && rtc_base_time >= RTC_PLAUSIBLE_EPOCH)
+  {
+    s64 t = rtc_base_time + elapsed;
+    if (t > rtc_last_shown)
+      rtc_last_shown = t;     /* the next sync never steps behind this */
+    return (time_t)t;
+  }
+#endif
   /* A save state restores the base it was written with.  States made
    * while the base came from the PSP's uptime carry 1970 forever, so
    * re-anchor one that cannot be real to the clock now -- the game then
@@ -1482,7 +1637,56 @@ static time_t rtc_current_time(void)
     if (now >= RTC_PLAUSIBLE_EPOCH)
       rtc_base_time = now - elapsed;
   }
-  return (time_t)(rtc_base_time + elapsed);
+  {
+    int wall;
+    long long shown = rtc_last_shown;
+    s64 t = (s64)rtc_clock_pick((long long)(rtc_base_time + elapsed),
+                                (long long)gpsp_rtc_wall,
+                                gpsp_rtc_frames_only, &shown, &wall);
+    rtc_last_shown = (s64)shown;
+    /* Keep the frame clock's base in step with what was shown: a savestate
+     * written now, or a link session that takes over from here, continues
+     * from this moment and not from the boot's. */
+    if (wall)
+      rtc_base_time = t - elapsed;
+    return (time_t)t;
+  }
+}
+
+#ifdef REWIND
+/* The clock's base, read (set == NULL) or replaced: a frame re-run past a
+ * point where the first pass brought the base up to the wall clock gets the
+ * base the first pass had from there (fe_host.c, rw_clk). */
+long long gpsp_rewind_clock_base(const long long *set);
+long long gpsp_rewind_clock_base(const long long *set)
+{
+  if (set)
+    rtc_base_time = (s64)*set;
+  return (long long)rtc_base_time;
+}
+
+void gpsp_rewind_clock_sync(void)
+{
+  u32 hold = gba_rewind_clock_frames;
+  gba_rewind_clock_frames = 0;
+  (void)rtc_current_time();   /* picks the wall clock, moves the base to it */
+  gba_rewind_clock_frames = hold;
+}
+#endif
+
+/* Telemetry: what the cartridge clock shows now and what base + frames
+ * alone would show, without touching either. */
+void gpsp_rtc_peek(long long *shown, long long *frames_time, int *wall)
+{
+  s64 elapsed = (s64)((double)frame_counter * GBA_FRAME_SECONDS);
+  long long last = (long long)rtc_last_shown;
+  int w = 0;
+  long long t = rtc_clock_pick((long long)(rtc_base_time + elapsed),
+                               (long long)gpsp_rtc_wall,
+                               gpsp_rtc_frames_only, &last, &w);
+  if (shown) *shown = t;
+  if (frames_time) *frames_time = (long long)(rtc_boot_time + elapsed);
+  if (wall) *wall = w;
 }
 
 static struct tm *rtc_fields(time_t t)
@@ -1725,6 +1929,7 @@ void function_cc write_gpio(u32 address, u32 value) {
   {                                                                           \
     case 0x02:                                                                \
       /* external work RAM */                                                 \
+      RW_MARK_EWRAM(address & 0x3FFFF, type / 8);                             \
       address##type(ewram, (address & 0x3FFFF)) = eswap##type(value);         \
       break;                                                                  \
                                                                               \
@@ -2107,12 +2312,21 @@ const dma_region_type dma_region_map[17] =
   write_memory##tfsize(type##_ptr, read_value)                                \
 
 #define dma_write_ewram(type, tfsize)                                         \
+  RW_DMA_MARK_EWRAM(type##_ptr & 0x3FFFF, tfsize / 8);                        \
   address##tfsize(ewram, type##_ptr & 0x3FFFF) = eswap##tfsize(read_value);   \
   if (address##tfsize(ewram, (type##_ptr & 0x3FFFF) + 0x40000)) {             \
     if (!(alerts & CPU_ALERT_SMC))     /* ADR-0030, once per transfer */      \
       smc_prof_note_ewram(type##_ptr);                                        \
     alerts |= CPU_ALERT_SMC;                                                  \
   }                                                                           \
+
+/* REWIND_MUTANT=2 (tests only, tools/rewind_test.py): DMA forgets the mark,
+ * to show that the checks catch a writer that does. */
+#if defined(REWIND) && defined(REWIND_MUTANT) && REWIND_MUTANT == 2
+#define RW_DMA_MARK_EWRAM(off, n) ((void)0)
+#else
+#define RW_DMA_MARK_EWRAM(off, n) RW_MARK_EWRAM(off, n)
+#endif
 
 #define print_line()                                                          \
   dma_print(src_op, dest_op, tfsize);                                         \
@@ -2950,6 +3164,7 @@ void init_memory(void)
   /* Written without the store paths: every page differs from any copy an
    * observer kept (the ME's eDRAM mirror, ME_MIDFRAME_LOG's shadow). */
   memset(vram_clean, 0, sizeof(vram_clean));
+  RW_MARK_ALL();
 
   write_ioreg(REG_DISPCNT, 0x80);
   write_ioreg(REG_P1, 0x3FF);
@@ -3152,12 +3367,12 @@ bool memory_read_savestate(const u8 *src)
     return false;
 
   if (!(
-    bson_read_bytes(memdoc, "iwram", &iwram[0x8000], 0x8000) &&
-    bson_read_bytes(memdoc, "ewram", ewram, 0x40000) &&
-    bson_read_bytes(memdoc, "vram", vram, sizeof(vram)) &&
-    bson_read_bytes(memdoc, "oamram", oam_ram, sizeof(oam_ram)) &&
-    bson_read_bytes(memdoc, "palram", palette_ram, sizeof(palette_ram)) &&
-    bson_read_bytes(memdoc, "ioregs", io_registers, sizeof(io_registers)) &&
+    RW_ARR_READ(memdoc, "iwram", &iwram[0x8000], 0x8000) &&
+    RW_ARR_READ(memdoc, "ewram", ewram, 0x40000) &&
+    RW_ARR_READ(memdoc, "vram", vram, sizeof(vram)) &&
+    RW_ARR_READ(memdoc, "oamram", oam_ram, sizeof(oam_ram)) &&
+    RW_ARR_READ(memdoc, "palram", palette_ram, sizeof(palette_ram)) &&
+    RW_ARR_READ(memdoc, "ioregs", io_registers, sizeof(io_registers)) &&
     bson_read_int32(memdoc, "dma-bus", &dma_bus_val) &&
 
     bson_read_int32(bakdoc, "backup-type", &backup_type) &&
@@ -3222,7 +3437,14 @@ bool memory_read_savestate(const u8 *src)
    * path.  The PSP ME renderer may already have a persistent mirror from the
    * pre-load game, so every restored page must be transferred once before
    * incremental dirty tracking resumes. */
+#ifdef REWIND
+  /* (not when the rewind moved the arrays itself: it marks what it copied) */
+  if (!gba_rewind_skip_arrays)
+#endif
+  {
   memset(vram_clean, 0, sizeof(vram_clean));
+  RW_MARK_ALL();             /* and EWRAM, for the rewind's own map */
+  }
 
   return true;
 }
@@ -3234,12 +3456,12 @@ unsigned memory_write_savestate(u8 *dst)
   u32 rtc_data_array[2] = { (u32)rtc_data, (u32)(rtc_data >> 32) };
 
   bson_start_document(dst, "memory", wbptr);
-  bson_write_bytes(dst, "iwram", &iwram[0x8000], 0x8000);
-  bson_write_bytes(dst, "ewram", ewram, 0x40000);
-  bson_write_bytes(dst, "vram", vram, sizeof(vram));
-  bson_write_bytes(dst, "oamram", oam_ram, sizeof(oam_ram));
-  bson_write_bytes(dst, "palram", palette_ram, sizeof(palette_ram));
-  bson_write_bytes(dst, "ioregs", io_registers, sizeof(io_registers));
+  RW_ARR_WRITE(dst, "iwram", &iwram[0x8000], 0x8000);
+  RW_ARR_WRITE(dst, "ewram", ewram, 0x40000);
+  RW_ARR_WRITE(dst, "vram", vram, sizeof(vram));
+  RW_ARR_WRITE(dst, "oamram", oam_ram, sizeof(oam_ram));
+  RW_ARR_WRITE(dst, "palram", palette_ram, sizeof(palette_ram));
+  RW_ARR_WRITE(dst, "ioregs", io_registers, sizeof(io_registers));
   bson_write_int32(dst, "dma-bus", dma_bus_val);
   bson_finish_document(dst, wbptr);
 
@@ -3266,6 +3488,10 @@ unsigned memory_write_savestate(u8 *dst)
   bson_write_int32(dst, "rtc-bit-cnt", rtc_bit_count);
   bson_write_int32array(dst, "rtc-data-words", rtc_data_array, 2);
   {
+    /* In wall mode the base follows the clock at each read; bring it up to
+     * this instant so the state continues from now on a frame clock. */
+    if (!gpsp_rtc_frames_only && gpsp_rtc_wall >= RTC_PLAUSIBLE_EPOCH)
+      (void)rtc_current_time();
     u32 base_words[2] = { (u32)(u64)rtc_base_time,
                           (u32)(((u64)rtc_base_time) >> 32) };
     bson_write_int32array(dst, "rtc-base-time", base_words, 2);
@@ -3819,3 +4045,13 @@ s32 load_bios(char *name)
     return -1;
   return 0;
 }
+
+#ifdef REWIND
+/* The chip is in the middle of something: a flash command sequence or mode,
+ * an EEPROM address / data / read sequence. */
+u32 gba_rewind_backup_busy(void)
+{
+  return flash_mode != FLASH_BASE_MODE || flash_command_position != 0 ||
+         eeprom_mode != EEPROM_BASE_MODE;
+}
+#endif

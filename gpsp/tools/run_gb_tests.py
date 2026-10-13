@@ -232,6 +232,16 @@ def main() -> int:
              *core_objs, str(shared), "-lm"])
         run([str(t / "serial")], asan)
 
+        # The MBC3 cartridge clock on its edges, as the game reads it, with
+        # a wall clock the test owns: trailers from other emulators, no
+        # trailer, future stamps, the clock set back, the day-counter wrap,
+        # a halted clock, a clock hook with no reading, save states, and the
+        # load a link session does.
+        run(["gcc", "-std=gnu11", *WARN, *SAN, "-Igbcore", "-o",
+             str(t / "rtc"), "gbcore/tests/rtc.c", str(glue),
+             *core_objs, str(shared), "-lm"])
+        run([str(t / "rtc")], asan)
+
         # The production frontend dispatch, save path, save states and cable
         # glue.
         run(["gcc", "-std=gnu11", *WARN, *SAN, "-ffunction-sections",
@@ -243,6 +253,19 @@ def main() -> int:
              "-Wl,--gc-sections",
              "-lm"])
         run([str(t / "fe_gb_boot")], asan)
+
+        # The clock save's timestamp through the production frontend: UTC
+        # out, UTC in, and the local-time stamps of 3.5.0 and earlier read
+        # without a jump -- at eight time zones.
+        run(["gcc", "-std=gnu11", *WARN, *SAN, "-ffunction-sections",
+             "-fdata-sections", *INC, "-o", str(t / "gb_rtc_utc"),
+             "tools/tests/test_gb_rtc_utc.c", "frontend-common/fe_host.c",
+             "frontend-common/fe_util.c", "netdrv/gb_link.c",
+             "frontend-common/fe_gblink.c",
+             "gbcore/gbcore_dual.c", inst_a, inst_b, str(shared),
+             "-Wl,--gc-sections",
+             "-lm"])
+        run([str(t / "gb_rtc_utc")], asan)
     print("gb: all GB/GBC host tests passed")
     return 0
 

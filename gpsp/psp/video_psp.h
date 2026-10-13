@@ -218,6 +218,20 @@ uint16_t *vid_shot_tex(void);
 void vid_shot_rows(int y0, const void *src, int rows);
 void vid_shot_draw(int x, int y, int w, int h);
 void vid_overlay_end(void);
+#ifdef REWIND
+/* The rewind ring (docs/REWIND.md): the three shapes it is made of, inside
+ * a vid_overlay_begin / _end pair.  Angles in radians, 0 = right, growing
+ * clockwise on screen (y down).
+ * vid_arc: a band of width `w` centred on radius `r` from a0 to a1, its
+ * alpha running from alpha0 at a0 to alpha1 at a1; additive = brightens
+ * what is under it instead of covering it.
+ * vid_disc: a filled dot.  vid_seg: a straight stroke of width `w`. */
+void vid_arc(float cx, float cy, float r, float w, float a0, float a1,
+             uint16_t rgb565, int alpha0, int alpha1, int additive);
+void vid_disc(float cx, float cy, float r, uint16_t rgb565, int alpha);
+void vid_seg(float x0, float y0, float x1, float y1, float w,
+             uint16_t rgb565, int alpha);
+#endif
 
 /* ---- deferred GE sync (ADR-0040, `config.ini gu_defer`, DEFAULT OFF) -----
  * ON leaves a finished display list running on the GE instead of blocking

@@ -44,7 +44,8 @@ typedef struct fe_gbadual_config
    int         session;
    /* 1: the headless partner mixes its sound as before (kill switch for
     * sound.h sound_synth_off; harness/config gba_link_headless_audio = 0). */
-   int         partner_audio;
+   int         partner_audio;   /* -1: silent AND its ring is not read out
+                                 * (gba_link_headless_audio = 2, section 23) */
    /* 1: the session's save watch hashes the whole battery image every 30
     * frames (kill switch for the write count; gba_link_sram_crc = 1). */
    int         sram_crc;
@@ -53,6 +54,16 @@ typedef struct fe_gbadual_config
     * builds only (cpu_threaded.c jit_small_pin_at); harness/config
     * gba_link_jit_pin_b.  GBA-LINK-MIRROR.md 17.5. */
    unsigned    b_jit_pin_p1;
+   /* 1: the cable fast path in both cores (gbalink_core.c gbalink_fast;
+    * harness/config gba_link_fast).  0 = the path every hardware run so far
+    * used.  GBA-LINK-MIRROR.md 21. */
+   int         cable_fast;      /* 0 off, 1 on, 2 the checking mode,
+                                 * 3 on + the lean inline hooks (section 23) */
+   /* Progress guard (section 22): the clock, and the longest one pair step
+    * may take in milliseconds (0 = 15000; harness gba_link_step_max_ms,
+    * negative = no wall-clock bound). */
+   uint64_t  (*time_us)(void);
+   int         step_max_ms;
 } fe_gbadual_config;
 
 /* After instance A has loaded its cartridge and save.  0 = B is up. */
@@ -86,6 +97,12 @@ void fe_gbadual_stats_evt(void (*evt)(const char *fmt, ...));
  * section 13).  Safe to call from another thread. */
 int  fe_gbadual_probe(char *buf, size_t n);
 void fe_gbadual_close(void);
+/* The pair stopped on an error (gbalink_pair E_*; 0 = none): a bench run
+ * ends on it (the session layer ends its own, fe_gblink `gblink_failed`). */
+int  fe_gbadual_fault(void);
+/* From a watchdog thread: ask both cores to stop at their next scheduler
+ * call (gbalink_core.c gbalink_abort).  The pair then fails E_OVERRUN. */
+void fe_gbadual_abort(void);
 
 /* The two-console session's machines (fe_gblink.h): the local machine is
  * instance A in slot `local_slot`, the partner instance B in the other.

@@ -36,6 +36,7 @@
 #define RTC_TRAILER_44 44u
 #define RTC_SPAN (512 * 86400)        /* the 9-bit day counter wraps here */
 #define RTC_EPOCH_MIN 852076800       /* 1997-01-01: older stamps are junk */
+#define RTC_STAMP_UNKNOWN 0x7fffffff7fffffffLL  /* "written without a clock" */
 
 #define STATE_MAGIC "GBAT"
 #define STATE_VERSION 1u
@@ -195,11 +196,6 @@ void gbcore_set_wallclock(time_t (*wallclock)(void))
   gbcore_wallclock = wallclock;
 }
 
-static int64_t wall_now(void)
-{
-  return (int64_t)(gbcore_wallclock ? gbcore_wallclock() : time(NULL));
-}
-
 /* MBC3 clock.  MasterBoy kept a bare offset from time(); this adds the halt
  * and day-carry bits the cartridge has, which Pokemon Gold/Silver/Crystal
  * use when the player sets the clock.  Running: count = now - base.
@@ -210,6 +206,26 @@ static struct {
   int halted;
   int carry;
 } rtc;
+
+/* A hook that cannot read its clock returns 0 (the PSP's does when the
+ * firmware call fails).  That is "no reading", not 1970: the cartridge clock
+ * holds at the last reading until there is one.  Taken as a time, a base
+ * set from 0 made the first good reading look like 56 years passing: the
+ * day counter wrapped and the carry bit was set.  So a base taken before
+ * the first reading is moved to that reading -- no time passed. */
+static int64_t wall_last;
+
+static int64_t wall_now(void)
+{
+  int64_t now = (int64_t)(gbcore_wallclock ? gbcore_wallclock() : time(NULL));
+  if (now > 0)
+  {
+    if (!wall_last)
+      rtc.base += now;
+    wall_last = now;
+  }
+  return wall_last;
+}
 
 static int64_t rtc_count(void)
 {
@@ -905,6 +921,12 @@ int gbcore_save_ram_read(gbcore_t *core, void *destination, size_t capacity)
     int64_t c = rtc_count();
     uint8_t *t = out + ram;
     int i;
+    /* No clock reading yet: the value the format gives a writer that cannot
+     * tell the time (bgb.bircd.org/rtcsave.html).  Every reader, this one
+     * included, sees a stamp from the future and keeps the registers as
+     * they are; a stamp of 0 reads as "not clock data" and loses them. */
+    if (now <= 0)
+      now = RTC_STAMP_UNKNOWN;
     for (i = 0; i < 5; i++)
       put_le32(t + i * 4, rtc_reg(c, 8 + i));
     put_le32(t + 20, mbc3_sec);
@@ -939,7 +961,7 @@ int gbcore_save_ram_write(gbcore_t *core, const void *source, size_t size)
     byte high = (byte)get_le32(t + 16);
     if (size == ram + RTC_TRAILER_48)
       stamp |= (int64_t)get_le32(t + 44) << 32;
-    if (stamp > now || stamp < RTC_EPOCH_MIN)
+    if (stamp < RTC_EPOCH_MIN)
       return 0;                           /* not real clock data: reset */
     c = (int64_t)(get_le32(t) % 60) + (int64_t)(get_le32(t + 4) % 60) * 60 +
         (int64_t)(get_le32(t + 8) % 24) * 3600 +
@@ -953,7 +975,13 @@ int gbcore_save_ram_write(gbcore_t *core, const void *source, size_t size)
     }
     else
     {
-      c += now - stamp;                   /* the time the PSP was off */
+      /* The time the PSP was off.  A stamp from the future -- the console's
+       * clock was set back, the save was made a moment ago by a console
+       * whose clock runs ahead, or the writer had no clock and said so --
+       * adds nothing: the registers stand, as VBA-M and BGB read it.  This
+       * used to reset the clock to zero. */
+      if (stamp < now)
+        c += now - stamp;
       if (c >= RTC_SPAN)
       {
         rtc.carry = 1;

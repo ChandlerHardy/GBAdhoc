@@ -29,7 +29,12 @@
 #define ME_MBOX_H
 
 #define ME_MBOX_MAGIC   0x4D454F4Bu   /* "MEOK": ME writes this at boot */
-#define ME_MBOX_VERSION 2             /* v2: input_seq + render desc v2 */
+/* v3: the renderer's work area is handed over in the render desc (below), the
+ * ME reports a refused render, and ME_CMD_SYNC exists.  The bump is what keeps
+ * a v2 EBOOT from driving a v3 module: its 28-byte desc has no work fields, so
+ * the module would read whatever followed it in memory.  A mismatched pair
+ * fails the boot handshake and the app renders on the main CPU. */
+#define ME_MBOX_VERSION 3
 
 /* Commands.  Keep the set tiny; every entry is code resident in the PRX. */
 #define ME_CMD_NOP        0
@@ -61,6 +66,43 @@
  * log + the affine seed + the OAM-updated flag.  result = a checksum of the
  * output frame (host verifies, same discipline as ME_CMD_COPY). */
 #define ME_CMD_RENDER     5
+/* v3.  Write back and invalidate the ME's whole D-cache.  The renderer's work
+ * area (below) is written through that cache, so up to 16 KiB of it sits in
+ * dirty lines the ME writes back whenever it next needs the line.  The host
+ * posts this, and waits for it, before handing HEAP-backed work memory to
+ * free(): free() writes its list pointers into the block, and a late
+ * writeback from the ME would land on top of them. */
+#define ME_CMD_SYNC       6
+
+/* ---- THE RENDERER'S WORK AREA (v3) ---------------------------------------
+ *
+ * Three buffers the renderer needs and nobody else ever looks at: its mirror
+ * of VRAM, the per-line OBJ lists order_obj() builds, and the frame it draws
+ * into before the pitched write-out.  They were static arrays in the module
+ * -- 278 KB of the kernel partition, on top of 130 KB of code -- and a module
+ * that needs 403 KB contiguous does not load on a PSP-1000 whose kernel
+ * memory is partly taken (PSPLink: largest free block 283 KB; CFW plugins in
+ * the field).  The load fails with 0x800200D9 and the app silently draws on
+ * the main CPU.
+ *
+ * So the HOST provides them, from the same volatile pool its capture and
+ * stage buffers come from, and names them in every render desc.  The module
+ * keeps no pointer between renders: it takes the base from the desc of the
+ * command it is executing and refuses the render if there is none.
+ *
+ * WHO TOUCHES IT.  The ME, through its D-cache, and nothing else.  The host
+ * holds the address only to pass it on: it never reads or writes the area, so
+ * there is no coherency protocol to get wrong.  That is also why the base and
+ * every size are whole 64-byte cache lines -- no line of the work area can be
+ * shared with memory the main CPU does write. */
+#define ME_WORK_VRAM_BYTES (1024u * 96u)          /*  98,304: u8 vram[96K]    */
+#define ME_WORK_OBJ_BYTES  (5u * 160u * 128u)     /* 102,400: OBJ lists       */
+#define ME_WORK_OUT_BYTES  77312u                 /* u16[240*161] = 77,280,
+                                                   * rounded up to a line     */
+#define ME_WORK_VRAM_OFF   0u
+#define ME_WORK_OBJ_OFF    (ME_WORK_VRAM_OFF + ME_WORK_VRAM_BYTES)
+#define ME_WORK_OUT_OFF    (ME_WORK_OBJ_OFF + ME_WORK_OBJ_BYTES)
+#define ME_WORK_BYTES      (ME_WORK_OUT_OFF + ME_WORK_OUT_BYTES)   /* 278,016 */
 
 /* v2 render contract (ME_CMD_RENDER, arg0 = desc pointer).  The LIVE pipeline:
  *
@@ -93,6 +135,21 @@ typedef struct me_render_desc
     * If 0, the ME copies ALL of VRAM -- used on the first frame and after any
     * teardown/resume, when the ME's eDRAM mirror cannot be trusted. */
    volatile unsigned int vram_clean;
+   /* v3: the work area (above).  `work` is its base, 64-byte aligned;
+    * `work_bytes` is what the host really reserved there, and the ME refuses
+    * anything smaller than ME_WORK_BYTES rather than trust a constant the two
+    * binaries were each compiled with.
+    *
+    * `work_gen` changes every time the host (re)builds the renderer.  The
+    * area's CONTENTS do not survive that: the pool is handed back across a
+    * sleep and the heap block is freed around a wireless bring-up, while the
+    * module -- and its idea of what the area holds -- can stay loaded
+    * throughout.  A base or generation the ME has not seen means "start from
+    * nothing": it copies all of VRAM whatever vram_clean says and clears its
+    * OBJ lists, exactly the state of a module that was just loaded. */
+   volatile unsigned int work;
+   volatile unsigned int work_bytes;
+   volatile unsigned int work_gen;
 } me_render_desc;
 
 typedef struct me_mbox
@@ -120,6 +177,14 @@ typedef struct me_mbox
                                        * the live core arrays; the host may
                                        * then resume emulation while the ME
                                        * renders in parallel               */
+   /* --- v3: refused render ---------------------------------------------- */
+   volatile unsigned int refused_seq; /* ME sets = seq of a render it did not
+                                       * draw because the desc named no usable
+                                       * work area.  The command still
+                                       * completes (input_seq, done_seq), so
+                                       * the host never hangs on it; it reads
+                                       * this at retire and falls back to the
+                                       * main CPU.  0 = never (seq starts at 1) */
 } me_mbox;
 
 /* Uncached alias helper — valid for user main-RAM pointers on both cores. */

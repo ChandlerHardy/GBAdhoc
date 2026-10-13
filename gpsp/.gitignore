@@ -52,3 +52,4 @@ __pycache__/
 # Menu = HOME kernel module: the .prx is tracked (packaging, like psp/me),
 # its intermediate .elf is not.
 psp/home/gbadhoc_home.elf
+.build-elf.nm

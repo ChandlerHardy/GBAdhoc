@@ -69,6 +69,66 @@ int video_prof_read_reset(unsigned *out, int n) { (void)out; (void)n; return 0; 
 }
 #endif
 
+/* ---- ME_WORK_INDIRECT: the engine's big buffers are not its own -----------
+ *
+ * In the Media Engine module (ME_PRX_BUILD) the renderer's VRAM mirror and its
+ * OBJ lists are not arrays linked into the module: they are in a work area the
+ * host provides with every render (psp/me/me_mbox.h, "THE RENDERER'S WORK
+ * AREA"), because 200 KB of static arrays here is what kept the module from
+ * loading on a console short of kernel memory.  So in that build `vram` and
+ * `obj_priority_list` below are reached through two pointers the module sets
+ * before it calls into this file.
+ *
+ * The core's build is untouched: there both stay the arrays they always were,
+ * and none of this exists.
+ *
+ * -DME_WORK_INDIRECT=1 WITHOUT ME_PRX_BUILD is the desktop proof of this
+ * source change (tools/e2e/run_me_midframe.sh with MMF_EXTRA_CFLAGS): the same
+ * indirection, with `vram` pointing at the core's array and the OBJ lists in
+ * a buffer filled with 0xA5 -- so a frame that depended on a list entry nobody
+ * wrote would not match the array build's. */
+#ifdef ME_PRX_BUILD
+#undef  ME_WORK_INDIRECT
+#define ME_WORK_INDIRECT 1
+#endif
+#ifndef ME_WORK_INDIRECT
+#define ME_WORK_INDIRECT 0
+#endif
+#if ME_WORK_INDIRECT
+#ifdef ME_PRX_BUILD
+extern "C" {                                           /* me_render_data.c */
+extern u8 *me_work_vram, *me_work_vram_obj, *me_work_obj;
+}
+#else
+static u8 me_work_obj_test[5 * 160 * 128];
+static u8 *me_work_vram     = vram;
+static u8 *me_work_vram_obj = vram + 0x10000;
+static u8 *me_work_obj      = me_work_obj_test;
+__attribute__((constructor)) static void me_work_test_poison(void)
+{
+  memset(me_work_obj_test, 0xA5, sizeof(me_work_obj_test));
+}
+#endif
+#define vram me_work_vram
+#endif
+
+/* OBJ_TILE(off): the byte of OBJ tile data at `off`.  OBJ tiles are the
+ * 32 KiB of VRAM from 0x10000.  As an array that base is a link-time
+ * constant; behind a pointer it would be a load AND an add at every sprite,
+ * so the module keeps the sum in a pointer of its own and the sprite code
+ * costs what it did: one load where there was one constant.
+ *
+ * The array form is the expression these sites always had, token for token,
+ * and it has to be: writing it "equivalently" for both builds (a const base
+ * pointer) compiled the CORE's render_object differently, and a core whose
+ * code moves is an EBOOT whose layout moves.  Checked: the core's video.o
+ * disassembles identically before and after (psp-objdump -dr, same flags). */
+#if ME_WORK_INDIRECT
+#define OBJ_TILE(off) (me_work_vram_obj[(off) & 0x7FFF])
+#else
+#define OBJ_TILE(off) (vram[0x10000 + ((off) & 0x7FFF)])
+#endif
+
 /* Deliberate renderer faults, used ONLY to prove the video regression oracle
  * (tools/e2e/run_video_regress.sh) can actually fail.  0 = the real renderer,
  * which is what every normal build compiles.  1 = one wrong bit in one pixel
@@ -1091,9 +1151,27 @@ static const u8 obj_dim_table[3][4][2] = {
   { {8, 16}, {8, 32}, {16, 32}, {32, 64} }
 };
 
+#if ME_WORK_INDIRECT
+/* In the host's work area (see ME_WORK_INDIRECT at the top).  The two small
+ * tables below say how much of it is valid, and they stay here. */
+#define obj_priority_list ((u8 (*)[160][128])me_work_obj)
+#else
 static u8 obj_priority_list[5][160][128];
+#endif
 static u8 obj_priority_count[5][160];
 static u8 obj_alpha_count[160];
+
+#if ME_WORK_INDIRECT
+/* The work area was just (re)assigned and holds nothing of ours: forget the
+ * lists that described the old one.  With the counts at zero no entry of the
+ * new area is read before order_obj() has written it -- which is the state a
+ * freshly loaded module was always in, its arrays being zeroed .bss. */
+extern "C" void me_obj_lists_reset(void)
+{
+  memset(obj_priority_count, 0, sizeof(obj_priority_count));
+  memset(obj_alpha_count, 0, sizeof(obj_alpha_count));
+}
+#endif
 
 typedef struct {
   s32 obj_x, obj_y;
@@ -1110,7 +1188,7 @@ static inline void render_obj_part_tile_Nbpp(
   u32 tile_offset, u16 palette, const u16 *pal
 ) {
   // Note that the last VRAM bank wrap around, hence the offset aliasing
-  const u8* tile_ptr = &vram[0x10000 + (tile_offset & 0x7FFF)];
+  const u8* tile_ptr = &OBJ_TILE(tile_offset);
   u32 px_attr = px_comb | palette | 0x100;  // Combine flags + high palette bit
 
   if (is8bpp) {
@@ -1167,7 +1245,7 @@ template<typename dsttype, rendtype rdtype, bool is8bpp, bool hflip>
 static inline void render_obj_tile_Nbpp(u32 px_comb,
   dsttype *dest_ptr, u32 tile_offset, u16 palette, const u16 *pal
 ) {
-  const u8* tile_ptr = &vram[0x10000 + (tile_offset & 0x7FFF)];
+  const u8* tile_ptr = &OBJ_TILE(tile_offset);
   u32 px_attr = px_comb | palette | 0x100;  // Combine flags + high palette bit
 
   if (is8bpp) {
@@ -1301,7 +1379,7 @@ static void render_object_mosaic(
     if (!mctr) {
       // Load tile pixel color.
       u32 tile_offset = base_tile_offset + (offx / 8) * tile_size_off;
-      const u8* tile_ptr = &vram[0x10000 + (tile_offset & 0x7FFF)];
+      const u8* tile_ptr = &OBJ_TILE(tile_offset);
 
       // Lookup for each mode and flip value.
       if (is8bpp) {
@@ -1428,7 +1506,7 @@ static void render_affine_object(
           ((pixel_y & 0x7) * tile_bwidth) +  // Skip vertical rows to the pixel
           (pixel_x & 0x7);                   // Skip the horizontal offset
 
-        pixval = vram[0x10000 + (tile_off & 0x7FFF)];   // Read pixel value!
+        pixval = OBJ_TILE(tile_off);   // Read pixel value!
       } else {
         const u32 tile_off =
           base_tile +                        // Character base
@@ -1437,7 +1515,7 @@ static void render_affine_object(
           ((pixel_y & 0x7) * tile_bwidth) +  // Skip vertical rows to the pixel
           ((pixel_x >> 1) & 0x3);            // Skip the horizontal offset
 
-        u8 pixpair = vram[0x10000 + (tile_off & 0x7FFF)]; // Read 2 pixels @4bpp
+        u8 pixpair = OBJ_TILE(tile_off); // Read 2 pixels @4bpp
         pixval = ((pixel_x & 1) ? pixpair >> 4 : pixpair & 0xF);
       }
       mctr = mosh;
@@ -1663,6 +1741,14 @@ static void order_obj(u32 video_mode)
   u32 row;
   t_oam *oam_base = (t_oam*)oam_ram;
   u16 rend_cycles[160];
+#if ME_WORK_INDIRECT
+  // Taken once: in the ME module the lists are behind a pointer, and the byte
+  // stores below would make the compiler load it again for every row.  The
+  // core keeps its array and its code (see OBJ_TILE).
+  u8 (*const obj_list)[160][128] = obj_priority_list;
+#else
+#define obj_list obj_priority_list
+#endif
 
   bool hblank_free = read_ioreg(REG_DISPCNT) & 0x20;
   u16 max_rend_cycles = !sprite_limit ? REND_CYC_MAX :
@@ -1733,7 +1819,7 @@ static void order_obj(u32 video_mode)
           {
             if (rend_cycles[row] < max_rend_cycles) {
               u32 cur_cnt = obj_priority_count[obj_priority][row];
-              obj_priority_list[obj_priority][row][cur_cnt] = obj_num;
+              obj_list[obj_priority][row][cur_cnt] = obj_num;
               obj_priority_count[obj_priority][row] = cur_cnt + 1;
               rend_cycles[row] += cyccnt;
               // Mark the row as having semi-transparent objects
@@ -1750,7 +1836,7 @@ static void order_obj(u32 video_mode)
           {
             if (rend_cycles[row] < max_rend_cycles) {
               u32 cur_cnt = obj_priority_count[obj_priority][row];
-              obj_priority_list[obj_priority][row][cur_cnt] = obj_num;
+              obj_list[obj_priority][row][cur_cnt] = obj_num;
               obj_priority_count[obj_priority][row] = cur_cnt + 1;
               rend_cycles[row] += cyccnt;
             }
@@ -1761,6 +1847,10 @@ static void order_obj(u32 video_mode)
     }
   }
 }
+
+#if !ME_WORK_INDIRECT
+#undef obj_list
+#endif
 
 u32 layer_order[16];
 u32 layer_count;

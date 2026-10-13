@@ -2340,6 +2340,26 @@ static void emit_pmemld_stub(
   *tr_ptr = translation_ptr;
 }
 
+#ifdef REWIND
+/* REWIND: the written-page map (gba_memory.h, "THE RULE").  It sits in
+ * mips_stub.S's data beside the register block, so a page's byte is
+ * reg_base + RW_MAP_OFF + page: no lui.  rw_map_off_ok() is checked once in
+ * init_emitter; if the linker ever put the map out of 16-bit reach the marks
+ * are not emitted and gba_rewind_map_ok tells the frontend to trust no map.
+ *
+ * REWIND_MUTANT=1 (tests only): the byte-store stub forgets to mark, to
+ * show the checks catch a store path that does. */
+#define RW_MAP_OFF ((s32)((u32)gba_rewind_clean - (u32)reg))
+static bool rw_map_emit;
+#define rw_map_off_ok() (RW_MAP_OFF >= 0 && RW_MAP_OFF + RW_CLEAN_BYTES < 0x7FFF)
+/* page index in `pagereg` (clobbered); mapbase = RW_CLEAN_EWRAM / _VRAM */
+#define emit_rw_mark(pagereg, mapbase)                                        \
+  if (rw_map_emit) {                                                          \
+    mips_emit_addu(pagereg, pagereg, reg_base);                               \
+    mips_emit_sb(reg_zero, pagereg, RW_MAP_OFF + (mapbase));                  \
+  }
+#endif
+
 // Generates the stub to store memory for a given region and size
 // Handles "special" cases like weirdly mapped memory
 static void emit_pmemst_stub(
@@ -2382,6 +2402,19 @@ static void emit_pmemst_stub(
     }
     // Need to insert a zero in the addr (due to how it's mapped)
     mips_emit_addu(reg_rv, reg_rv, reg_a0);    // Adds to the base addr
+#ifdef REWIND
+    /* EWRAM page mark, before the store and before the SMC branch (whose
+     * taken path never comes back here).  reg_a0 is the masked, aligned
+     * offset and must survive for smc_write; reg_temp is dead until the SMC
+     * check loads it.  Three instructions per EWRAM store. */
+#if defined(REWIND_MUTANT) && REWIND_MUTANT == 1
+    if (size != 0)
+#endif
+    if (rw_map_emit) {
+      mips_emit_srl(reg_temp, reg_a0, RW_PAGE_SHIFT);
+      emit_rw_mark(reg_temp, RW_CLEAN_EWRAM);
+    }
+#endif
   } else if (region == 6) {
     // VRAM is mirrored every 128KB but the last 32KB is mapped to the previous
     extract_bits(reg_temp, reg_a0, 15, 2);     // Extract bits 15 and 16
@@ -2430,6 +2463,11 @@ static void emit_pmemst_stub(
 #endif
     mips_emit_addu(reg_a0, reg_a0, reg_temp);
     mips_emit_sb(reg_zero, reg_a0, dbase);               /* clean[page] = 0 */
+#ifdef REWIND
+    /* ...and the rewind's own map: reg_temp still holds the page index.
+     * Two more instructions per VRAM store. */
+    emit_rw_mark(reg_temp, RW_CLEAN_VRAM);
+#endif
   }
 
   // Generate SMC write and tracking
@@ -2746,6 +2784,89 @@ static void emit_saveaccess_stub(u8 **tr_ptr) {
     mips_emit_b(bne, reg_zero, reg_temp, st_phndlr_branch(strop));
 
     mips_emit_sw(mips_reg_ra, reg_base, ReOff_SaveR3); // Store the return addr
+#ifdef IRQ_IO_FAST
+    /* IRQ_IO_FAST=1 + irq_io_fast (docs/GBA-LINK-MIRROR.md 25): 16-bit
+     * stores to IE, IF and IME handled here, without the register save, the
+     * C call and the register restore (~75 instructions each; an interrupt
+     * handler that masks around itself makes 4-8 per interrupt, Street
+     * Fighter 1,783 a frame).
+     *
+     * Exactly write_io_register16's effect for these three registers:
+     *   IF   IF &= ~value; never an alert.
+     *   IE,  reg = value; then check_interrupt(): an alert iff IME != 0,
+     *   IME  (IE & IF) != 0 and CPSR.I clear.  When that holds the write is
+     *        left to the full path below, which stores the same value again
+     *        (idempotent) and returns the alert as before -- so every block
+     *        exit, interrupt entry and cycle count is the one it was.
+     * Everything else (other registers, 8- and 32-bit stores) takes the
+     * full path untouched.  Like the full path, reg[REG_PC] gets the PC.
+     * The index is ((address & 0xffffff) >> 1), as the C function's.
+     * a0 survives until the write is known to be ours; rv and temp are
+     * scratch here, as they are across the C call. */
+    if (strop == 1 && irq_io_fast)
+    {
+      u32 iob = (u32)io_registers + REG_IE * 2;     /* IE; IF +2, IME +8 */
+      u8 *b_slow1, *b_if, *b_ie, *b_slow2, *b_done[6], *b_slow3[2];
+      unsigned k, nd = 0, w;
+      mips_emit_sll(reg_temp, reg_a0, 8);
+      mips_emit_srl(reg_temp, reg_temp, 9);                 /* register index */
+      mips_emit_addiu(reg_temp, reg_temp, -REG_IE);         /* IE 0, IF 1, IME 4 */
+      mips_emit_sltiu(reg_rv, reg_temp, 5);
+      b_slow1 = translation_ptr;
+      mips_emit_b(beq, reg_rv, reg_zero, 0);                /* not ours */
+      mips_emit_lui(reg_rv, iob >> 16);                     /* (delay) */
+      mips_emit_ori(reg_rv, reg_rv, iob & 0xFFFF);          /* rv = &IE */
+      mips_emit_addiu(reg_temp, reg_temp, -1);
+      b_if = translation_ptr;
+      mips_emit_b(beq, reg_temp, reg_zero, 0);              /* IF */
+      mips_emit_andi(reg_a1, reg_a1, 0xFFFF);               /* (delay) value */
+      mips_emit_addiu(reg_temp, reg_temp, 1);
+      b_ie = translation_ptr;
+      mips_emit_b(beq, reg_temp, reg_zero, 0);              /* IE */
+      mips_emit_addiu(reg_temp, reg_temp, -4);              /* (delay) */
+      b_slow2 = translation_ptr;
+      mips_emit_b(bne, reg_temp, reg_zero, 0);              /* 2, 3: not ours */
+      mips_emit_nop();
+      for (w = 0; w < 2; w++)                               /* IME, then IE */
+      {
+        u32 off = w ? 0 : 8;
+        if (w)
+          generate_branch_patch_conditional(b_ie, translation_ptr);
+        mips_emit_sh(reg_a1, reg_rv, off);                  /* the store */
+        mips_emit_lhu(reg_temp, reg_rv, 8);                 /* IME */
+        b_done[nd++] = translation_ptr;
+        mips_emit_b(beq, reg_temp, reg_zero, 0);
+        mips_emit_lhu(reg_temp, reg_rv, 0);                 /* (delay) IE */
+        mips_emit_lhu(reg_a0, reg_rv, 2);                   /* IF */
+        mips_emit_and(reg_temp, reg_temp, reg_a0);
+        b_done[nd++] = translation_ptr;
+        mips_emit_b(beq, reg_temp, reg_zero, 0);
+        mips_emit_lw(reg_temp, reg_base, ReOff_CPSR);       /* (delay) */
+        mips_emit_andi(reg_temp, reg_temp, 0x80);
+        b_done[nd++] = translation_ptr;
+        mips_emit_b(bne, reg_temp, reg_zero, 0);            /* CPSR.I set */
+        mips_emit_lui(reg_a0, 0x0400);                      /* (delay) */
+        /* deliverable: the full path, with the address rebuilt */
+        b_slow3[w] = translation_ptr;
+        mips_emit_b(beq, reg_zero, reg_zero, 0);
+        mips_emit_ori(reg_a0, reg_a0, REG_IE * 2 + off);    /* (delay) */
+      }
+      generate_branch_patch_conditional(b_if, translation_ptr);
+      mips_emit_lhu(reg_temp, reg_rv, 2);                   /* IF &= ~value */
+      mips_emit_nor(reg_a1, reg_a1, reg_zero);
+      mips_emit_and(reg_temp, reg_temp, reg_a1);
+      mips_emit_sh(reg_temp, reg_rv, 2);
+      for (k = 0; k < nd; k++)
+        generate_branch_patch_conditional(b_done[k], translation_ptr);
+      mips_emit_sw(reg_a2, reg_base, ReOff_RegPC);          /* as the full path */
+      mips_emit_jr(mips_reg_ra);
+      mips_emit_nop();
+      generate_branch_patch_conditional(b_slow1, translation_ptr);
+      generate_branch_patch_conditional(b_slow2, translation_ptr);
+      generate_branch_patch_conditional(b_slow3[0], translation_ptr);
+      generate_branch_patch_conditional(b_slow3[1], translation_ptr);
+    }
+#endif
     emit_save_regs(strop == 3);
 #ifdef GBA_LINK
     /* Link cable: the cycle the write happened at (gbalink_core.c
@@ -2897,6 +3018,10 @@ void init_emitter(bool must_swap) {
 
   // Generates the trampoline and helper stubs that we need
   u8 *translation_ptr = (u8*)&rom_translation_cache[0];
+#ifdef REWIND
+  rw_map_emit = gba_rewind_marks_wanted && rw_map_off_ok();
+  gba_rewind_map_ok = rw_map_emit;
+#endif
 
   // Generate first the patch handlers
   // We have 6+4 patchers, one per mem type (6 or 4)
@@ -2924,6 +3049,20 @@ void init_emitter(bool must_swap) {
   // Special trampoline for SP-relative ldm/stm (to EWRAM)
   generate_load_imm(reg_a1, 0x3FFFC);
   mips_emit_and(reg_a1, reg_a1, reg_a2);
+#ifdef REWIND
+  /* A register-list store through an EWRAM stack pointer writes its words
+   * inline (arm/thumb_block_memory, the sp fast path), past every store
+   * stub.  This trampoline is the one place they all come through, loads
+   * too: mark here.  Up to 16 words from reg_a1 upward, so the page and the
+   * one after it (the map has spill bytes after page 255).  reg_temp is
+   * dead: the caller only used it to pick this branch. */
+  if (rw_map_emit) {
+    mips_emit_srl(reg_temp, reg_a1, RW_PAGE_SHIFT);
+    mips_emit_addu(reg_temp, reg_temp, reg_base);
+    mips_emit_sb(reg_zero, reg_temp, RW_MAP_OFF + RW_CLEAN_EWRAM);
+    mips_emit_sb(reg_zero, reg_temp, RW_MAP_OFF + RW_CLEAN_EWRAM + 1);
+  }
+#endif
   mips_emit_lui(reg_a0, ((u32)(ewram + 0x8000) >> 16));
   generate_function_return_swap_delay();
 

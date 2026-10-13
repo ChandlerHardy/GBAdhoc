@@ -779,6 +779,9 @@ it drives the player's own path: the button table and every frontend shortcut.
 `ui_controls_demo = 1` walks Settings > Controls in-game (GE dumps
 `log/ge_ctl_*.bmp`); `= 2` with `browser = 1` takes the ROM browser's START
 settings path instead (`log/ge_ctlb_*.bmp`).
+`ui_controls_demo = 6` walks the Turbo buttons page (`log/ge_tb_*.bmp`), and
+`ui_turbo_lock = 1` makes turbo buttons behave and read as in a link session
+(docs/CONTROL-REMAP.md section 13).
 
 Autopilot.ini keys added for this layer: `testpat`, `gedump_at`, `ui_demo`,
 `simff`, `silent` (+ optional `role`), `blit_mode` — documented in psp/main_psp.c's

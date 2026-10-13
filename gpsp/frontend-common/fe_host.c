@@ -13,6 +13,9 @@
 #include "fe_linkprof.h"
 #include "../netdrv/gb_link.h"
 #include "netpacket_host.h"
+#ifdef REWIND
+#include "fe_rewind.h"
+#endif
 #ifdef GBA_LINK
 #include "fe_gbadual.h"
 #include <stdarg.h>
@@ -65,8 +68,11 @@ static uint16_t gb_dual_buttons;
  * not on gb_core, because a link session (gbl) runs with no single core. */
 static int gb_family;
 /* The GB link session (fe_gblink.h), NULL when none. */
+static void save_recover_bak(const char *path);   /* below, with sram_load */
 static fe_gblink *gbl;
 static int gbl_last;               /* last fe_gblink_step result */
+static int gbl_is_gba;             /* the session is the GBA cable mirror */
+static int gbl_ride_set;           /* Fast link: ack riding applied */
 static int gbl_primed;             /* autopilot had its power-on look */
 static uint8_t *gbl_prelink_state; /* the running game when the link began */
 static size_t gbl_prelink_state_n;
@@ -183,6 +189,128 @@ static int gb_save_reserve(size_t size)
    return 0;
 }
 
+/* ---- the clock trailer's stamp is UTC ----
+ *
+ * The 48-byte trailer of a clock cartridge's save ends in the UNIX time it
+ * was written, which the format defines as UTC (bgb.bircd.org/rtcsave.html)
+ * and VBA-M, BGB, SameBoy and mGBA all write as UTC.  Up to 3.5.0 the PSP
+ * wrote its LOCAL time there, so a save carried to or from another emulator
+ * was off by the player's UTC offset -- and, west of UTC, a save another
+ * emulator had just written was "from the future" and the clock was reset.
+ *
+ * The core's clock (host.wallclock) is now UTC.  What remains is telling a
+ * file the old releases wrote from every other file, since the two stamps
+ * cannot be told apart by their value:
+ *
+ *   - every trailer written here is MARKED: "UTC" in the three unused upper
+ *     bytes of the latched day-high register (trailer bytes 37-39).  The
+ *     registers are bytes in 32-bit fields; VBA-M reads that field through
+ *     a (uint8_t) cast, SameBoy declares those bytes padding, mGBA assigns
+ *     the field to a uint8_t, and releases up to 3.5.0 cast it to a byte.
+ *     A marked trailer is UTC, with no further question;
+ *   - an unmarked trailer stamped at or before host.gb_rtc_legacy_before
+ *     -- the moment this install first ran a release that stamps UTC, on the
+ *     old clock -- is taken as an old release's, and its stamp is moved onto
+ *     the UTC clock by the two clocks' present difference.  now - stamp is
+ *     then exactly what 3.5.0 computed;
+ *   - any other unmarked trailer is another emulator's: UTC.
+ *
+ * The middle rule also catches a file another emulator wrote before that
+ * moment and the player imports afterwards; it is read as 3.5.0 read it
+ * (off by the UTC offset).  Nothing in the file can tell the two apart. */
+#define GB_RTC_TRAILER 48u
+#define GB_RTC_TRAILER_32 44u
+#define GB_RTC_EPOCH_MIN 852076800ll
+
+/* The trailer of `image` (n bytes) for the running cartridge, or NULL. */
+static uint8_t *gb_rtc_trailer(uint8_t *image, size_t n)
+{
+   size_t ram = gbcore_cart_ram_size(gb_core);
+   if (gbcore_save_ram_size(gb_core) != ram + GB_RTC_TRAILER)
+      return NULL;                        /* not a clock cartridge */
+   if (n != ram + GB_RTC_TRAILER && n != ram + GB_RTC_TRAILER_32)
+      return NULL;
+   return image + ram;
+}
+
+static void gb_rtc_mark(uint8_t *t)
+{
+   t[37] = 'U'; t[38] = 'T'; t[39] = 'C';
+}
+
+static int gb_rtc_marked(const uint8_t *t)
+{
+   return t[37] == 'U' && t[38] == 'T' && t[39] == 'C';
+}
+
+/* Before the core sees a file: an old release's stamp onto the UTC clock. */
+static void gb_rtc_from_legacy(uint8_t *image, size_t n)
+{
+   uint8_t *t = gb_rtc_trailer(image, n);
+   int bytes = t && n - (size_t)(t - image) == GB_RTC_TRAILER ? 8 : 4;
+   int64_t stamp = 0, now, old, ahead;
+   int i;
+   if (!t || !host.wallclock || !host.wallclock_legacy ||
+       host.gb_rtc_legacy_before <= 0 || gb_rtc_marked(t))
+      return;
+   for (i = 0; i < bytes; i++)
+      stamp |= (int64_t)t[40 + i] << (8 * i);
+   if (stamp < GB_RTC_EPOCH_MIN || stamp > host.gb_rtc_legacy_before)
+      return;
+   now = (int64_t)host.wallclock();
+   old = (int64_t)host.wallclock_legacy();
+   if (now <= 0 || old <= 0)
+      return;                             /* no reading: leave it be */
+   /* The two readings are a moment apart; zones are whole minutes. */
+   ahead = old - now;
+   ahead = (ahead >= 0 ? ahead + 30 : ahead - 30) / 60 * 60;
+   fe_evt("gb_rtc_legacy stamp=%lld ahead=%lld before=%lld",
+          (long long)stamp, (long long)ahead, host.gb_rtc_legacy_before);
+   stamp -= ahead;
+   for (i = 0; i < bytes; i++)
+      t[40 + i] = (uint8_t)((uint64_t)stamp >> (8 * i));
+}
+
+/* A clock cartridge's save that is cartridge RAM and nothing else -- a dump
+ * of a real cartridge, RetroArch's .srm (its clock lives in a separate
+ * .rtc), a flash cart's file.  The game's progress is there and the clock is
+ * not, and the clock cannot be invented: started from zero, as it was up to
+ * 3.5.0, the game showed a time that was simply wrong and said nothing.
+ *
+ * The cartridge has a way to say "the clock cannot be trusted": the day
+ * counter's carry bit, which a real one sets when more than 511 days pass.
+ * So such a file is completed with a trailer that says exactly that -- the
+ * clock at zero, running, carry set -- stamped with the format's "written
+ * without a clock" time, which adds nothing at load.  SameBoy does the same
+ * (Core/gb.c, reset_rtc: "This gives the game a hint that the clock should
+ * be reset").  Pokemon Gold, Silver and Crystal then show TIME NOT SET on
+ * the menu, say "The clock's time may be wrong.  Please reset the time." on
+ * CONTINUE and let the player set the day and time there; saving in the
+ * game clears the bit (run on Crystal and Silver, see the commit).
+ *
+ * Only here, only for a file of exactly the cartridge's RAM size: not with
+ * no file at all (a new game), not for any file with a trailer, never
+ * inside the core (a link session's loads are untouched), and once -- the
+ * first flush rewrites the file with a real trailer, whose flag is from then
+ * on whatever the game leaves it.  Returns the size to load. */
+static size_t gb_rtc_no_trailer(uint8_t *image, size_t n)
+{
+   size_t ram = gbcore_cart_ram_size(gb_core);
+   uint8_t *t = image + ram;
+   if (!ram || n != ram ||
+       gbcore_save_ram_size(gb_core) != ram + GB_RTC_TRAILER)
+      return n;
+   memset(t, 0, GB_RTC_TRAILER);
+   t[16] = 0x80;                          /* live day-high: the carry bit */
+   t[36] = 0x80;                          /* and as last latched */
+   memset(t + 40, 0xFF, 8);               /* 0x7fffffff7fffffff: no clock */
+   t[43] = 0x7F;
+   t[47] = 0x7F;
+   fe_evt("gb_rtc_no_trailer size=%u: clock flagged for the game to reset",
+          (unsigned)n);
+   return ram + GB_RTC_TRAILER;
+}
+
 /* Change detection covers cart RAM only.  An RTC cart's battery image ends in
  * a clock trailer stamped with the wall clock at the moment it is read, so a
  * CRC over the whole image changed every second and rewrote the save every
@@ -211,6 +339,11 @@ static int gb_save_flush(int force)
    crc = gb_save_ram_crc(size);
    if (!force && gb_save_crc_valid && crc == gb_save_crc)
       return 0;
+   {
+      uint8_t *t = gb_rtc_trailer(gb_save_buffer, size);
+      if (t)
+         gb_rtc_mark(t);
+   }
    /* Same length on disk: overwrite in place.  "wb" truncates first, so an
     * interrupted write left an empty file -- which the next boot cannot load
     * and whose first flush then replaced with a blank cartridge. */
@@ -251,6 +384,7 @@ static void gb_save_load(void)
    gb_save_file_len = -1;
    if (!size || !host.save_path || gb_save_reserve(cap) != 0)
       return;
+   save_recover_bak(host.save_path);
    f = fopen(host.save_path, "rb");
    if (!f)
    {
@@ -270,7 +404,11 @@ static void gb_save_load(void)
    if (load > n)
       load = n;
    if (whole)
+   {
       gb_save_file_len = (long)n;
+      load = gb_rtc_no_trailer(gb_save_buffer, load);
+   }
+   gb_rtc_from_legacy(gb_save_buffer, load);
    if (gbcore_save_ram_write(gb_core, gb_save_buffer, load) != 0 ||
        gbcore_save_ram_read(gb_core, gb_save_buffer, gb_save_capacity) != 0)
    {
@@ -560,9 +698,6 @@ static uint64_t fps_last_us;
  * only, e.g. gpsp_frameskip for the FF feature — plan §4.4). */
 static int options_dirty;
 
-static uint32_t sram_last_crc;
-static int      sram_have_crc;
-
 /* Per-block SRAM dirty map (ADR-0020).  4 KiB matches the GBA flash sector
  * the games erase/write one at a time, so a mid-save dirty check normally
  * touches 1-2 blocks instead of rewriting all 128 KiB to the memory stick. */
@@ -594,8 +729,19 @@ static int      sram_have_blk;   /* the .sav on disk matches sram_blk_crc */
  * The emulation thread, only while fast-forward is on and only once the save
  * has been quiet for SRAM_FF_SETTLE_FRAMES, asks for a scan and sleeps ~1 ms
  * (host_io->yield) every SRAM_FF_NUDGE_EVERY frames until the writer has
- * published the live generation.  Outside fast-forward nothing changes: the
- * writer's own 5 s cadence persists it, exactly as before. */
+ * published the live generation.
+ *
+ * AT NORMAL SPEED TOO (3.5.x): once the save has been quiet for the same
+ * SRAM_FF_SETTLE_FRAMES the emulation thread asks for a scan -- a flag and a
+ * wake, no yield: at 1x the writer runs in the slack the vblank wait already
+ * gives it.  Up to 3.5.0 a save waited for the writer's own 5 s scan, and a
+ * scan that landed in the middle of the game's save left the rest for the
+ * NEXT one: for up to five seconds after "saved the game" the stick could
+ * hold a newest slot of mixed old and new sectors, which a generation-3
+ * Pokemon game reports as "The save file is corrupted" if the console is
+ * switched off, crashes or runs flat in that window (reproduced; reported
+ * for Sapphire).  The window is now the settle time plus one write.  The
+ * 5 s cadence stays as the backstop. */
 extern volatile uint32_t backup_write_gen __attribute__((weak));
 
 /* Frames of save silence before the first nudge: a gen-3 Pokemon save
@@ -620,12 +766,37 @@ static int      ffn_enabled = 1;         /* harness A/B knob (sram_ff_nudge) */
 static uint32_t ffn_seen_gen;            /* EMU: last gen observed */
 static int      ffn_pending;             /* EMU: seen gen not yet on disk */
 static unsigned ffn_first_frame;         /* EMU: oldest unpersisted write */
+static uint64_t ffn_first_us;            /* EMU: host clock, no later than it */
 static unsigned ffn_last_frame;          /* EMU: newest write */
 static uint64_t ffn_last_us;             /* EMU: host clock at newest write */
 static unsigned ffn_next_frame;          /* EMU: earliest next nudge */
 static unsigned ffn_gen_yields;          /* EMU: yields spent on this gen */
 static int      ffn_gave_up;             /* EMU: cap hit for this gen */
 static unsigned ffn_yields;              /* EMU: lifetime yields */
+static int      ffn_starved_said;
+/* Wall time after the newest save write by which it must be on the stick
+ * at normal speed (the settle time is 0.5 s, a flush tens of ms). */
+#define SRAM_STARVED_US 1500000u
+/* ...and after the OLDEST unpersisted one (review S2): a game below full
+ * speed that writes again at least every SRAM_STARVED_US never trips the
+ * rule above, and its writer never gets the CPU.  Longer than
+ * SRAM_FF_MAX_DEFER_FRAMES at full speed (5.02 s) plus a healthy flush, so
+ * a game that never stops writing but DOES reach full speed is served by
+ * the deferred request alone and never sleeps for this. */
+#define SRAM_STARVED_OLDEST_US 6500000u
+/* One REQUEST = the first ask after the gate opened, until the writer has
+ * published a generation at least as new (review S3).  Everything the game
+ * wrote up to the ask is then on the stick; whatever it wrote since is newer
+ * than the ask, so the "oldest unpersisted write" (frame and clock) moves up
+ * to the ask and the deferral starts again from there.  Without this a game
+ * that never stops writing was scanned and written every settle period
+ * (every other frame in fast-forward) for ever once it had been pending for
+ * SRAM_FF_MAX_DEFER_FRAMES; 3.5.0 scanned every 5 s, and so does this.
+ * The generation only ever counts up, so the signed difference orders it. */
+static int      ffn_asked;               /* EMU: a request is outstanding */
+static uint32_t ffn_ask_gen;             /* EMU: live gen when it was made */
+static unsigned ffn_ask_frame;
+static uint64_t ffn_ask_us;
 static uint64_t ffn_yield_us;            /* EMU: lifetime time asleep */
 
 static uint32_t sram_gen_now(void)
@@ -645,6 +816,52 @@ static retro_audio_buffer_status_callback_t audio_buf_status_cb;
 #define FE_MAX_MEMDESC 8
 static struct retro_memory_descriptor memdesc[FE_MAX_MEMDESC];
 static unsigned memdesc_count;
+
+#ifdef REWIND
+/* Rewind (fe_rewind.h): what the core callbacks below need to know.  The
+ * rest of the glue is above fe_host_run_frame. */
+#define RW_AUD_CAP 1200           /* stereo frames per emulated frame, max */
+static int       rw_on;           /* fe_host_rewind_enable succeeded */
+static int       rw_gesture;      /* a rewind is on screen or winding up: a
+                                   * tick has answered something other than
+                                   * PLAY and none has answered PLAY since */
+static int       rw_replay;       /* this retro_run is a rewind re-run: its
+                                   * picture and sound go to the capture (or
+                                   * nowhere), never to the platform */
+static int       rw_tee;          /* a normal frame: presented AND captured */
+static uint16_t *rw_cap_pix;
+static const uint16_t *rw_cap_last;
+static int16_t  *rw_cap_aud;
+static uint32_t  rw_cap_aud_n;
+static uint32_t  rw_mask;         /* the input latched for this run */
+static int       rw_mask_on;
+static FILE     *rw_hash_fp;      /* test instrument (rewind_check.py) */
+static int16_t   rw_test_aud[RW_AUD_CAP * 2];
+static uint32_t  rw_test_aud_n;
+static int       rw_poked;        /* the platform wrote guest RAM itself */
+static uint32_t  rw_pitch = FE_GBA_WIDTH;   /* pixels per row of a slot */
+static int       rw_cap_got;      /* this frame's slot received a picture */
+
+/* The core's picture (or, on a frame the core skipped, the last one) into
+ * the slot at rw_cap_pix. */
+static void rw_put_picture(const void *data, size_t pitch)
+{
+   unsigned y;
+   if (data)
+      for (y = 0; y < FE_GBA_HEIGHT; y++)
+         memcpy(rw_cap_pix + y * rw_pitch,
+                (const uint8_t *)data + y * pitch, FE_GBA_WIDTH * 2);
+   else if (rw_cap_last && rw_cap_last != rw_cap_pix)
+      for (y = 0; y < FE_GBA_HEIGHT; y++)
+         memcpy(rw_cap_pix + y * rw_pitch, rw_cap_last + y * rw_pitch,
+                FE_GBA_WIDTH * 2);
+   else if (!rw_cap_last)
+      return;
+   rw_cap_got = 1;
+}
+static void      fe_host_rewind_state_loaded(void);
+extern void      gpsp_rewind_mark_all(void);
+#endif
 
 /* ------------------------------------------------------------ callbacks -- */
 
@@ -667,6 +884,18 @@ static void core_log(enum retro_log_level level, const char *fmt, ...)
 static void video_refresh(const void *data, unsigned width, unsigned height,
                           size_t pitch)
 {
+#ifdef REWIND
+   if (rw_replay)
+   {
+      if (rw_cap_pix)
+         rw_put_picture(data, pitch);
+      return;
+   }
+   /* Normal play keeps the pictures of the current window, so that the
+    * first tick of a rewind has its frame already. */
+   if (rw_tee && rw_cap_pix)
+      rw_put_picture(data, pitch);
+#endif
    if (data)
    {
       last_frame = (const uint16_t *)data;
@@ -686,6 +915,39 @@ static void audio_sample(int16_t left, int16_t right)
 
 static size_t audio_sample_batch(const int16_t *data, size_t frames)
 {
+#ifdef REWIND
+   if (rw_replay)
+   {
+      if (rw_cap_aud && rw_cap_aud_n < RW_AUD_CAP)
+      {
+         size_t n = RW_AUD_CAP - rw_cap_aud_n;
+         if (n > frames)
+            n = frames;
+         memcpy(rw_cap_aud + rw_cap_aud_n * 2, data, n * 4);
+      }
+      rw_cap_aud_n += (uint32_t)frames;   /* past the cap = clipped, counted */
+      return frames;
+   }
+   if (rw_tee)
+   {
+      if (rw_cap_aud_n < RW_AUD_CAP)
+      {
+         size_t n = RW_AUD_CAP - rw_cap_aud_n;
+         if (n > frames)
+            n = frames;
+         memcpy(rw_cap_aud + rw_cap_aud_n * 2, data, n * 4);
+      }
+      rw_cap_aud_n += (uint32_t)frames;
+   }
+   if (rw_hash_fp && rw_test_aud_n < RW_AUD_CAP)
+   {
+      size_t n = RW_AUD_CAP - rw_test_aud_n;
+      if (n > frames)
+         n = frames;
+      memcpy(rw_test_aud + rw_test_aud_n * 2, data, n * 4);
+      rw_test_aud_n += (uint32_t)n;
+   }
+#endif
    if (host.audio_frames)
       host.audio_frames(data, frames);
    return frames;
@@ -704,6 +966,13 @@ static int16_t input_state(unsigned port, unsigned device, unsigned index,
    uint32_t mask;
    if (port != 0 || device != RETRO_DEVICE_JOYPAD || index != 0)
       return 0;
+#ifdef REWIND
+   /* One value per frame, the one that is logged: a replay must hand the
+    * core exactly what the first run did. */
+   if (rw_mask_on)
+      mask = rw_mask;
+   else
+#endif
    mask = (host.input_bitmask ? host.input_bitmask() : 0) | injected_mask;
    if (id == RETRO_DEVICE_ID_JOYPAD_MASK)
       return (int16_t)mask;
@@ -882,6 +1151,34 @@ static uint32_t sram_crc(void)
    return p ? fe_crc32(0, p, FE_SRAM_SIZE) : 0;
 }
 
+/* A "Share game data" pull replaces the save with two renames
+ * (fe_share_commit): save -> save.bak, then the new file -> save.  Power
+ * lost between them leaves NO save and the old one as save.bak; the game
+ * would boot empty, the player would save, and the next pull would delete
+ * the only copy of the original.  So before a save is loaded: no file, but
+ * a .bak beside it -> the .bak is the save (review finding 5). */
+static void save_recover_bak(const char *path)
+{
+   char bak[512];
+   FILE *f;
+   if (!path || snprintf(bak, sizeof(bak), "%s.bak", path) >= (int)sizeof(bak))
+      return;
+   f = fopen(path, "rb");
+   if (f)
+   {
+      fclose(f);
+      return;
+   }
+   f = fopen(bak, "rb");
+   if (!f)
+      return;
+   fclose(f);
+   if (rename(bak, path) == 0)
+      fe_evt("save_recovered from=.bak (an interrupted share replace)");
+   else
+      fe_log("save_recover: could not rename %s", bak);
+}
+
 static void sram_load(void)
 {
    void *p = retro_get_memory_data(RETRO_MEMORY_SAVE_RAM);
@@ -891,6 +1188,7 @@ static void sram_load(void)
 
    if (!p || !host.save_path)
       return;
+   save_recover_bak(host.save_path);
 
    f = fopen(host.save_path, "rb");
    if (f)
@@ -903,13 +1201,11 @@ static void sram_load(void)
    else
       fe_evt("sram_load size=0 crc=none");
 
-   sram_last_crc = sram_crc();
-   sram_have_crc = 1;
-
    /* Whatever the game has written so far is what was just loaded. */
    sram_disk_gen = ffn_seen_gen = sram_gen_now();
    sram_scan_gen_valid = 0;
    ffn_pending = 0;
+   ffn_asked = 0;
    ffn_gave_up = 0;
    ffn_gen_yields = 0;
 
@@ -1007,6 +1303,16 @@ int fe_host_mem_write(uint32_t gba_addr, const void *in, unsigned len)
 
    if (gba_addr >= 0x08000000)
       return -1;
+#ifdef REWIND
+   /* The platform writing guest RAM is a writer the store paths never see
+    * (gba_memory.h, "THE RULE"), and one no input log can replay: every
+    * page is marked and the history ends at this frame. */
+   if (rw_on)
+   {
+      gpsp_rewind_mark_all();
+      rw_poked = 1;
+   }
+#endif
    for (i = 0; i < memdesc_count; i++)
    {
       const struct retro_memory_descriptor *d = &memdesc[i];
@@ -1049,6 +1355,19 @@ int fe_host_state_save(const char *path)
       fe_evt("state_save file=%s FAILED reason=link_session", path);
       return -1;
    }
+#ifdef REWIND
+   /* While a rewind is on screen the machine is NOT at the frame shown (it
+    * is re-running older ones): a state saved now would be of the wrong
+    * moment.  The platform lands it first (fe_host_rewind_land); this is
+    * the refusal for one that did not.  (rw_gesture, not
+    * fe_rewind_active(): that stays true after a landing until the first
+    * frame is played, and refused the save the landing was made for.) */
+   if (rw_on && rw_gesture)
+   {
+      fe_evt("state_save file=%s FAILED reason=rewinding", path);
+      return -1;
+   }
+#endif
    if (gb_core)
    {
       /* The same staging buffer: the largest GB image (CGB with 128 KiB of
@@ -1125,6 +1444,10 @@ int fe_host_state_load(const char *path)
       return -1;
    }
    fe_evt("state_load file=%s size=%u", path, (unsigned)sz);
+#ifdef REWIND
+   if (rw_on)                    /* a loaded state starts a new history */
+      fe_host_rewind_state_loaded();
+#endif
 #ifdef GBA_LINK
    if (host.gba_dual)
       fe_gbadual_state_loaded(state_buf, sz);
@@ -1194,6 +1517,26 @@ int fe_host_state_load(const char *path)
 static FILE    *sram_fp;            /* held open "r+b"; WRITER-owned */
 static volatile unsigned char sram_blk_state[SRAM_BLOCKS];
 static volatile int sram_full_req;  /* whole-image rewrite pending */
+/* A delta write failed and its dirty set was discarded (sram_abandon_deltas):
+ * the image in memory is NOT on disk and nothing is queued to put it there.
+ * Cleared by the whole-image rewrite that makes the disk whole again. */
+static volatile int sram_retry_full;
+
+/* Harness only (sleep_sim_sav, sram_exit_retry): PPSSPP never suspends, so
+ * the one thing a real sleep does to the save path -- kill the handle the
+ * .sav is held open on -- has to be modelled.  `sram_fp_dead` makes every
+ * write through the CURRENT handle fail as an I/O error until it is closed;
+ * a fresh open works, as on a console.  `sram_exit_retry = 0` restores
+ * 3.5.0's exit, which gave up after that failure, for the A/B. */
+#ifdef GPSP_PERF_RIG
+static int sram_fp_dead;
+static int sram_exit_retry = 1;
+#define SRAM_FP_DEAD     sram_fp_dead
+#define SRAM_EXIT_RETRY  sram_exit_retry
+#else
+#define SRAM_FP_DEAD     0
+#define SRAM_EXIT_RETRY  1
+#endif
 /* 0 = none, 1 = periodic scan due, 2 = forced (write even if clean). */
 static volatile int sram_scan_req;
 static uint64_t sram_last_scan_us;  /* writer-owned scan cadence */
@@ -1278,8 +1621,26 @@ static void sram_close(void)
    {
       fclose(sram_fp);
       sram_fp = NULL;
+#ifdef GPSP_PERF_RIG
+      sram_fp_dead = 0;
+#endif
    }
 }
+
+#ifdef GPSP_PERF_RIG
+int fe_host_sram_test_kill_handle(void)
+{
+   if (!sram_fp)
+      return 0;
+   sram_fp_dead = 1;
+   return 1;
+}
+
+void fe_host_sram_test_exit_retry(int on)
+{
+   sram_exit_retry = on ? 1 : 0;
+}
+#endif
 
 /* Give up on incremental updates: the next scan rewrites the whole image. */
 static void sram_abandon_deltas(const char *why)
@@ -1291,15 +1652,34 @@ static void sram_abandon_deltas(const char *why)
    for (i = 0; i < SRAM_BLOCKS; i++)
       sram_blk_state[i] = SBLK_CLEAN;
    sram_full_req = 0;
+   sram_retry_full = 1;
 }
 
 /* Rewrite the whole .sav.  First flush of a run, or any time an in-place
  * update is impossible (file missing / wrong size / seek or write failed). */
+/* The whole image.  This is the ROUTINE recovery path after every wake (the
+ * held-open handle is dead -> sram_abandon_deltas -> here ~0.5 s later), so
+ * it must never leave the player without a save: "wb" truncates first, and
+ * for the whole 128 KiB write the file was empty, then partial -- power lost
+ * or a failed wake in that window and the old save was gone (also in 3.5.0).
+ * A file of the right size is therefore overwritten IN PLACE ("r+b", as
+ * gb_save_flush does for Game Boy saves): an interrupted write then leaves a
+ * mix of old and new blocks, never an empty file.  "wb" only when the file
+ * is missing or has another size.  A failed fclose (the FAT's deferred
+ * write) is a failed write: no good baseline is recorded for it. */
 static int sram_write_full(const void *p)
 {
    FILE *f;
+   long len = -1;
    sram_close();
-   f = fopen(host.save_path, "wb");
+   f = fopen(host.save_path, "rb");
+   if (f)
+   {
+      if (fseek(f, 0, SEEK_END) == 0)
+         len = ftell(f);
+      fclose(f);
+   }
+   f = fopen(host.save_path, len == (long)FE_SRAM_SIZE ? "r+b" : "wb");
    if (!f)
    {
       fe_log("sram_flush FAILED to open %s", host.save_path);
@@ -1311,7 +1691,11 @@ static int sram_write_full(const void *p)
       fe_log("sram_flush short write to %s", host.save_path);
       return -1;
    }
-   fclose(f);
+   if (fclose(f) != 0)
+   {
+      fe_log("sram_flush close FAILED on %s", host.save_path);
+      return -1;
+   }
    return 0;
 }
 
@@ -1358,6 +1742,7 @@ static int sram_drain(uint32_t budget_us)
       sram_run_full = 1;
       sram_have_blk = 1;
       sram_full_req = 0;
+      sram_retry_full = 0;
    }
    else if (!sram_pending())
       return 0;
@@ -1387,7 +1772,8 @@ static int sram_drain(uint32_t budget_us)
          memcpy(sram_stage, p + (size_t)i * SRAM_BLOCK, SRAM_BLOCK);
 
          b0 = host.time_us ? host.time_us() : 0;
-         if (fseek(sram_fp, (long)i * SRAM_BLOCK, SEEK_SET) != 0 ||
+         if (SRAM_FP_DEAD ||
+             fseek(sram_fp, (long)i * SRAM_BLOCK, SEEK_SET) != 0 ||
              fwrite(sram_stage, 1, SRAM_BLOCK, sram_fp) != SRAM_BLOCK ||
              fflush(sram_fp) != 0)
          {
@@ -1449,6 +1835,17 @@ static int sram_drain(uint32_t budget_us)
              (unsigned)(sram_run_scan_us / 1000),
              (unsigned)(sram_run_scan_us % 1000),
              sram_run_threaded);
+      /* The save was in flight for longer than half a second: say so, and
+       * which kind.  A slow single write is the stick; fast writes and a
+       * long total is the writer thread not getting the CPU (main never
+       * blocked: fast-forward, a game below full speed, a rewind), which
+       * the nudges below exist to prevent.  Must not appear. */
+      if (sram_run_us > 500000u || sram_run_scan_us > 500000u)
+         fe_evt("sram_flush_slow ms=%u scan_ms=%u blk_ms=%u why=%s",
+                (unsigned)(sram_run_us / 1000),
+                (unsigned)(sram_run_scan_us / 1000),
+                (unsigned)(sram_run_blk_max / 1000),
+                sram_run_blk_max > 250000u ? "stick" : "writer_starved");
       sram_run_bytes = 0;
       sram_run_blocks = 0;
       sram_run_us = 0;
@@ -1491,10 +1888,27 @@ int fe_host_sram_service_io(void)
       uint32_t gen = sram_gen_now();
       sram_last_scan_us = now;
       sram_run_threaded = 1;
-      (void)sram_scan(req == 2);
-      sram_scan_req = 0;      /* clear only after the scan has marked */
-      sram_scan_gen = gen;
-      sram_scan_gen_valid = 1;
+      {
+         /* A scan made while the save is HELD (a link session owns it)
+          * returns without looking: it has seen nothing, so it must not
+          * become the generation that is later published as on disk
+          * (review S5).  Whoever releases the hold asks for a scan. */
+#ifdef GBA_LINK
+         int held = gba_sram_hold;
+#else
+         int held = 0;
+#endif
+         (void)sram_scan(req == 2);
+         sram_scan_req = 0;      /* clear only after the scan has marked */
+#ifdef GBA_LINK
+         held |= gba_sram_hold;
+#endif
+         if (!held)
+         {
+            sram_scan_gen = gen;
+            sram_scan_gen_valid = 1;
+         }
+      }
    }
 
    before = sram_pending();
@@ -1514,6 +1928,24 @@ int fe_host_sram_service_io(void)
      return (int)(before > after ? before - after : 0); }
 }
 
+/* The console is about to sleep (PSP power callback, its own thread): ask
+ * the writer for a scan now, so a save made in the last few seconds is on
+ * the stick before the power goes.  A flag and a wake -- no file is touched
+ * from the caller's thread.  Nothing to do without a writer thread (the
+ * synchronous path flushes on the emulation thread) or for a GB game (its
+ * save is flushed by the main loop's own suspend request). */
+void fe_host_sram_request_scan(void)
+{
+   /* One read: this runs on the power callback's thread, and the main
+    * thread clears host_io when it stops the writer (io_thread_stop). */
+   const fe_host_io *io = host_io;
+   if (!io || gb_family || !host.save_path)
+      return;
+   if (!sram_scan_req)
+      sram_scan_req = 1;
+   io->wake();
+}
+
 void fe_host_sram_ff_nudge_enable(int on)
 {
    ffn_enabled = on ? 1 : 0;
@@ -1521,7 +1953,9 @@ void fe_host_sram_ff_nudge_enable(int on)
 
 int fe_host_sram_ff_nudge(int ff_active)
 {
-   uint32_t gen;
+   uint32_t gen, dgen;
+   uint64_t now_us;
+   int oldest_late, want_scan;
 
    if (!host_io || gb_family || !&backup_write_gen || !host.save_path)
       return 0;
@@ -1529,55 +1963,134 @@ int fe_host_sram_ff_nudge(int ff_active)
    gen = backup_write_gen;
    if (gen != ffn_seen_gen)
    {
+      now_us = host.time_us ? host.time_us() : 0;
       if (!ffn_pending)
+      {
          ffn_first_frame = frame_count;
+         ffn_first_us = now_us;
+         ffn_asked = 0;
+      }
+      /* A new SAVE re-arms the yield budget: the first write, or one that
+       * follows a settle period of quiet.  A write in the middle of a run
+       * of them does not, or a game that never stops writing would be made
+       * to sleep for a writer that cannot persist for as long as it ran. */
+      if (!ffn_pending ||
+          frame_count - ffn_last_frame >= SRAM_FF_SETTLE_FRAMES)
+      {
+         ffn_gen_yields = 0;
+         ffn_gave_up = 0;
+         ffn_starved_said = 0;
+      }
       ffn_pending = 1;
       ffn_seen_gen = gen;
       ffn_last_frame = frame_count;
-      ffn_last_us = host.time_us ? host.time_us() : 0;
-      ffn_gen_yields = 0;
-      ffn_gave_up = 0;
+      ffn_last_us = now_us;
    }
    if (!ffn_pending)
       return 0;
-   if (sram_disk_gen == gen)
+   dgen = sram_disk_gen;
+   now_us = host.time_us ? host.time_us() : 0;
+   if (dgen == gen)
    {
       /* Persisted -- by a nudged scan or by the writer's own cadence.
        * Observed here, so both figures are upper bounds by one frame. */
-      uint64_t now_us = host.time_us ? host.time_us() : 0;
       fe_evt("sram_persisted gen=%u ff=%d frames_since_write=%u "
              "ms_since_write=%u yields=%u total_yields=%u total_yield_us=%u",
              (unsigned)gen, ff_active, frame_count - ffn_last_frame,
              (unsigned)((now_us - ffn_last_us) / 1000u), ffn_gen_yields,
              ffn_yields, (unsigned)ffn_yield_us);
-      FE_EVT_ONLY(now_us);
       ffn_pending = 0;
+      ffn_asked = 0;
       ffn_gen_yields = 0;
       return 0;
    }
-   if (!ff_active || !ffn_enabled || ffn_gave_up)
+   if (ffn_asked && (int32_t)(dgen - ffn_ask_gen) >= 0)
+   {
+      /* The request was served, and the game has written again since: what
+       * is still unpersisted is newer than the request (see ffn_asked). */
+      ffn_asked = 0;
+      ffn_first_frame = ffn_ask_frame;
+      ffn_first_us = ffn_ask_us;
+      ffn_gen_yields = 0;
+      ffn_gave_up = 0;
+      ffn_starved_said = 0;
+   }
+   if (!ffn_enabled)
       return 0;
+#ifdef GBA_LINK
+   /* A link session owns the battery image and the writer looks at nothing
+    * (gba_sram_hold): no request can be served, so none is made and main
+    * does not sleep for one.  The release asks for the scan itself. */
+   if (gba_sram_hold)
+      return 0;
+#endif
+   oldest_late = host.time_us &&
+                 now_us - ffn_first_us > SRAM_STARVED_OLDEST_US;
    if (frame_count - ffn_last_frame < SRAM_FF_SETTLE_FRAMES &&
-       frame_count - ffn_first_frame < SRAM_FF_MAX_DEFER_FRAMES)
+       frame_count - ffn_first_frame < SRAM_FF_MAX_DEFER_FRAMES &&
+       !oldest_late)
       return 0;
    if ((int)(frame_count - ffn_next_frame) < 0)
       return 0;
-   if (ffn_gen_yields >= SRAM_FF_NUDGE_CAP)
+   /* Fast-forward is not the only time main never blocks: a game that does
+    * not reach full speed gives the writer (which runs below main) no time
+    * either.  A save still not on the stick a second after its settle time,
+    * or whose OLDEST write has waited SRAM_STARVED_OLDEST_US while the game
+    * kept writing, is treated as fast-forward treats it: main sleeps for it.
+    * Once the yield cap for this save is spent (a writer that cannot
+    * persist) it is back to asking every settle period, as normal speed
+    * always did. */
+   if (!ff_active && !ffn_gave_up && host.time_us &&
+       (oldest_late || now_us - ffn_last_us > SRAM_STARVED_US))
    {
-      ffn_gave_up = 1;
-      fe_evt("sram_ff_nudge gave_up gen=%u disk_gen=%u yields=%u",
-             (unsigned)gen, (unsigned)sram_disk_gen, ffn_gen_yields);
-      return 0;
+      if (!ffn_starved_said)
+      {
+         ffn_starved_said = 1;
+         fe_evt("sram_nudge_starved gen=%u disk_gen=%u ms_since_write=%u "
+                "ms_since_oldest=%u",
+                (unsigned)gen, (unsigned)dgen,
+                (unsigned)((now_us - ffn_last_us) / 1000u),
+                (unsigned)((now_us - ffn_first_us) / 1000u));
+      }
+      ff_active = 1;
    }
-
-   /* The writer has not scanned since this write, or its last pass failed
-    * (no trustworthy on-disk image until a full rewrite, which only a scan
-    * schedules): ask for a scan now rather than at its 5 s cadence.  Never
-    * downgrade a pending forced request. */
-   if (!sram_scan_gen_valid || sram_scan_gen != gen || !sram_have_blk)
+   if (ff_active)
    {
-      if (!sram_scan_req)
-         sram_scan_req = 1;
+      if (ffn_gave_up)
+         return 0;
+      if (ffn_gen_yields >= SRAM_FF_NUDGE_CAP)
+      {
+         ffn_gave_up = 1;
+         fe_evt("sram_ff_nudge gave_up gen=%u disk_gen=%u yields=%u",
+                (unsigned)gen, (unsigned)dgen, ffn_gen_yields);
+         return 0;
+      }
+   }
+   if (!ffn_asked)
+   {
+      ffn_asked = 1;
+      ffn_ask_gen = gen;
+      ffn_ask_frame = frame_count;
+      ffn_ask_us = now_us;
+   }
+   /* The writer has not scanned since the request, or its last pass failed
+    * (no trustworthy on-disk image until a full rewrite, which only a scan
+    * schedules): ask for a scan now rather than at its 5 s cadence -- once
+    * per request, not once per nudge.  Never downgrade a pending forced
+    * request. */
+   want_scan = !sram_scan_gen_valid || !sram_have_blk ||
+               (int32_t)(sram_scan_gen - ffn_ask_gen) < 0;
+   if (want_scan && !sram_scan_req)
+      sram_scan_req = 1;
+   if (!ff_active)
+   {
+      /* Normal speed: ask, do not wait.  The writer is woken again every
+       * settle period until the generation is on disk (a scan that raced a
+       * late write, a write that failed and needs the whole-image
+       * rewrite). */
+      ffn_next_frame = frame_count + SRAM_FF_SETTLE_FRAMES;
+      host_io->wake();
+      return 0;
    }
    ffn_next_frame = frame_count + SRAM_FF_NUDGE_EVERY;
    ffn_gen_yields++;
@@ -1637,6 +2150,30 @@ void fe_host_sram_sync(void)
       {
          if (sram_drain(0) != 0)
             sram_full_req = 1;   /* retry from a whole-image write */
+      }
+      /* A FAILED DELTA WRITE MUST NOT END THE STORY HERE.
+       *
+       * sram_abandon_deltas() closes the file, forgets the dirty set and
+       * leaves the whole-image rewrite to "the next scan".  This function
+       * is what exit calls, and at exit there is no next scan: the flush
+       * that failed returned with nothing pending, this returned with
+       * nothing to do, and the save stayed in memory.
+       *
+       * It is reachable on a console without anything being broken: the
+       * .sav is held open for the run, and a PSP invalidates open Memory
+       * Stick files across sleep, so the first write after a wake fails.
+       * Save, sleep, wake, quit within the writer's 5 s scan interval, and
+       * the stick kept whatever it had -- the previous save, or, when a
+       * scan had landed in the middle of the game's save before the sleep,
+       * a slot of mixed old and new sectors ("The save file is corrupted").
+       *
+       * So finish it now, with the rewrite the next scan would have asked
+       * for: a fresh open of the path, the whole image.  One attempt; if
+       * the stick really is gone there is nothing more to do from here. */
+      if ((sram_retry_full || sram_full_req) && SRAM_EXIT_RETRY)
+      {
+         sram_full_req = 1;
+         (void)sram_drain(0);
       }
       return;
    }
@@ -1709,14 +2246,24 @@ static int sram_scan(int force_write)
       }
       sram_run_scan_us += (host.time_us ? host.time_us() : 0) - s0;
    }
-   /* A failed delta write invalidates the per-block on-disk baseline.  Even
-    * when live SRAM's whole-image CRC is unchanged, scan again to schedule a
-    * full rewrite; that write is the only way to re-establish the baseline. */
-   if (!force_write && sram_have_blk && sram_have_crc &&
-       crc == sram_last_crc)
+   /* Nothing to do only when every block matches what is ON DISK
+    * (sram_blk_crc, recorded from the bytes each write staged).  This used
+    * to compare the whole image with the image the previous SCAN saw: a
+    * block that changed again between that scan and its write, then went
+    * back, left the intermediate bytes on the stick and a scan that called
+    * the save persisted (review S4).  A failed delta write invalidates the
+    * per-block baseline (sram_have_blk): scan on, to schedule the full
+    * rewrite that is the only way to re-establish it. */
+   if (!force_write && sram_have_blk)
    {
-      sram_run_scan_us = 0;    /* nothing to attribute it to */
-      return 0;
+      for (i = 0; i < SRAM_BLOCKS; i++)
+         if (crc_now[i] != sram_blk_crc[i])
+            break;
+      if (i == SRAM_BLOCKS)
+      {
+         sram_run_scan_us = 0;    /* nothing to attribute it to */
+         return 0;
+      }
    }
 
    sram_run_crc = crc;
@@ -1746,8 +2293,6 @@ static int sram_scan(int force_write)
             sram_blk_state[i] = SBLK_DIRTY;
    }
 
-   sram_last_crc = crc;
-   sram_have_crc = 1;
    return 1;
 }
 
@@ -1967,6 +2512,10 @@ static void gb_rtc_to_local(uint8_t *image, size_t size)
       t[44] = (uint8_t)(now >> 32); t[45] = (uint8_t)(now >> 40);
       t[46] = (uint8_t)(now >> 48); t[47] = (uint8_t)(now >> 56);
    }
+   /* Stamped with this frontend's clock: UTC, and marked as the files
+    * gb_save_flush writes are. */
+   if (size - ram == 48)
+      gb_rtc_mark(t);
    fe_evt("gb_rtc_rebase to_local=%lld trailer=%u", (long long)now,
           (unsigned)(size - ram));
 }
@@ -2145,6 +2694,37 @@ static uint8_t *gba_scratch_get(size_t need, int *heap)
    return (uint8_t *)malloc(need);
 }
 
+/* The one-console bench with no pair running (GBA-LINK-MIRROR.md 21).  The
+ * pair starts when the player's machine loads a state (fe_host_state_load);
+ * a bench ini with no `load_state` therefore ran ONE machine for its whole
+ * length, silently, and its core_prof was read as the pair's.
+ *   gba_dual_cold = 1: start the pair before the first frame, both machines
+ *     from the player's power-on machine (serialized here, loaded into both,
+ *     exactly what a state file does).
+ *   otherwise: say so once, loudly, when the autoload window has passed. */
+static void gba_dual_bench_idle(void)
+{
+   static int noted;
+   if (host.gba_dual_cold && frame_count == 0 && fe_gbadual_loaded())
+   {
+      size_t sz = retro_serialize_size();
+      int ok = sz && sz <= sizeof(state_buf) && retro_serialize(state_buf, sz) &&
+               retro_unserialize(state_buf, sz);
+      fe_evt("gbadual_cold size=%u ok=%d", (unsigned)sz, ok);
+      if (ok)
+         fe_gbadual_state_loaded(state_buf, sz);
+      return;
+   }
+   if (!noted && frame_count >= 120)
+   {
+      noted = 1;
+      fe_evt("gbadual_idle frame=%u loaded=%d WARNING the pair is NOT running: "
+             "this run is ONE machine and its core_prof is not a pair's "
+             "(stage a state with load_state = 1, or set gba_dual_cold = 1)",
+             frame_count, fe_gbadual_loaded());
+   }
+}
+
 static void gba_dual_cfg(fe_gbadual_config *dc)
 {
    memset(dc, 0, sizeof(*dc));
@@ -2157,6 +2737,9 @@ static void gba_dual_cfg(fe_gbadual_config *dc)
    dc->partner_audio = host.gba_dual_partner_audio;
    dc->sram_crc = host.gba_dual_sram_crc;
    dc->b_jit_pin_p1 = host.gba_dual_b_jit_pin_p1;
+   dc->cable_fast = host.gba_dual_cable_fast;
+   dc->time_us = host.time_us;
+   dc->step_max_ms = host.gba_dual_step_max_ms;
    dc->hash_path = host.gba_dual_hash;
    dc->env = env_cb;
    dc->log = gbadual_log;
@@ -2345,6 +2928,12 @@ static int gba_cable_start(int is_host, unsigned input_delay, int64_t rtc_seed)
    size_t sn;
    if (gbl)
       return -1;
+#ifdef REWIND
+   /* The session starts from the machine as it stands (it is serialized
+    * below, for both consoles): never from an old frame that a rewind in
+    * progress is re-running.  Land first (fe_host.h). */
+   (void)fe_host_rewind_land(0);
+#endif
    if (gba_cable_late && !fe_gbadual_loaded())
    {
       int mrc = gba_session_mem(1);
@@ -2417,9 +3006,12 @@ static int gba_cable_start(int is_host, unsigned input_delay, int64_t rtc_seed)
    l.batch_lines = host.gba_dual_lookahead ? host.gba_dual_lookahead / 1232u
                                            : 114u;
    l.machines = m;
+   l.core_mask = host.gba_core_mask;
    l.rom_sampled = gba_rom_sampled;
    gba_sram_hold = 1;
    gbl = fe_gblink_create(&p, &l);
+   gbl_is_gba = gbl != NULL;
+   gbl_ride_set = 0;
    gbl_last = FE_GBLINK_IDLE;
    gbl_primed = 0;
    fe_evt("gblink_lane bulk_max=%u rate=%u input_copies=%u",
@@ -2569,6 +3161,22 @@ int fe_host_gblink_stalled(void)
 }
 void fe_host_gblink_hold(int on) { gbl_hold = on ? 1 : 0; }
 int fe_host_gblink_state(void) { return gbl ? fe_gblink_state(gbl) : -1; }
+void fe_host_set_fast_link(int on)
+{
+#ifdef GBA_LINK
+   host.gba_core_mask = (host.gba_core_mask & ~FE_GBLINK_MASK_INPUT_BATCH) |
+                        (on ? FE_GBLINK_MASK_INPUT_BATCH : 0u);
+#else
+   (void)on;                    /* no GBA cable in this build */
+#endif
+}
+int fe_host_fast_link(int *source)
+{
+   (void)gbl_ride_set;
+   if (!gbl || !gbl_is_gba)
+      return -1;
+   return fe_gblink_fast_link(gbl, source);
+}
 
 void fe_host_gblink_status(char *l1, size_t c1, char *l2, size_t c2)
 {
@@ -2716,6 +3324,12 @@ void fe_host_session_reset(void)
    if (options_boot_saved)
       memcpy(options, options_boot, sizeof(options));
    options_dirty = 0;
+   /* The save writer's requests belong to the game that was just shut down
+    * (its flush and sync have run, the writer thread is stopped): a rewrite
+    * or scan still flagged must not be carried out on the next game. */
+   sram_full_req = 0;
+   sram_retry_full = 0;
+   sram_scan_req = 0;
 }
 
 int fe_host_boot(const fe_host_config *cfg)
@@ -3444,6 +4058,19 @@ static void gba_cable_frame(uint64_t core_t0)
    gbl_waited_us = 0;
    FE_LP_SET(FELP_SESS);
    gbl_last = fe_gblink_step(gbl, fe_gbadual_keys_from_retro(pad));
+   if (!gbl_ride_set && fe_gblink_state(gbl) == FE_GBLINK_RUNNING)
+   {
+      /* RUNNING: both consoles now send every frame or two, so an ack has
+       * a packet to ride on.  Not before (setup is one-directional) and
+       * not after gba_cable_close. */
+      gbl_ride_set = 1;
+      if (gbl_is_gba)
+      {
+         fe_np_ack_ride_session(1);
+         fe_evt("net_tuning ack_ride_us=%u at=running",
+                (unsigned)fe_np_ack_ride_now());
+      }
+   }
 #ifdef DRPROF_HW
    FE_LP_SET(lp_was);
 #endif
@@ -3480,6 +4107,8 @@ static void gba_cable_frame(uint64_t core_t0)
  * Anything else: back to the moment the link began, battery included. */
 static int gba_cable_close(void)
 {
+   fe_np_ack_ride_session(0);
+   gbl_is_gba = 0;
    size_t sn = 0, vn = 0;
    const void *fs = fe_gblink_final_state(gbl, &sn);
    const void *fv = fe_gblink_final_save(gbl, &vn);
@@ -3554,7 +4183,16 @@ static int gba_cable_close(void)
       rc = -1;
    }
    if (bat && sram)
+   {
+      /* The session's save becomes the cartridge's.  This is a write like
+       * the game's own: count it, or nothing knows the stick is behind and
+       * a console switched off within the writer's 5 s cadence after a
+       * finished trade lost it (review S5).  The scan is asked for where
+       * the hold is released, below. */
       memcpy(sram, bat, 0x20000);
+      if (&backup_write_gen)
+         backup_write_gen++;
+   }
    free(state);
    free(bat);
    free(gbl_prelink_state);
@@ -3562,6 +4200,7 @@ static int gba_cable_close(void)
    gbl_prelink_state = NULL;
    gba_prelink_sram = NULL;
    gba_sram_hold = 0;
+   fe_host_sram_request_scan();   /* the committed save goes to the stick now */
    FE_EVT_ONLY(how);
    fe_evt("gblink_resume how=%s rc=%d t_ms=%llu", how, rc,
           (unsigned long long)(host.time_us ? host.time_us() / 1000u : 0));
@@ -3575,6 +4214,2127 @@ void fe_host_skip_override(int skip)
    if (&frontend_skip_override)
       frontend_skip_override = skip_override;
 }
+
+#ifdef REWIND
+/* ---- rewind glue (PROTOTYPE; fe_rewind.h, docs/REWIND.md) -----------------
+ * fe_rewind.c is the mechanism and knows no GBA; this is the GBA machine it
+ * drives.  The snapshot is the save-state image, whole -- the same bytes a
+ * save state holds, so "everything a save state needs" is true by
+ * construction -- plus the two things a save state leaves out and a rewind
+ * cannot (gpsp_rewind_gather in libretro/libretro.c).
+ *
+ * The cartridge save (flash/EEPROM/SRAM contents) is NOT in that image and
+ * a rewind never changes it, in memory or in the file: see "the save is
+ * permanent" below.
+ *
+ * The rewind timeline (fe_rewind_frame_now) is NOT frame_count: frame_count
+ * keeps counting frames run, as every other user of it expects, while the
+ * timeline goes back when the player does. */
+static fe_host_rewind_opts rw_opt;
+static void    *rw_mem;
+static void     rw_win_mark(void);
+static void     rw_gesture_mark(void);
+static void     rw_gesture_evt(void);
+static uint8_t *rw_hash_state;      /* test: scratch for the per-frame hash */
+static uint32_t rw_seen_gen;        /* core backup_write_gen last seen */
+static int      rw_ff;              /* platform is fast-forwarding */
+static uint32_t rw_redo_high;       /* test: redo logged inputs up to here */
+static unsigned rw_barriers_cheat;
+static uint64_t rw_tick_us;
+static unsigned rw_tick_n, rw_tick_max_us;
+static uint16_t rw_present[FE_GBA_WIDTH * FE_GBA_HEIGHT];
+static int      rw_present_valid;
+
+/* The core's rewind image (libretro/libretro.c): the save state plus the
+ * two things it leaves out that a rewind cannot. */
+extern size_t gpsp_rewind_state_size(void);
+extern bool   gpsp_rewind_gather(void *data, size_t size);
+extern bool   gpsp_rewind_restore(const void *data, size_t size);
+extern uint32_t gpsp_rewind_light;
+/* Measurement: translated code emitted while re-running after a restore
+ * (cpu_threaded.c).  Weak: an interpreter-only core has no such thing. */
+extern void gpsp_rewind_jit_used(uint32_t *rom, uint32_t *ram)
+   __attribute__((weak));
+static uint32_t rw_jit_rom0, rw_jit_ram0;
+static int      rw_jit_open;
+static uint64_t rw_jit_rom_emit, rw_jit_ram_emit;
+
+static void rw_jit_close(void)
+{
+   uint32_t rom, ram;
+   if (!rw_jit_open || !gpsp_rewind_jit_used)
+      return;
+   gpsp_rewind_jit_used(&rom, &ram);
+   if (rom > rw_jit_rom0) rw_jit_rom_emit += rom - rw_jit_rom0;
+   if (ram > rw_jit_ram0) rw_jit_ram_emit += ram - rw_jit_ram0;
+   rw_jit_open = 0;
+}
+
+/* ---- how the state reaches a snapshot -------------------------------------
+ * Two ways, one binary (fe_host_rewind_opts.inplace):
+ *
+ *   image    the whole save-state image is serialised into a buffer and that
+ *            buffer is compared with the reference.  One span.  The first
+ *            version, kept as the baseline to measure against.
+ *   in place the six big arrays (IWRAM, EWRAM, VRAM, OAM, palette, I/O; 387
+ *            of the image's 459 KiB) are compared where they lie in the
+ *            machine's memory: nothing is copied.  Only the rest of the
+ *            image (a few KiB) and the sound in flight are serialised, into
+ *            two small buffers.  Eight spans.  With vram_dirty, VRAM pages
+ *            nothing wrote to since the last snapshot are not even read.
+ *
+ * A restore is the mirror image: the arrays are copied back from the
+ * reference and the unchanged save-state loader does the rest. */
+typedef struct { uint32_t bytes; uint8_t *live; } rw_arr_t;
+extern uint32_t gpsp_rewind_layout(uint8_t *scratch, rw_arr_t arr[6]);
+extern void     gpsp_rewind_rest_gather(uint8_t *scratch, uint8_t *rest);
+extern bool     gpsp_rewind_rest_restore(uint8_t *scratch, const uint8_t *rest,
+                                         int keep_ram_code);
+extern int      gpsp_rewind_arrays_restore(const uint8_t *ref,
+                                           const uint8_t *ewram256,
+                                           const uint8_t *vram96,
+                                           uint32_t *copied);
+extern void     gpsp_rewind_map_peek(uint8_t *ewram256, uint8_t *vram96);
+extern void     gpsp_rewind_map_clean(void);
+extern void     gpsp_rewind_marks_want(int on);
+extern int      gpsp_rewind_marks_ok(void);
+extern void     gpsp_rewind_clock_mode(int frames);
+extern void     gpsp_rewind_clock_sync(void);
+extern long long gpsp_rewind_clock_base(const long long *set);
+extern uint32_t gpsp_rewind_audio_bytes(void);
+extern uint32_t gpsp_rewind_audio_gather(uint8_t *dst, uint32_t stale);
+extern void     gpsp_rewind_audio_restore(const uint8_t *src);
+extern int      gpsp_rewind_take_dirty(uint8_t *ewram256, uint8_t *vram96);
+extern void     gpsp_rewind_gprof(uint32_t out[4], uint64_t (*clock)(void));
+extern uint32_t gba_rewind_cheat_gen;
+extern uint32_t gba_rewind_serial_gen;
+extern uint32_t gba_rewind_backup_ro, gba_rewind_backup_ro_hits;
+extern uint32_t gba_rewind_bk_acc;
+extern uint8_t *gba_rewind_rlog;
+extern uint32_t gba_rewind_rlog_mask, gba_rewind_rlog_pos, gba_rewind_rlog_end;
+extern uint32_t gba_rewind_rlog_served, gba_rewind_rlog_miss;
+extern uint32_t gba_rewind_rlog_mutant;
+extern uint32_t gba_rewind_backup_busy(void);
+
+#define RW_REST_CAP  (16u * 1024u)   /* the rest of the image is ~4 KiB */
+#define RW_AUD_PAGE  10              /* dirty-map page of the sound span */
+static fe_rewind_span rw_spans[10];
+static uint32_t rw_nspans;
+static uint8_t *rw_buf;              /* scratch image, then rest, then sound */
+static size_t   rw_buf_bytes;
+static uint8_t *rw_scratch, *rw_rest, *rw_aud;
+static uint32_t rw_rest_bytes, rw_aud_bytes, rw_aud_used;
+static rw_arr_t rw_arr[6];
+/* ---- the save is permanent --------------------------------------------------
+ * The owner's rule (docs/REWIND.md 17): a rewind takes back the game, never
+ * the save, like a real cartridge.  The cartridge save is not in a
+ * snapshot; nothing here reads, writes, holds back or replaces the .sav, and
+ * the flush path does not know a rewind exists.  As built:
+ *   - a save write does not end the history;
+ *   - frames re-run for a rewind run with the save write-protected
+ *     (gba_rewind_backup_ro): the chip's command state runs, the bytes stay;
+ *   - what such a frame READS of the save comes from the read log (the
+ *     bytes the first pass read, gba_memory.h), because the contents may be
+ *     newer now.  The log's position is the last 8 bytes of a snapshot's
+ *     first span (rw_pos_cur / rw_pos_off).  The log is a ring: history
+ *     that reaches back beyond it is dropped (rw_rlog_floor);
+ *   - a frame in which the game touched the chip, or left it in the middle
+ *     of something, is reported to the core as FE_RW_IN_BUSY and one that
+ *     changed the contents as FE_RW_IN_CHANGE; fe_rewind never lets play
+ *     continue from inside such a stretch once the save has changed after
+ *     it (fe_rewind.h, "where a rewind may not stop").
+ * rw_quiet is now the serial port's alone.
+ * rw_floor_frame / rw_floor_why: where the history last started and why,
+ * for the readout at the stop. */
+static uint32_t rw_quiet;            /* frames still to pass after a write */
+static int      rw_quiet_why;        /* ...and what it was (FE_RW_LIMIT_*) */
+#define RW_RLOG_CHUNKS 32
+static uint32_t rw_rlog_bytes = 131072u;
+static uint8_t *rw_rlog;
+static uint32_t rw_rlog_cframe[RW_RLOG_CHUNKS];  /* frame that entered chunk c */
+static uint32_t rw_rlog_chunk;       /* chunk the log's end is in */
+static uint32_t *rw_pos_cur;         /* where gather puts the log position */
+static uint32_t rw_pos_off;          /* ...and its offset in an image */
+static uint32_t rw_bk_quiet = 0xFFFF;/* frames since the chip was last busy */
+/* Frames since the game last WROTE its save or left the chip in the middle
+ * of something.  A rewind is not begun inside a save in progress: the save
+ * is permanent, so going back from the middle of one would leave it half
+ * written for good (a cartridge pulled while "Saving...").  The control
+ * simply does nothing until the save has been finished for save_quiet
+ * frames. */
+static uint32_t rw_wr_quiet = 0xFFFF;
+static unsigned rw_denied_saving;
+static int      rw_bk_carry;         /* the history has just (re)started */
+static unsigned rw_bk_busy_frames, rw_rlog_trims, rw_rlog_resets;
+/* Quiet frames between two busy ones, by length (what N has to cover):
+ * 1-4, 5-8, 9-15, 16-30, 31-60, 61-120, 121-300, more. */
+static unsigned rw_bk_gaps[8];
+static uint32_t rw_rlog_pos_seen;
+/* The serial port is the same kind of thing (serial.c,
+ * gba_rewind_serial_gen): the adapter or cable on the other end is not in a
+ * snapshot.  A frame in which the game drove the port ends the history, with
+ * the same quiet period, because an exchange is several writes and the
+ * answers come back over the following frames. */
+static uint32_t rw_seen_serial_gen;
+static unsigned rw_barriers_serial, rw_serial_frames, rw_w_serial_frames;
+static uint32_t rw_w_deferred;
+static uint32_t rw_floor_frame;
+static int      rw_floor_why;
+static unsigned rw_ro_hits_seen, rw_replay_save_hits, rw_rlog_miss_seen;
+static int      rw_limit_said;
+/* Frames in which the game wrote the save, and frames the history was shut
+ * because of it (those plus the quiet frames after): per window in
+ * rewind_win, so a game that writes its save all the time shows up. */
+static unsigned rw_save_write_frames;
+static unsigned rw_w_save_write_frames, rw_w_bk_busy_frames;
+
+/* The history was ended with the machine on a frame play may not continue
+ * from (fe_host.h, "ending the history in the middle of a rewind"): the
+ * game is reset before its next frame.  Set by fe_host_rewind_suspend, which
+ * a power callback may call; acted on by the emulation thread only. */
+static volatile int rw_reset_owed;
+static int rw_distrust;         /* fe_host_rewind_distrust */
+static unsigned rw_lands, rw_land_fails, rw_unlanded_ok, rw_unvetted_resets;
+static int rw_gesture_live(void);
+static void rw_reset_if_owed(const char *where);
+
+static void rw_barrier(int why)
+{
+   uint32_t f = fe_rewind_frame_now() + 1;
+   fe_rewind_reset(f);
+   if (rw_opt.clock_frames)
+      gpsp_rewind_clock_sync();     /* nothing reaches back past here */
+   rw_floor_frame = f;
+   rw_floor_why = why;
+   rw_bk_carry = 1;
+   if (rw_hash_fp)
+      fprintf(rw_hash_fp, "B %u\n", (unsigned)f);
+}
+/* The core's written-page map as it stood when the snapshot was gathered
+ * (1 = written), 1 KiB pages.  A copy, because the core's map starts
+ * collecting for the NEXT snapshot the moment this one is gathered. */
+static uint8_t  rw_ewram_map[256], rw_vram_map[96], rw_aud_map[64];
+static int      rw_pieces;           /* the in-place layout is in use */
+static int      rw_maps;             /* rw_opt.dirty bits actually in force */
+static uint32_t rw_seen_cheat_gen;
+/* ---- a restore that copies only what can differ ---------------------------
+ * For every EWRAM / VRAM page: if the machine differs from the reference
+ * there, then the core's map has it marked (written since the last
+ * snapshot) or rw_diff_* has (a step back changed the reference there and
+ * the machine has not followed).  A restore copies exactly those pages and
+ * then both are empty; so is rw_diff_* after any snapshot, which leaves
+ * machine and reference equal.  rewind_verify checks it after every
+ * restore. */
+static uint8_t  rw_diff_ewram[256], rw_diff_vram[96];
+static uint32_t rw_off_ewram, rw_off_vram;   /* where they lie in the image */
+static uint32_t rw_restore_bad;
+static uint64_t rw_restore_copied;
+static uint32_t rw_restore_kept, rw_restore_n;
+static uint64_t rw_restore_arr_us;   /* of a restore's time: the arrays */
+static uint64_t rw_now(void);
+/* Test instrument: the cartridge save as it is in memory. */
+static uint32_t rw_sav_crc(void)
+{
+   const void *sp = retro_get_memory_data(RETRO_MEMORY_SAVE_RAM);
+   size_t sn = retro_get_memory_size(RETRO_MEMORY_SAVE_RAM);
+   return sp && sn ? fe_crc32(0, sp, sn) : 0;
+}
+static uint32_t rw_nopic_shown;      /* frames gone back over with no picture */
+
+static void rw_diff_mark(uint8_t *map, uint32_t pages, uint32_t base,
+                         uint32_t off, uint32_t bytes)
+{
+   uint32_t lo, hi, p;
+   if (off + bytes <= base || off >= base + (pages << 10))
+      return;
+   lo = off > base ? off - base : 0;
+   hi = off + bytes - base;
+   if (hi > pages << 10)
+      hi = pages << 10;
+   for (p = lo >> 10; p <= (hi - 1) >> 10; p++)
+      map[p] = 1;
+}
+
+static void rw_ref_touched(uint32_t off, uint32_t bytes)
+{
+   rw_diff_mark(rw_diff_ewram, 256, rw_off_ewram, off, bytes);
+   rw_diff_mark(rw_diff_vram, 96, rw_off_vram, off, bytes);
+}
+
+static void rw_snapshot_done(void)
+{
+   memset(rw_diff_ewram, 0, sizeof(rw_diff_ewram));
+   memset(rw_diff_vram, 0, sizeof(rw_diff_vram));
+}
+
+static int rw_run_nopic, rw_play_ext;
+extern uint32_t sound_synth_off;  /* sound.h */
+static int      rw_held_tick;     /* this tick's re-runs are a held rewind's */
+static int      rw_inexact;       /* a re-run since the last restore skipped
+                                   * the sound synthesis */
+static int      rw_cad_quiet;
+static uint32_t rw_e_frame, rw_e_pic, rw_e_head;   /* running means, us */
+static uint32_t rw_synth_skipped;
+/* restore, split (gather_prof): closing the JIT accounting, the verify
+ * compare, the maps, the sound in flight */
+static uint64_t rw_rs_jit_us, rw_rs_verify_us, rw_rs_maps_us, rw_rs_aud_us;
+
+static int      rw_head_skip = 1; /* fe_host_rewind_set_head_skip */
+static uint32_t rw_ring_asked, rw_ring_granted;
+static const char *const rw_why_name[FE_RW_LIMIT_N] =
+   { "history", "save", "state_load", "cheats", "other", "serial", "sleep",
+     "poke", "not_recorded" };
+static uint32_t rw_head_skipped;
+
+static void rw_ema(uint32_t *e, uint32_t d)
+{
+   *e = *e ? (*e * 7 + d) / 8 : d;
+}
+/* The clock's base after each of the last first-pass syncs, by the frame
+ * that had just run.  A re-run that passes one of those frames takes the
+ * same base from there on, so it reads the seconds the first pass read. */
+#define RW_CLK_N 64
+static struct { uint32_t frame; long long base; } rw_clk[RW_CLK_N];
+static unsigned rw_clk_at;
+static uint16_t *rw_play_ext_pix;
+static uint32_t rw_frame_core_us;    /* retro_run's time for the last frame */
+static uint32_t rw_snap_est_us = 3000;
+static uint32_t rw_snap_seen;
+
+static int rw_gather(void)
+{
+   uint32_t used, hi, pg;
+   /* The clock's base joins the wall clock here and only here, and only on
+    * the first pass: a snapshot taken again on the way back to `now` keeps
+    * the base the frames since were run with. */
+   if (rw_opt.clock_frames && fe_rewind_frame_mach() == fe_rewind_frame_now())
+   {
+      gpsp_rewind_clock_sync();
+      rw_clk[rw_clk_at % RW_CLK_N].frame = fe_rewind_frame_mach();
+      rw_clk[rw_clk_at % RW_CLK_N].base = gpsp_rewind_clock_base(NULL);
+      rw_clk_at++;
+   }
+   if (rw_pos_cur)
+   {
+      rw_pos_cur[0] = gba_rewind_rlog_pos;
+      rw_pos_cur[1] = 0;
+   }
+   if (!rw_pieces)
+      return gpsp_rewind_gather(rw_scratch, gpsp_rewind_state_size()) ? 0 : -1;
+   gpsp_rewind_rest_gather(rw_scratch, rw_rest);
+   /* The sound in flight: a kilobyte or two of a 32 KiB span.  Only the
+    * pages this save or the previous one reached can differ. */
+   used = gpsp_rewind_audio_gather(rw_aud, rw_aud_used);
+   hi = used > rw_aud_used ? used : rw_aud_used;
+   rw_aud_used = used;
+   memset(rw_aud_map, 0, sizeof(rw_aud_map));
+   for (pg = 0; pg < sizeof(rw_aud_map) && (pg << RW_AUD_PAGE) < hi; pg++)
+      rw_aud_map[pg] = 1;
+   if (rw_maps && !gpsp_rewind_take_dirty(rw_ewram_map, rw_vram_map))
+   {
+      /* The core withdrew the map (gba_rewind_map_ok): read everything. */
+      memset(rw_ewram_map, 1, sizeof(rw_ewram_map));
+      memset(rw_vram_map, 1, sizeof(rw_vram_map));
+   }
+   return 0;
+}
+
+static int rw_restore(const void *image, uint32_t bytes)
+{
+   int r;
+   uint64_t t_rs = rw_opt.gather_prof ? rw_now() : 0;
+   rw_inexact = 0;
+   rw_jit_close();
+   if (rw_opt.gather_prof)
+      rw_rs_jit_us += rw_now() - t_rs;
+   if (rw_pos_cur)
+      /* the frames run from here read the save the first pass read */
+      memcpy(&gba_rewind_rlog_pos, (const uint8_t *)image + rw_pos_off, 4);
+   if (!rw_pieces)
+      r = gpsp_rewind_restore(image, bytes) ? 0 : -1;
+   else
+   {
+      const uint8_t *q = (const uint8_t *)image + rw_rest_bytes;
+      uint8_t ew[256], vr[96];
+      const uint8_t *pe = NULL, *pv = NULL;
+      uint32_t copied = 0;
+      uint64_t t_arr;
+      int i, keep = 0, fast = rw_opt.fast_restore && gpsp_rewind_light;
+      if (fast)
+      {
+         unsigned p;
+         gpsp_rewind_map_peek(ew, vr);
+         if (rw_maps & 2)
+         {
+            for (p = 0; p < 256; p++)
+               ew[p] |= rw_diff_ewram[p];
+            pe = ew;
+         }
+         if (rw_maps & 1)
+         {
+            for (p = 0; p < 96; p++)
+               vr[p] |= rw_diff_vram[p];
+            pv = vr;
+         }
+      }
+      t_arr = rw_now();
+      keep = !gpsp_rewind_arrays_restore(q, pe, pv, &copied) && fast;
+      rw_restore_arr_us += rw_now() - t_arr;
+      t_rs = rw_opt.gather_prof ? rw_now() : 0;
+      if (rw_opt.verify)
+      {
+         /* The whole machine must now be the snapshot. */
+         const uint8_t *v = q;
+         for (i = 0; i < 6; i++)
+         {
+            if (memcmp(rw_arr[i].live, v, rw_arr[i].bytes) != 0)
+            {
+               rw_restore_bad++;
+               fe_evt("rewind_restore_verify_fail array=%d (a page that "
+                      "differed was not copied back)", i);
+               memcpy(rw_arr[i].live, v, rw_arr[i].bytes);
+               keep = 0;
+            }
+            v += rw_arr[i].bytes;
+         }
+      }
+      if (rw_opt.gather_prof)
+         rw_rs_verify_us += rw_now() - t_rs;
+      for (i = 0; i < 6; i++)
+         q += rw_arr[i].bytes;
+      r = gpsp_rewind_rest_restore(rw_scratch, (const uint8_t *)image, keep)
+             ? 0 : -1;
+      t_rs = rw_opt.gather_prof ? rw_now() : 0;
+      /* Machine == reference: nothing is written, nothing is behind. */
+      gpsp_rewind_map_clean();
+      rw_snapshot_done();
+      if (!fast)
+         gpsp_rewind_mark_all();      /* (no map in use: stay conservative) */
+      rw_restore_copied += copied;
+      rw_restore_kept += (uint32_t)keep;
+      rw_restore_n++;
+      if (rw_opt.gather_prof)
+      {
+         uint64_t t = rw_now();
+         rw_rs_maps_us += t - t_rs;
+         t_rs = t;
+      }
+      gpsp_rewind_audio_restore(q);
+      if (rw_opt.gather_prof)
+         rw_rs_aud_us += rw_now() - t_rs;
+      /* The reference's sound span may now reach further than the last
+       * save did: compare all of it once. */
+      rw_aud_used = rw_aud_bytes;
+   }
+   if (gpsp_rewind_jit_used)
+   {
+      gpsp_rewind_jit_used(&rw_jit_rom0, &rw_jit_ram0);
+      rw_jit_open = 1;
+   }
+   return r;
+}
+
+static void rw_run(uint32_t input, uint16_t *pix, int16_t *aud,
+                   uint32_t *aud_n)
+{
+   int ext = 0, skip = 0, fskip0 = -1, fskip = 0;
+   uint32_t synth0 = sound_synth_off;
+   uint64_t t_run;
+   if (rw_opt.clock_frames)
+   {
+      unsigned k, n = rw_clk_at < RW_CLK_N ? rw_clk_at : RW_CLK_N;
+      uint32_t at = fe_rewind_frame_mach();
+      for (k = 1; k <= n; k++)       /* newest first: a frame synced twice */
+         if (rw_clk[(rw_clk_at - k) % RW_CLK_N].frame == at)
+         {
+            (void)gpsp_rewind_clock_base(&rw_clk[(rw_clk_at - k) % RW_CLK_N].base);
+            break;
+         }
+   }
+   if (rw_opt.no_capture)
+      pix = NULL;
+   if (rw_opt.pix_begin)
+      ext = rw_opt.pix_begin(pix);
+   if (rw_opt.sound_mode == 2 && rw_held_tick)
+   {
+      /* Nobody hears these frames and the machine goes back to a snapshot
+       * before play continues: leave our own mixing out. */
+      skip = 1;
+      rw_inexact = 1;
+      rw_synth_skipped++;
+      sound_synth_off = 1;
+      fe_rewind_taint();
+   }
+   rw_replay    = 1;
+   rw_cap_pix   = ext ? NULL : pix;
+   rw_cap_aud   = (rw_opt.no_capture || rw_opt.sound_mode) ? NULL : aud;
+   rw_cap_aud_n = 0;
+   rw_cap_got   = 0;
+   rw_mask      = input;
+   rw_mask_on   = 1;
+   gba_rewind_backup_ro = 1;
+   if (!pix && rw_head_skip && &frontend_skip_override)
+   {
+      /* Nobody will look at this frame: the core need not draw or capture
+       * it (what a skipped fast-forward frame is). */
+      fskip = 1;
+      fskip0 = frontend_skip_override;
+      frontend_skip_override = 1;
+      rw_head_skipped++;
+   }
+   t_run = rw_now();
+   retro_run();
+   rw_ema(pix ? &rw_e_pic : &rw_e_head, (uint32_t)(rw_now() - t_run));
+   if (fskip)
+      frontend_skip_override = fskip0;
+   gba_rewind_backup_ro = 0;
+   rw_mask_on = 0;
+   rw_replay = 0;
+   if (skip)
+      sound_synth_off = synth0;
+   if (pix && !(ext ? (rw_opt.pix_end && rw_opt.pix_end()) : rw_cap_got))
+      rw_run_nopic = 1;
+   else
+      rw_run_nopic = 0;
+   if (rw_hash_fp && rw_hash_state && !rw_inexact &&
+       gpsp_rewind_gather(rw_hash_state, gpsp_rewind_state_size()))
+      /* Test instrument: the machine a RE-RUN frame leaves, to be compared
+       * with what the first pass left at that frame (rewind_check.py, Q).
+       * (Not for frames run without the sound synthesis: those are known
+       * to differ in the sound buffer, and never become play.) */
+      fprintf(rw_hash_fp, "Q %u %08x %08x\n", (unsigned)fe_rewind_frame_mach() + 1,
+              (unsigned)fe_crc32(0, rw_hash_state, gpsp_rewind_state_size()),
+              (unsigned)rw_sav_crc());
+   if (rw_hash_fp && rw_hash_state && rw_opt.dump_frame &&
+       fe_rewind_frame_mach() + 1 == rw_opt.dump_frame &&
+       gpsp_rewind_gather(rw_hash_state, gpsp_rewind_state_size()))
+   {
+      /* Test instrument: the same frame's image when it is RE-RUN for a
+       * rewind, state_<n>_r<k>.bin (see rw_after_frame). */
+      static unsigned dump_r;
+      char path[600];
+      FILE *df;
+      snprintf(path, sizeof(path), "%s/state_%u_r%u.bin",
+               rw_opt.dump_dir ? rw_opt.dump_dir : ".",
+               (unsigned)rw_opt.dump_frame, dump_r++);
+      df = dump_r <= 4 ? fopen(path, "wb") : NULL;
+      if (df)
+      {
+         fwrite(rw_hash_state, 1, gpsp_rewind_state_size(), df);
+         fclose(df);
+      }
+   }
+   if (aud_n)
+      *aud_n = (rw_cap_aud ? rw_cap_aud_n : 0) |
+               (rw_run_nopic ? FE_RW_NOPIC : 0);
+   if (pix && !rw_run_nopic && !ext)
+      rw_cap_last = pix;
+}
+
+static uint64_t rw_now(void)
+{
+   return host.time_us ? host.time_us() : 0;
+}
+
+/* A state was loaded: the machine is somewhere else entirely.  The history
+ * restarts, and so does the watch on the save counter (a state load does
+ * not write the save, but whatever the counter did before it is not this
+ * timeline's business). */
+static void fe_host_rewind_state_loaded(void)
+{
+   rw_seen_gen = sram_gen_now();
+   rw_seen_serial_gen = gba_rewind_serial_gen;
+   rw_quiet = 0;
+   rw_bk_quiet = 0xFFFF;        /* another machine: its chip is as loaded */
+   rw_wr_quiet = 0xFFFF;
+   rw_barrier(FE_RW_LIMIT_STATE);
+}
+
+const char *fe_host_rewind_blocked(void)
+{
+   if (!rw_on)
+      return "off";
+   if (gb_family)
+      return "gb";              /* GB/GBC: not built in this prototype */
+   /* Every kind of link SESSION: lockstep partners and the emulated
+    * wireless adapter cannot be taken back in time.  A session, not the
+    * ability to have one: `gba_cable` is set at every GBA game load in a
+    * build that can host a cable room (a player's build always), and
+    * testing it here refused the rewind in every game.  A running session
+    * is `gbl` (GB and GBA cable) or the pair being active. */
+   if (gbl)
+      return "link";
+#ifdef GBA_LINK
+   if (fe_gbadual_active())
+      return "link";
+#endif
+   if (fe_np_session_active())
+      return "link";
+   return NULL;
+}
+
+void fe_host_rewind_set_ff(int ff)
+{
+   rw_ff = ff;
+}
+
+int fe_host_rewind_replaying(void)
+{
+   return rw_replay;
+}
+
+static uint32_t rw_crc_rev(const int16_t *a, uint32_t n)
+{
+   /* CRC of the stereo frames in reverse order: what a rewind plays. */
+   uint32_t crc = 0;
+   while (n--)
+      crc = fe_crc32(crc, a + n * 2, 4);
+   return crc;
+}
+
+/* Test instrument: buttons as a pure function of the timeline frame, so a
+ * run that rewinds and a run that never does play the same game. */
+static uint32_t rw_fuzz_mask(uint32_t seed, uint32_t frame)
+{
+   static const uint8_t dir[5] = { 0, RETRO_DEVICE_ID_JOYPAD_UP,
+      RETRO_DEVICE_ID_JOYPAD_DOWN, RETRO_DEVICE_ID_JOYPAD_LEFT,
+      RETRO_DEVICE_ID_JOYPAD_RIGHT };
+   uint32_t h = (frame / 12u) * 2654435761u ^ seed * 40503u;
+   uint32_t m = 0;
+   h ^= h >> 15; h *= 2246822519u; h ^= h >> 13;
+   if ((h & 3) != 0)        m |= 1u << RETRO_DEVICE_ID_JOYPAD_A;
+   if (((h >> 2) & 7) == 0) m |= 1u << RETRO_DEVICE_ID_JOYPAD_B;
+   if (((h >> 5) & 15) == 0) m |= 1u << RETRO_DEVICE_ID_JOYPAD_L;
+   if (((h >> 9) & 15) == 0) m |= 1u << RETRO_DEVICE_ID_JOYPAD_R;
+   if (dir[(h >> 13) % 5])  m |= 1u << dir[(h >> 13) % 5];
+   return m;
+}
+
+/* The input the next normal frame runs with, and where its picture goes. */
+static void rw_latch_input(void)
+{
+   uint32_t f;
+   if (rw_reset_owed)
+      rw_reset_if_owed("frame");   /* (the platform resumed nothing) */
+   if (!rw_on)
+      return;
+   f = fe_rewind_frame_now() + 1;
+   rw_mask = (host.input_bitmask ? host.input_bitmask() : 0) | injected_mask;
+   if (rw_opt.fuzz_from && f >= rw_opt.fuzz_from)
+      rw_mask = rw_fuzz_mask(rw_opt.fuzz_seed, f);
+   else if (rw_opt.redo_inputs && f <= rw_redo_high)
+      rw_mask = fe_rewind_logged_input(f);
+   rw_mask_on = 1;
+   rw_test_aud_n = 0;
+   rw_cap_aud_n = 0;
+   rw_cap_got = 0;
+   rw_play_ext = 0;
+   rw_tee = fe_rewind_play_slot(&rw_cap_pix, &rw_cap_aud);
+   if (rw_opt.no_capture)
+      rw_tee = 0;               /* the slot exists (1 pixel); nothing goes in */
+   if (rw_opt.pix_begin)
+   {
+      rw_play_ext = rw_opt.pix_begin(rw_tee ? rw_cap_pix : NULL);
+      if (rw_play_ext)
+         rw_play_ext_pix = rw_cap_pix, rw_cap_pix = NULL;   /* sound only */
+   }
+}
+
+/* After every normally-run GBA frame. */
+static void rw_after_frame(void)
+{
+   uint32_t gen, bk_flags = 0;
+   int tee = rw_tee;
+
+   int has_pic = 0, hash_ok;
+
+   rw_mask_on = 0;              /* the latch is for one retro_run only */
+   rw_tee = 0;
+   if (!rw_on)
+      return;
+   if (tee)
+   {
+      if (rw_play_ext)
+         has_pic = rw_opt.pix_end && rw_opt.pix_end();
+      else
+      {
+         has_pic = rw_cap_got;
+         if (has_pic)
+            rw_cap_last = rw_cap_pix;
+      }
+   }
+   else if (rw_play_ext && rw_opt.pix_end)
+      (void)rw_opt.pix_end();
+   gen = sram_gen_now();
+   {
+      /* The save chip in this frame (see "the save is permanent"). */
+      int busy = gba_rewind_bk_acc || gba_rewind_backup_busy() ||
+                 gen != rw_seen_gen;
+      gba_rewind_bk_acc = 0;
+      if (busy)
+      {
+         if (rw_bk_quiet && rw_bk_quiet < 0xFFFF)
+         {
+            static const uint16_t lim[7] = { 4, 8, 15, 30, 60, 120, 300 };
+            unsigned b = 0;
+            while (b < 7 && rw_bk_quiet > lim[b])
+               b++;
+            rw_bk_gaps[b]++;
+         }
+         rw_bk_quiet = 0;
+         rw_bk_busy_frames++;
+         bk_flags |= FE_RW_IN_BUSY;
+      }
+      else if (rw_bk_quiet < 0xFFFF)
+         rw_bk_quiet++;
+      if (gen != rw_seen_gen)
+      {
+         rw_save_write_frames++;
+         bk_flags |= FE_RW_IN_CHANGE;
+      }
+      if (gen != rw_seen_gen || gba_rewind_backup_busy())
+         rw_wr_quiet = 0;
+      else if (rw_wr_quiet < 0xFFFF)
+         rw_wr_quiet++;
+   }
+   if (rw_poked)
+   {
+      rw_poked = 0;
+      rw_seen_gen = gen;
+      rw_barrier(FE_RW_LIMIT_POKE);
+      return;
+   }
+   if (gba_rewind_cheat_gen != rw_seen_cheat_gen)
+   {
+      /* The cheat list changed (a code switched on or off, the list
+       * reloaded, cheats suspended).  It is not part of a snapshot, and a
+       * frame re-run under another list is another frame: the history ends
+       * here, like at a cartridge save. */
+      rw_seen_cheat_gen = gba_rewind_cheat_gen;
+      rw_seen_gen = gen;
+      rw_barriers_cheat++;
+      rw_barrier(FE_RW_LIMIT_CHEAT);
+      return;
+   }
+   if (fe_host_rewind_blocked() || (rw_ff && !rw_opt.ff_rewindable))
+   {
+      /* Not recorded: the history restarts when this ends. */
+      rw_seen_gen = gen;
+      rw_barrier(FE_RW_LIMIT_OFF);
+      return;
+   }
+   rw_seen_gen = gen;
+   if (rw_rlog && gba_rewind_rlog_pos != rw_rlog_pos_seen)
+   {
+      /* The game read its save: the log moved.  History whose reads have
+       * left the log's ring cannot be re-run faithfully and is dropped. */
+      uint32_t cb = rw_rlog_bytes / RW_RLOG_CHUNKS, c, k;
+      uint32_t f = fe_rewind_frame_now() + 1;
+      rw_rlog_pos_seen = gba_rewind_rlog_pos;
+      c = (gba_rewind_rlog_pos - 1) / cb;
+      if (c != rw_rlog_chunk)
+      {
+         uint32_t need;
+         for (k = c - rw_rlog_chunk < RW_RLOG_CHUNKS
+                     ? rw_rlog_chunk + 1 : c - (RW_RLOG_CHUNKS - 1);
+              k != c + 1; k++)
+            rw_rlog_cframe[k % RW_RLOG_CHUNKS] = f;
+         rw_rlog_chunk = c;
+         /* all chunks but the oldest are whole in the ring */
+         need = rw_rlog_cframe[(c - (RW_RLOG_CHUNKS - 2)) % RW_RLOG_CHUNKS];
+         if (need)
+         {
+            uint32_t old0 = fe_rewind_frame_oldest();
+            if (need >= f || fe_rewind_trim(need) < need)
+            {
+               /* (this one frame read more than the log holds, or only the
+                * newest snapshot is left and it is too old) */
+               rw_rlog_resets++;
+               rw_barrier(FE_RW_LIMIT_SAVE);
+               return;
+            }
+            if (fe_rewind_frame_oldest() != old0)
+            {
+               rw_rlog_trims++;
+               rw_floor_frame = need;
+               rw_floor_why = FE_RW_LIMIT_SAVE;
+            }
+         }
+      }
+   }
+   if (gba_rewind_serial_gen != rw_seen_serial_gen)
+   {
+      /* The game drove the serial port in this frame. */
+      rw_seen_serial_gen = gba_rewind_serial_gen;
+      rw_serial_frames++;
+      if (!rw_quiet)
+      {
+         rw_barriers_serial++;
+         rw_quiet_why = FE_RW_LIMIT_SERIAL;
+      }
+      rw_quiet = rw_opt.save_quiet;
+      rw_barrier(rw_quiet_why);
+      return;
+   }
+   if (rw_quiet)
+   {
+      /* Between the writes of a serial exchange, or just after the last
+       * one. */
+      rw_quiet--;
+      rw_barrier(rw_quiet_why);
+      return;
+   }
+   /* Test instrument: the image hashed for this frame is taken BEFORE a
+    * snapshot can be (which brings the clock's base up to the wall clock):
+    * it is the machine the frame left, which is what a re-run leaves. */
+   hash_ok = rw_hash_fp && rw_hash_state &&
+             gpsp_rewind_gather(rw_hash_state, gpsp_rewind_state_size());
+   if (rw_opt.slack_margin_us)
+      fe_rewind_hint_busy(!rw_ff && rw_frame_core_us &&
+                          rw_frame_core_us + rw_opt.slack_margin_us +
+                          rw_snap_est_us >
+                          (uint32_t)(1000000.0 / FE_GBA_FPS));
+   if (rw_bk_carry)
+   {
+      /* The first frame of a history: what the chip was doing just before
+       * it is not in the log of frames. */
+      rw_bk_carry = 0;
+      if (rw_bk_quiet < rw_opt.save_quiet)
+         bk_flags |= FE_RW_IN_BUSY;
+   }
+   fe_rewind_frame((rw_mask & FE_RW_IN_KEYS) | bk_flags,
+                   (tee ? rw_cap_aud_n : 0) |
+                   (tee && !has_pic ? FE_RW_NOPIC : 0));
+   {
+      /* What a snapshot costs here, for the busy test: the last one, or a
+       * slowly forgotten larger one. */
+      const fe_rewind_stats *t = fe_rewind_get_stats();
+      static uint64_t us_seen;
+      if (t->snapshots != rw_snap_seen)
+      {
+         uint32_t last = (uint32_t)(t->gather_us + t->pack_us - us_seen);
+         rw_snap_est_us -= rw_snap_est_us / 8;
+         if (last > rw_snap_est_us)
+            rw_snap_est_us = last;
+         rw_snap_seen = t->snapshots;
+      }
+      us_seen = t->gather_us + t->pack_us;
+   }
+   if (fe_rewind_frame_now() > rw_redo_high)
+      rw_redo_high = fe_rewind_frame_now();
+   if (rw_hash_fp)
+   {
+      uint32_t sc = 0, vc = 0, bc;
+      char vtxt[12];
+      if (hash_ok)
+      {
+         /* Test instrument: RW_DUMP_FRAME=n writes the image hashed for
+          * timeline frame n, every time that frame is run, to
+          * RW_DUMP_DIR/state_<n>_<k>.bin -- to see WHICH bytes differ when
+          * rewind_check.py says a state does. */
+         static long dump_frame = -2;
+         static unsigned dump_k;
+         sc = fe_crc32(0, rw_hash_state, gpsp_rewind_state_size());
+         if (dump_frame == -2)
+            dump_frame = rw_opt.dump_frame ? (long)rw_opt.dump_frame :
+               getenv("RW_DUMP_FRAME") ? atol(getenv("RW_DUMP_FRAME")) : -1;
+         if (dump_frame >= 0 && (long)fe_rewind_frame_now() == dump_frame)
+         {
+            char path[600];
+            FILE *df;
+            snprintf(path, sizeof(path), "%s/state_%ld_%u.bin",
+                     rw_opt.dump_dir ? rw_opt.dump_dir :
+                     getenv("RW_DUMP_DIR") ? getenv("RW_DUMP_DIR") : ".",
+                     dump_frame, dump_k++);
+            df = fopen(path, "wb");
+            if (df)
+            {
+               fwrite(rw_hash_state, 1, gpsp_rewind_state_size(), df);
+               fclose(df);
+            }
+            /* ...and its picture, 240x160 RGB565, as pix_<n>_<k>.bin */
+            snprintf(path, sizeof(path), "%s/pix_%ld_%u.bin",
+                     rw_opt.dump_dir ? rw_opt.dump_dir :
+                     getenv("RW_DUMP_DIR") ? getenv("RW_DUMP_DIR") : ".",
+                     dump_frame, dump_k - 1);
+            df = last_frame ? fopen(path, "wb") : NULL;
+            if (df)
+            {
+               unsigned y;
+               for (y = 0; y < FE_GBA_HEIGHT; y++)
+                  fwrite((const uint8_t *)last_frame + y * last_pitch, 1,
+                         FE_GBA_WIDTH * 2, df);
+               fclose(df);
+            }
+         }
+      }
+      /* The picture hashed is the one the rewind KEEPS for this frame (what
+       * it will show when the frame is gone back over).  On a platform
+       * whose pictures come from elsewhere than the core (the PSP's second
+       * core: pix_begin / pix_end) the core's own buffer is not drawn at
+       * all, and hashing it compared every backward picture with something
+       * nobody saw (1388 of 1388 "wrong" on a PSP-3000).  A frame with no
+       * kept picture has no hash there ("--------"); the checker says how
+       * many. */
+      {
+         const uint16_t *hp = (tee && has_pic)
+            ? (rw_play_ext ? rw_play_ext_pix : rw_cap_pix) : NULL;
+         unsigned y;
+         if (hp)
+         {
+            for (y = 0; y < FE_GBA_HEIGHT; y++)
+               vc = fe_crc32(vc, hp + y * rw_pitch, FE_GBA_WIDTH * 2);
+            snprintf(vtxt, sizeof(vtxt), "%08x", (unsigned)vc);
+         }
+         else if (rw_opt.pix_begin)
+            snprintf(vtxt, sizeof(vtxt), "--------");
+         else
+         {
+            if (last_frame)
+               for (y = 0; y < FE_GBA_HEIGHT; y++)
+                  vc = fe_crc32(vc, (const uint8_t *)last_frame + y * last_pitch,
+                                FE_GBA_WIDTH * 2);
+            snprintf(vtxt, sizeof(vtxt), "%08x", (unsigned)vc);
+         }
+      }
+      /* ...and the cartridge save as it is in memory (a rewind never
+       * changes it), how many of its bytes the game has read so far, and
+       * whether this frame is one the chip was busy in. */
+      bc = rw_sav_crc();
+      fprintf(rw_hash_fp, "F %u %08x %s %08x %u %04x %08x %u %u\n",
+              (unsigned)fe_rewind_frame_now(), (unsigned)sc, vtxt,
+              (unsigned)rw_crc_rev(rw_test_aud, rw_test_aud_n),
+              (unsigned)rw_test_aud_n, (unsigned)(rw_mask & FE_RW_IN_KEYS),
+              (unsigned)bc, (unsigned)gba_rewind_rlog_end,
+              (unsigned)((bk_flags & FE_RW_IN_BUSY) != 0));
+   }
+}
+
+/* The options, with the defaults and the limits applied, as a core config
+ * (its spans are set by the caller). */
+static void rw_config(const fe_host_rewind_opts *o, fe_host_rewind_opts *out,
+                      fe_rewind_config *c)
+{
+   *out = *o;
+   if (!out->ring_bytes)
+   {
+      /* 1..8 MiB (docs/REWIND.md): 1 so a PSP-1000 can take part, 8
+       * because past that the ring is no longer what limits a rewind.
+       * The PSP's Settings offer 1, 2 and 4 and always name one; the 2
+       * below is only what a caller that names NO size gets (the desktop
+       * twin and its records). */
+      uint32_t mib = out->ring_mib ? out->ring_mib : 2;
+      if (mib < 1) mib = 1;
+      if (mib > 8) mib = 8;
+      out->ring_mib = mib;
+      out->ring_bytes = mib << 20;
+   }
+   if (!out->interval)   out->interval   = 6;
+   if (!out->save_quiet) out->save_quiet = 60;
+   {
+      /* the read log: a power of two, 16 KiB .. 1 MiB */
+      uint32_t b = 16384u;
+      while (b < (out->rlog_bytes ? out->rlog_bytes : 131072u) && b < (1u << 20))
+         b <<= 1;
+      out->rlog_bytes = b;
+      rw_rlog_bytes = b;
+   }
+   if (!out->max_frames) out->max_frames = 16384;
+
+   memset(c, 0, sizeof(*c));
+   c->ring_bytes   = out->ring_bytes;
+   c->interval     = out->interval;
+   if (!out->pix_pitch) out->pix_pitch = FE_GBA_WIDTH;
+   if (!out->pix_rows)  out->pix_rows  = FE_GBA_HEIGHT;
+   if (out->slack_margin_us && !out->max_span)
+      out->max_span = 8 * out->interval;
+   c->pace_us      = out->pace_us;
+   c->max_span     = out->max_span;
+   c->max_frames   = out->max_frames;
+   c->frame_pixels = out->no_capture ? 1 : out->pix_pitch * out->pix_rows;
+   c->ref_touched  = rw_ref_touched;
+   c->snapshot_done = rw_snapshot_done;
+   c->audio_cap    = out->no_capture ? 1 : RW_AUD_CAP;
+   c->burst        = out->burst;
+   c->tick_budget_us = out->tick_budget_us;
+   c->verify       = out->verify;
+   c->gather       = rw_gather;
+   c->restore      = rw_restore;
+   c->run          = rw_run;
+   c->now_us       = host.time_us ? rw_now : NULL;
+}
+
+static size_t rw_mem_bytes;     /* size of rw_mem */
+
+/* ---- where the memory comes from ------------------------------------------
+ * The host's small buffers (rw_buf: the rest of the state, the sound in
+ * flight, and in the image layout the image), the core's block (rw_mem: the
+ * reference image, the logs, the pictures) and the delta ring.
+ *
+ * Without a pool: three heap blocks.  With one (fe_host_rewind_set_pool)
+ * rw_buf and rw_mem are carved from its END downwards and the ring takes
+ * what is left of the pool; only the part of the ring that does not fit
+ * goes to the heap (the ring may be in two pieces, fe_rewind_config).  So
+ * the heap pays exactly for the megabytes of history beyond what the pool
+ * holds, and nothing when the pool holds it all.
+ *
+ * The in-place layout needs a save-state image as scratch (the writers are
+ * run into it and the few KiB between the arrays gathered from it).  That is
+ * state_buf, the static buffer every state save and load already goes
+ * through: it costs nothing, and anything else that writes it leaves a
+ * valid image of the same layout behind.
+ *
+ * Sizes are those of the image layout, the larger of the two, so a reserve
+ * before the game is loaded and the enable after it agree.
+ *
+ * Nothing in a pool survives fe_host_rewind_suspend: no pointer into it is
+ * kept, and resume builds everything again from the options. */
+static uint8_t *rw_pool_base, *rw_pool_top, *rw_pool_low;
+static int      rw_buf_pool, rw_mem_pool;   /* the block is pool memory */
+static uint8_t *rw_ring_pool;               /* the ring's piece in the pool */
+static size_t   rw_ring_pool_bytes;
+static uint8_t *rw_ring_heap;               /* its piece (or all) on the heap */
+static size_t   rw_ring_heap_bytes;
+static int      rw_suspended;               /* rw_opt is to be resumed */
+static uint32_t rw_resume_frame;            /* the timeline goes on from here */
+
+void fe_host_rewind_set_pool(void *base, size_t bytes)
+{
+   if (rw_on)
+      return;                   /* only between suspend and resume, or before */
+   rw_pool_base = (uint8_t *)base;
+   rw_pool_top  = base ? (uint8_t *)base + (bytes & ~(size_t)63) : NULL;
+   rw_pool_low  = rw_pool_top;
+}
+
+void *fe_host_rewind_pool_low(void)
+{
+   return rw_pool_low;
+}
+
+/* n bytes from the end of the pool, 64-byte aligned; NULL = no room. */
+static uint8_t *rw_pool_take(size_t n)
+{
+   n = (n + 63u) & ~(size_t)63u;
+   if (!rw_pool_base || (size_t)(rw_pool_low - rw_pool_base) < n)
+      return NULL;
+   rw_pool_low -= n;
+   return rw_pool_low;
+}
+
+static size_t rw_buf_need(int inplace)
+{
+   return RW_REST_CAP + gpsp_rewind_audio_bytes() +
+          (inplace ? 0 : gpsp_rewind_state_size() + 8) + rw_rlog_bytes;
+}
+
+/* Everything, once: a second call finds it there.  cu: the configuration
+ * with the image layout's spans (the size to plan with).  On return
+ * *ring_bytes is the ring actually obtained (less than asked only if the
+ * heap refused its part).  0 = ok. */
+static int rw_mem_take(const fe_rewind_config *cu, int inplace,
+                       uint32_t *ring_bytes)
+{
+   fe_rewind_config t = *cu;
+   size_t fixed, buf = rw_buf_need(inplace);
+   uint32_t ring = cu->ring_bytes, a = 0, b;
+
+   if (rw_mem)
+   {
+      *ring_bytes = (uint32_t)(rw_ring_pool_bytes + rw_ring_heap_bytes);
+      return 0;
+   }
+   t.ring_mem = (void *)1;                    /* the size without the ring */
+   fixed = fe_rewind_mem_bytes(&t);
+   if (!fixed)
+      return -1;
+   rw_ring_pool = NULL;
+   rw_ring_pool_bytes = 0;
+
+   if (rw_pool_base && (size_t)(rw_pool_low - rw_pool_base) >=
+                       ((buf + 63u) & ~(size_t)63u) + ((fixed + 63u) & ~(size_t)63u))
+   {
+      size_t room;
+      rw_buf = rw_pool_take(buf);
+      rw_mem = rw_pool_take(fixed);
+      rw_buf_pool = rw_mem_pool = 1;
+      room = (size_t)(rw_pool_low - rw_pool_base) & ~(size_t)0xFFFF;
+      a = ring < room ? ring : (uint32_t)room;
+      b = ring - a;
+      if (rw_ring_heap && rw_ring_heap_bytes != b)
+      {
+         free(rw_ring_heap);                  /* (kept across a suspend) */
+         rw_ring_heap = NULL;
+         rw_ring_heap_bytes = 0;
+      }
+      if (b && !rw_ring_heap)
+      {
+         /* What the heap will not give is asked for again half a megabyte
+          * smaller, down to nothing: it used to be all or nothing, so a
+          * size the heap could not hold in full gave LESS history than a
+          * smaller setting (the pool's piece alone). */
+         while (b && !(rw_ring_heap = (uint8_t *)malloc(b)))
+            b = b > 524288u ? b - 524288u : 0;
+         rw_ring_heap_bytes = rw_ring_heap ? b : 0;
+      }
+      if (a)
+      {
+         rw_ring_pool = rw_pool_take(a);
+         rw_ring_pool_bytes = a;
+      }
+      if (!rw_ring_pool_bytes && !rw_ring_heap_bytes)
+      {
+         rw_buf = NULL;                       /* pool memory: nothing to free */
+         rw_mem = NULL;
+         rw_buf_pool = rw_mem_pool = 0;
+         return -1;
+      }
+   }
+   else
+   {
+      rw_buf_pool = rw_mem_pool = 0;
+      rw_buf = (uint8_t *)malloc(buf);
+      rw_mem = malloc(fixed);
+      if (rw_ring_heap && rw_ring_heap_bytes != ring)
+      {
+         free(rw_ring_heap);
+         rw_ring_heap = NULL;
+      }
+      if (!rw_ring_heap)
+         rw_ring_heap = (uint8_t *)malloc(ring);
+      rw_ring_heap_bytes = rw_ring_heap ? ring : 0;
+      if (!rw_buf || !rw_mem || !rw_ring_heap)
+      {
+         free(rw_buf);
+         free(rw_mem);
+         free(rw_ring_heap);
+         rw_buf = NULL;
+         rw_mem = NULL;
+         rw_ring_heap = NULL;
+         rw_ring_heap_bytes = 0;
+         return -1;
+      }
+   }
+   rw_buf_bytes = buf;
+   rw_mem_bytes = fixed;
+   *ring_bytes = (uint32_t)(rw_ring_pool_bytes + rw_ring_heap_bytes);
+   return 0;
+}
+
+static void rw_mem_drop(int keep_heap_ring)
+{
+   if (rw_mem && !rw_mem_pool)
+      free(rw_mem);
+   rw_mem = NULL;
+   rw_mem_pool = 0;
+   rw_mem_bytes = 0;
+   if (rw_buf && !rw_buf_pool)
+      free(rw_buf);
+   rw_buf = NULL;
+   rw_buf_pool = 0;
+   rw_buf_bytes = 0;
+   rw_ring_pool = NULL;
+   rw_ring_pool_bytes = 0;
+   gba_rewind_rlog = NULL;      /* (it was in rw_buf) */
+   rw_rlog = NULL;
+   rw_pos_cur = NULL;
+   if (!keep_heap_ring)
+   {
+      free(rw_ring_heap);
+      rw_ring_heap = NULL;
+      rw_ring_heap_bytes = 0;
+   }
+   rw_pool_base = rw_pool_top = rw_pool_low = NULL;
+}
+
+/* Where the ring is, for a core configuration. */
+static void rw_ring_place(fe_rewind_config *c, uint32_t ring_bytes)
+{
+   c->ring_bytes = ring_bytes;
+   c->ring_mem2 = NULL;
+   c->ring_split = ring_bytes;
+   if (rw_ring_pool_bytes)
+   {
+      c->ring_mem = rw_ring_pool;
+      if (rw_ring_heap_bytes)
+      {
+         c->ring_mem2 = rw_ring_heap;
+         c->ring_split = (uint32_t)rw_ring_pool_bytes;
+      }
+   }
+   else
+      c->ring_mem = rw_ring_heap;
+}
+
+static void rw_mem_evt(const char *what, int rc)
+{
+   (void)what; (void)rc;         /* (a build without the event log) */
+   fe_evt("%s buf=%u@%s mem=%u@%s ring=%u@pool+%u@heap pool=%08x..%08x "
+          "low=%08x %s", what, (unsigned)rw_buf_bytes,
+          rw_buf_pool ? "pool" : "heap", (unsigned)rw_mem_bytes,
+          rw_mem_pool ? "pool" : "heap", (unsigned)rw_ring_pool_bytes,
+          (unsigned)rw_ring_heap_bytes, (unsigned)(uintptr_t)rw_pool_base,
+          (unsigned)(uintptr_t)rw_pool_top, (unsigned)(uintptr_t)rw_pool_low,
+          rc == 0 ? "ok" : "FAILED");
+}
+
+/* One span over the whole serialised image. */
+static void rw_spans_image(void)
+{
+   rw_pieces = 0;
+   rw_maps = 0;
+   /* (before the buffers exist this only sizes things: cur is never read) */
+   rw_scratch = rw_buf ? rw_buf + RW_REST_CAP + gpsp_rewind_audio_bytes()
+                       : state_buf;
+   rw_spans[0].bytes = (uint32_t)gpsp_rewind_state_size() + 8;
+   rw_spans[0].cur = rw_scratch;
+   rw_pos_off = (uint32_t)gpsp_rewind_state_size();
+   rw_pos_cur = rw_buf ? (uint32_t *)(void *)(rw_scratch + rw_pos_off) : NULL;
+   rw_rlog = rw_buf ? rw_scratch + rw_pos_off + 8 : NULL;
+   rw_spans[0].dirty = NULL;
+   rw_spans[0].page_shift = 0;
+   rw_nspans = 1;
+}
+
+/* The rest, the six arrays where they lie, the sound.  0 = not possible
+ * here (then the image layout is used). */
+static int rw_spans_pieces(void)
+{
+   uint32_t i, n = 0;
+   rw_maps      = 0;
+   rw_scratch   = state_buf;      /* see "where the memory comes from" */
+   rw_rest      = rw_buf;
+   rw_aud       = rw_rest + RW_REST_CAP;
+   rw_aud_bytes = gpsp_rewind_audio_bytes();
+   rw_rest_bytes = gpsp_rewind_layout(rw_scratch, rw_arr);
+   /* (the read log's position rides at the end of the rest) */
+   rw_pos_off = rw_rest_bytes;
+   rw_pos_cur = (uint32_t *)(void *)(rw_rest + rw_pos_off);
+   rw_rlog = rw_rest + RW_REST_CAP + rw_aud_bytes;
+   if (rw_rest_bytes)
+      rw_rest_bytes += 8;
+   if (!rw_rest_bytes || rw_rest_bytes > RW_REST_CAP || (rw_pos_off & 3) ||
+       (rw_aud_bytes >> RW_AUD_PAGE) >= sizeof(rw_aud_map))
+      return 0;
+   for (i = 0; i < 6; i++)
+      if (((uintptr_t)rw_arr[i].live & 3) || (rw_arr[i].bytes & 3))
+         return 0;               /* compared by word: must be word-aligned */
+   memset(rw_rest, 0, RW_REST_CAP + rw_aud_bytes);
+   memset(rw_spans, 0, sizeof(rw_spans));
+   rw_spans[n].bytes = rw_rest_bytes;
+   rw_spans[n++].cur = rw_rest;
+   rw_off_ewram = rw_rest_bytes + rw_arr[0].bytes;
+   rw_off_vram  = rw_off_ewram + rw_arr[1].bytes;
+   for (i = 0; i < 6; i++)
+   {
+      rw_spans[n].bytes = rw_arr[i].bytes;
+      rw_spans[n].cur = rw_arr[i].live;
+      if (i == 1 && (rw_opt.dirty & 2) &&
+          rw_arr[i].bytes == sizeof(rw_ewram_map) << 10)
+      {
+         rw_spans[n].dirty = rw_ewram_map;     /* EWRAM, 1 KiB pages */
+         rw_spans[n].page_shift = 10;
+         rw_maps |= 2;
+      }
+      if (i == 2 && (rw_opt.dirty & 1) &&
+          rw_arr[i].bytes == sizeof(rw_vram_map) << 10)
+      {
+         rw_spans[n].dirty = rw_vram_map;      /* VRAM, 1 KiB pages */
+         rw_spans[n].page_shift = 10;
+         rw_maps |= 1;
+      }
+      n++;
+   }
+   rw_spans[n].bytes = rw_aud_bytes;
+   rw_spans[n].cur = rw_aud;
+   rw_spans[n].dirty = rw_aud_map;
+   rw_spans[n++].page_shift = RW_AUD_PAGE;
+   rw_nspans = n;
+   rw_aud_used = rw_aud_bytes;   /* nothing known about the buffer yet */
+   memset(rw_vram_map, 1, sizeof(rw_vram_map));
+   memset(rw_ewram_map, 1, sizeof(rw_ewram_map));
+   rw_pieces = 1;
+   return 1;
+}
+
+void fe_host_rewind_prepare(const fe_host_rewind_opts *o)
+{
+   gpsp_rewind_marks_want(o && o->inplace && o->dirty);
+}
+
+int fe_host_rewind_reserve(const fe_host_rewind_opts *o)
+{
+   fe_host_rewind_opts opt;
+   fe_rewind_config c;
+   uint32_t ring = 0;
+   int rc;
+
+   if (rw_on || rw_mem)
+      return -1;
+   fe_host_rewind_prepare(o);
+   /* Sized for the image layout, which is the larger of the two. */
+   rw_config(o, &opt, &c);
+   rw_spans_image();
+   c.spans = rw_spans;
+   c.nspans = rw_nspans;
+   rc = rw_mem_take(&c, opt.inplace, &ring);
+   rw_mem_evt("rewind_reserve", rc);
+   return rc;
+}
+
+int fe_host_rewind_enable(const fe_host_rewind_opts *o)
+{
+   fe_rewind_config c;
+   uint32_t s, state = 0, ring = 0;
+   int was_suspended;
+
+   if (rw_on || gb_family)
+      return -1;
+   rw_config(o, &rw_opt, &c);
+   rw_pitch = rw_opt.pix_pitch;
+   rw_spans_image();
+   c.spans = rw_spans;
+   c.nspans = rw_nspans;
+   if (rw_mem_take(&c, rw_opt.inplace, &ring) != 0)
+   {
+      rw_mem_drop(0);
+      rw_mem_evt("rewind_enable", -1);
+      return -1;
+   }
+   if (!rw_opt.inplace || !rw_spans_pieces())
+   {
+      if (rw_opt.inplace)
+      {
+         /* The in-place layout was asked for and is not possible here, and
+          * the buffers were sized without an image: not recording at all is
+          * the honest outcome. */
+         rw_mem_drop(0);
+         fe_evt("rewind_enable FAILED (in-place layout)");
+         return -1;
+      }
+      rw_spans_image();
+   }
+   c.spans = rw_spans;
+   c.nspans = rw_nspans;
+   for (s = 0; s < rw_nspans; s++)
+      state += rw_spans[s].bytes;
+   rw_ring_place(&c, ring);
+   rw_opt.ring_bytes = ring;
+   rw_ring_asked = rw_opt.ring_mib ? rw_opt.ring_mib * 1048576u : c.ring_bytes;
+   if (fe_rewind_init(&c, rw_mem, rw_mem_bytes) == 0)
+   {
+      fe_rewind_set_target(rw_opt.target_s, rw_opt.gap_max ? rw_opt.gap_max : 24);
+      rw_ring_granted = c.ring_bytes;
+      fe_evt("rewind_ring asked=%u granted=%u (pool %u + heap %u) target_s=%u",
+             (unsigned)rw_ring_asked, (unsigned)c.ring_bytes,
+             (unsigned)rw_ring_pool_bytes, (unsigned)rw_ring_heap_bytes,
+             (unsigned)rw_opt.target_s);
+   }
+   else
+   {
+      rw_mem_drop(0);
+      fe_evt("rewind_enable FAILED (init) mem=%u", (unsigned)rw_mem_bytes);
+      return -1;
+   }
+   rw_snapshot_done();
+   gpsp_rewind_mark_all();
+   gpsp_rewind_clock_mode(rw_opt.clock_frames);
+   was_suspended = rw_suspended;
+   rw_suspended = 0;
+   if (rw_opt.hash_path && !rw_hash_fp)
+   {
+      rw_hash_fp = fopen(rw_opt.hash_path, "w");
+      rw_hash_state = (uint8_t *)malloc(gpsp_rewind_state_size());
+   }
+   rw_on = 1;
+   gpsp_rewind_light = rw_opt.full_flush_restore ? 0 : 1;
+   rw_seen_gen = sram_gen_now();
+   rw_seen_cheat_gen = gba_rewind_cheat_gen;
+   rw_seen_serial_gen = gba_rewind_serial_gen;
+   rw_quiet = 0;
+   rw_poked = 0;
+   rw_ro_hits_seen = gba_rewind_backup_ro_hits;
+   /* The read log starts empty: nothing before this frame is re-run. */
+   gba_rewind_rlog_mask = rw_rlog_bytes - 1;
+   gba_rewind_rlog_pos = gba_rewind_rlog_end = rw_rlog_pos_seen = 0;
+   gba_rewind_bk_acc = 0;
+   gba_rewind_rlog_mutant = (uint32_t)rw_opt.sav_mutant & 3u;
+   memset(rw_rlog_cframe, 0, sizeof(rw_rlog_cframe));
+   rw_rlog_chunk = 0;
+   gba_rewind_rlog = rw_rlog;
+   rw_bk_carry = 1;
+   fe_rewind_set_noland((rw_opt.sav_mutant & 4) ? 0 : rw_opt.save_quiet);
+   if (rw_opt.gather_prof)
+      gpsp_rewind_gprof(NULL, rw_now);
+   /* The timeline starts at the frame count; after a suspend it goes on
+    * from the frame the machine was left at (the two differ once a rewind
+    * has gone back). */
+   fe_rewind_reset(was_suspended ? rw_resume_frame : frame_count);
+   rw_floor_frame = fe_rewind_frame_now();
+   rw_floor_why = was_suspended ? FE_RW_LIMIT_SLEEP : FE_RW_LIMIT_HISTORY;
+   if (was_suspended && rw_hash_fp)
+      fprintf(rw_hash_fp, "W %u\n", (unsigned)fe_rewind_frame_now());
+   rw_win_mark();
+   rw_mem_evt("rewind_mem", 0);
+   fe_evt("rewind_enable mem=%u+%u state=%u ring=%u interval=%u max_frames=%u "
+          "capture=%u burst=%u save_quiet=%u ff_rewindable=%d light=%d "
+          "inplace=%d dirty=%d pace_us=%u verify=%d fast_restore=%d "
+          "clock_frames=%d slack_us=%u max_span=%u marks=%d ext_pix=%d",
+          (unsigned)rw_mem_bytes, (unsigned)rw_buf_bytes, (unsigned)state,
+          (unsigned)c.ring_bytes,
+          (unsigned)c.interval, (unsigned)c.max_frames,
+          rw_opt.no_capture ? 0u :
+          (unsigned)(2u * c.interval * (c.frame_pixels * 2 + c.audio_cap * 4)),
+          (unsigned)(c.burst ? c.burst : 2),
+          (unsigned)rw_opt.save_quiet, rw_opt.ff_rewindable,
+          !rw_opt.full_flush_restore, rw_pieces, rw_maps,
+          (unsigned)c.pace_us, rw_opt.verify, rw_opt.fast_restore,
+          rw_opt.clock_frames, (unsigned)rw_opt.slack_margin_us,
+          (unsigned)c.max_span, gpsp_rewind_marks_ok(),
+          rw_opt.pix_begin != NULL);
+   return 0;
+}
+
+void fe_host_rewind_suspend(void)
+{
+   if (!rw_on)
+      return;
+   fe_evt("rewind_suspend history_frames=%u",
+          (unsigned)(fe_rewind_frame_now() - fe_rewind_frame_oldest()));
+   /* Not rw_shutdown: no run totals, the test files stay open, and the
+    * options stay for the resume.
+    *
+    * If a rewind was on screen the machine is not at the frame shown but
+    * within two capture windows of it, re-running.  Bringing it there
+    * would mean emulating frames from inside a power callback; instead
+    * play goes on from where the machine IS.  The player loses the last
+    * fraction of a second of a rewind he was still holding when the lid
+    * closed. */
+   if (rw_gesture_live())
+   {
+      /* NOT landed (fe_host_rewind_land was not called, or ran out of
+       * budget).  The machine's own frame decides: */
+      int bad = rw_distrust || fe_rewind_mach_noland();
+      fe_evt("rewind_suspend_unlanded mach=%u now=%u top=%u vetted=%d",
+             (unsigned)fe_rewind_frame_mach(), (unsigned)fe_rewind_frame_now(),
+             (unsigned)fe_rewind_frame_top(), !bad);
+      if (bad)
+         rw_reset_owed = 1;    /* inside an old save: it may not go on */
+      else
+         rw_unlanded_ok++;
+   }
+   rw_distrust = 0;
+   rw_resume_frame = fe_rewind_frame_mach();
+   gpsp_rewind_clock_mode(0);
+   if (rw_redo_high > rw_resume_frame)
+      rw_redo_high = rw_resume_frame;   /* test: the input log is gone too */
+   rw_on = 0;
+   rw_mask_on = 0;
+   rw_tee = 0;
+   rw_gesture = 0;
+   rw_present_valid = 0;
+   rw_mem_drop(1);
+   rw_suspended = 1;
+}
+
+int fe_host_rewind_resume(void *base, size_t bytes)
+{
+   fe_host_rewind_opts o;
+   if (!rw_suspended || rw_on)
+      return -1;
+   o = rw_opt;
+   rw_reset_if_owed("resume");
+   fe_host_rewind_set_pool(base, bytes);
+   /* enable opens the test log again: keep the one that is open */
+   o.hash_path = NULL;
+   if (fe_host_rewind_enable(&o) != 0)
+   {
+      rw_suspended = 0;
+      return -1;
+   }
+   fe_evt("rewind_resume ok");
+   return 0;
+}
+
+unsigned fe_host_rewind_resets(void)
+{
+   return rw_unvetted_resets;
+}
+
+void fe_host_rewind_distrust(void)
+{
+   rw_distrust = 1;
+}
+
+void fe_host_rewind_abandon(void)
+{
+   rw_reset_if_owed("abandon");
+   rw_suspended = 0;
+}
+
+/* Emulation thread.  The game may not go on from where the machine was
+ * left: start it again from the cartridge.  The save in memory is the
+ * game's last whole save (no re-run frame wrote it) and reset_gba leaves it
+ * alone, so this is a console switched off and on, not a lost save. */
+static void rw_reset_if_owed(const char *where)
+{
+   (void)where;
+   if (!rw_reset_owed)
+      return;
+   rw_reset_owed = 0;
+   rw_unvetted_resets++;
+   fe_evt("rewind_unvetted_reset at=%s frame=%u (the history ended with the "
+          "machine inside an old save sequence)", where, (unsigned)frame_count);
+   gba_rewind_backup_ro = 0;
+   retro_reset();
+   rw_bk_quiet = 0xFFFF;        /* another machine: its chip is idle */
+   rw_wr_quiet = 0xFFFF;
+   if (rw_on)
+      rw_barrier(FE_RW_LIMIT_SLEEP);
+}
+
+/* ---- measurement lines ----------------------------------------------------
+ * rewind_win, on the heartbeat cadence (with EVT fps and EVT core_prof): what
+ * recording cost in the window.  core_prof times retro_run; work_us is all
+ * the rewind does to a normal frame outside it (gather and pack included),
+ * so the overhead per frame is work_us / frames.
+ * rewind_gesture, when play resumes after a rewind: what the rewind cost. */
+static uint64_t rw_work_us;
+static uint32_t rw_work_max_us;
+static struct
+{
+   unsigned frame;
+   uint32_t snaps, evicted;
+   uint64_t bytes, gather_us, pack_us, work_us, words_read, words_total;
+} rw_w0;
+static struct
+{
+   uint32_t show, stall, limit, catchup, restores, steps, replayed;
+   uint64_t restore_us, unpack_us, replay_us, tick_us;
+   unsigned tick_n;
+   uint32_t from;
+} rw_g0;
+static uint32_t rw_g_tick_max, rw_g_restore_max;
+static uint32_t rw_verify_seen;
+
+static void rw_win_mark(void)
+{
+   const fe_rewind_stats *t = fe_rewind_get_stats();
+   rw_w0.frame     = frame_count;
+   rw_w0.snaps     = t->snapshots;
+   rw_w0.evicted   = t->evicted;
+   rw_w0.bytes     = t->packed_bytes;
+   rw_w0.gather_us = t->gather_us;
+   rw_w0.pack_us   = t->pack_us;
+   rw_w0.work_us   = rw_work_us;
+   rw_w0.words_read  = t->words_read;
+   rw_w0.words_total = t->words_total;
+   rw_work_max_us  = 0;
+   fe_rewind_window_reset();
+}
+
+static void rw_win_evt(void)
+{
+   const fe_rewind_stats *t;
+   unsigned n;
+   if (!rw_on)
+      return;
+   t = fe_rewind_get_stats();
+   n = t->snapshots - rw_w0.snaps;
+   (void)n;
+   fe_evt("rewind_win frames=%u snaps=%u gather_us=%u/%u pack_us=%u/%u "
+          "work_us=%u/%u bytes=%u read_pct=%u evicted=%u ring_used=%u "
+          "records=%u history_frames=%u save_frames=%u closed_frames=%u "
+          "serial_frames=%u deferred=%u",
+          frame_count - rw_w0.frame, n,
+          n ? (unsigned)((t->gather_us - rw_w0.gather_us) / n) : 0,
+          t->gather_win_max_us,
+          n ? (unsigned)((t->pack_us - rw_w0.pack_us) / n) : 0,
+          t->pack_win_max_us,
+          (unsigned)(rw_work_us - rw_w0.work_us), rw_work_max_us,
+          (unsigned)(t->packed_bytes - rw_w0.bytes),
+          t->words_total != rw_w0.words_total
+             ? (unsigned)((t->words_read - rw_w0.words_read) * 100u /
+                          (t->words_total - rw_w0.words_total)) : 0u,
+          t->evicted - rw_w0.evicted,
+          (unsigned)fe_rewind_ring_used(), (unsigned)fe_rewind_ring_records(),
+          (unsigned)(fe_rewind_frame_now() - fe_rewind_frame_oldest()),
+          rw_save_write_frames - rw_w_save_write_frames,
+          rw_bk_busy_frames - rw_w_bk_busy_frames,
+          rw_serial_frames - rw_w_serial_frames,
+          t->deferred - rw_w_deferred);
+   /* How much can be rewound right now, and why not more: the frames held
+    * as time; what the ring was given against what was asked; the distance
+    * between snapshots in force; and the last thing that ended the
+    * history (why@frame; "history" = nothing has since boot). */
+   fe_evt("rewind_avail avail_ms=%u history_frames=%u ring_asked=%u "
+          "ring_granted=%u ring_used=%u gap_frames=%u bytes_per_snap=%u "
+          "last_drop=%s@%u drops: save=%u serial=%u cheat=%u",
+          (unsigned)((uint64_t)(fe_rewind_frame_now() -
+                                fe_rewind_frame_oldest()) * 1000000u / 59727u),
+          (unsigned)(fe_rewind_frame_now() - fe_rewind_frame_oldest()),
+          (unsigned)rw_ring_asked, (unsigned)rw_ring_granted,
+          (unsigned)fe_rewind_ring_used(), (unsigned)fe_rewind_gap(),
+          n ? (unsigned)((t->packed_bytes - rw_w0.bytes) / n) : 0,
+          rw_why_name[rw_floor_why < FE_RW_LIMIT_N ? rw_floor_why : 4],
+          (unsigned)rw_floor_frame, rw_rlog_trims + rw_rlog_resets, rw_barriers_serial,
+          rw_barriers_cheat);
+   rw_w_deferred = t->deferred;
+#ifdef REWIND_COUNT
+   {
+      extern uint32_t gba_rewind_cnt[2];
+      static uint32_t c0[2];
+      unsigned fr = frame_count - rw_w0.frame;
+      fe_evt("rewind_marks frames=%u ewram_stores=%u vram_stores=%u "
+             "per_frame=%u/%u", fr, gba_rewind_cnt[0] - c0[0],
+             gba_rewind_cnt[1] - c0[1],
+             fr ? (gba_rewind_cnt[0] - c0[0]) / fr : 0,
+             fr ? (gba_rewind_cnt[1] - c0[1]) / fr : 0);
+      c0[0] = gba_rewind_cnt[0];
+      c0[1] = gba_rewind_cnt[1];
+   }
+#endif
+   rw_w_serial_frames = rw_serial_frames;
+   rw_w_save_write_frames = rw_save_write_frames;
+   rw_w_bk_busy_frames = rw_bk_busy_frames;
+   if (rw_opt.verify)
+   {
+      if (t->verify_bad_words != rw_verify_seen)
+         fe_evt("rewind_verify_fail snaps=%u words=%u first_off=%u "
+                "(a written page was called clean)",
+                t->verify_bad_snaps, t->verify_bad_words, t->verify_first_off);
+      rw_verify_seen = t->verify_bad_words;
+   }
+   if (rw_opt.gather_prof && !rw_pieces)
+   {
+      /* Where the serialised gather's time goes (libretro.c): clearing the
+       * image, the save-state writers, the sound in flight. */
+      uint32_t g[4];
+      gpsp_rewind_gprof(g, NULL);
+      if (g[0])
+         fe_evt("rewind_gprof n=%u clear_us=%u save_us=%u sound_us=%u",
+                g[0], g[1] / g[0], g[2] / g[0], g[3] / g[0]);
+   }
+   rw_win_mark();
+}
+
+/* A rewind's ticks never block, so the save writer (below main) would not
+ * run for as long as the control is held: on a PSP-3000 a save made just
+ * before a hold stayed half written on the stick for 20 to 27 s.  The save
+ * in memory cannot change during a rewind (it is write-protected), so there
+ * is nothing to wait for: at the first tick of a press main sleeps until
+ * the pending save is on the stick, for at most a quarter of a second (the
+ * ring is not shown yet; a tap pays this only right after a save), and
+ * every further tick gives the writer one sleep while anything is still
+ * pending.  1 = it slept. */
+static unsigned rw_flush_engage_waits, rw_flush_tick_yields;
+static int rw_denied_now;
+static uint32_t rw_flush_engage_max_us;
+static int rw_flush_help(int engage)
+{
+   uint64_t t0;
+   if (!host_io || gb_family || !&backup_write_gen || !host.save_path)
+      return 0;
+   if (sram_disk_gen == backup_write_gen)
+      return 0;
+   if (!sram_scan_gen_valid || sram_scan_gen != backup_write_gen || !sram_have_blk)
+      if (!sram_scan_req)
+         sram_scan_req = 1;
+   t0 = host.time_us ? host.time_us() : 0;
+   if (!engage)
+   {
+      rw_flush_tick_yields++;
+      host_io->wake();
+      host_io->yield();
+      return 1;
+   }
+   rw_flush_engage_waits++;
+   {
+      unsigned n = 0;
+      while (sram_disk_gen != backup_write_gen && n++ < 2000 &&
+             (!t0 || host.time_us() - t0 < 250000u))
+      {
+         host_io->wake();
+         host_io->yield();
+      }
+   }
+   if (t0)
+   {
+      uint32_t d = (uint32_t)(host.time_us() - t0);
+      if (d > rw_flush_engage_max_us)
+         rw_flush_engage_max_us = d;
+      fe_evt("rewind_flush_wait ms=%u on_disk=%d", (unsigned)(d / 1000u),
+             sram_disk_gen == backup_write_gen);
+   }
+   return 1;
+}
+
+static void rw_gesture_mark(void)
+{
+   const fe_rewind_stats *t = fe_rewind_get_stats();
+   rw_g0.show       = t->ticks_show;
+   rw_g0.stall      = t->ticks_stall;
+   rw_g0.limit      = t->ticks_limit;
+   rw_g0.catchup    = t->ticks_catchup;
+   rw_g0.restores   = t->restores;
+   rw_g0.steps      = t->steps_back;
+   rw_g0.replayed   = t->replayed;
+   rw_g0.restore_us = t->restore_us;
+   rw_g0.unpack_us  = t->unpack_us;
+   rw_g0.replay_us  = t->replay_us;
+   rw_g0.tick_us    = rw_tick_us;
+   rw_g0.tick_n     = rw_tick_n;
+   rw_g0.from       = fe_rewind_frame_now();
+   rw_g_tick_max    = 0;
+   rw_g_restore_max = 0;
+}
+
+extern void gpsp_rewind_rprof(uint32_t out[9]);
+
+static void rw_gesture_evt(void)
+{
+   const fe_rewind_stats *t = fe_rewind_get_stats();
+   unsigned ticks = rw_tick_n - rw_g0.tick_n;
+   unsigned res = t->restores - rw_g0.restores;
+   unsigned rep = t->replayed - rw_g0.replayed;
+   unsigned stp = t->steps_back - rw_g0.steps;
+   (void)ticks; (void)res; (void)rep; (void)stp;
+   fe_evt("rewind_gesture from=%u to=%u ticks=%u show=%u stall=%u limit=%u "
+          "catchup=%u tick_us=%u/%u restores=%u restore_us=%u unpack_us=%u "
+          "replayed=%u replay_us=%u frames_per_tick_max=%u "
+          "restore_kb=%u restore_arrays_us=%u code_kept=%u/%u nopic=%u "
+          "resnaps=%u",
+          (unsigned)rw_g0.from, (unsigned)fe_rewind_frame_now(), ticks,
+          t->ticks_show - rw_g0.show, t->ticks_stall - rw_g0.stall,
+          t->ticks_limit - rw_g0.limit, t->ticks_catchup - rw_g0.catchup,
+          ticks ? (unsigned)((rw_tick_us - rw_g0.tick_us) / ticks) : 0,
+          rw_g_tick_max,
+          res, res ? (unsigned)((t->restore_us - rw_g0.restore_us) / res) : 0,
+          stp ? (unsigned)((t->unpack_us - rw_g0.unpack_us) / stp) : 0,
+          rep, rep ? (unsigned)((t->replay_us - rw_g0.replay_us) / rep) : 0,
+          t->tick_frames_max,
+          rw_restore_n ? (unsigned)(rw_restore_copied / rw_restore_n / 1024) : 0,
+          rw_restore_n ? (unsigned)(rw_restore_arr_us / rw_restore_n) : 0,
+          rw_restore_kept, rw_restore_n, rw_nopic_shown, t->resnaps);
+   fe_evt("rewind_cost frame_us=%u rerun_pic_us=%u rerun_head_us=%u "
+          "sound_mode=%d synth_skipped=%u head_skipped=%u", rw_e_frame,
+          rw_e_pic, rw_e_head, rw_opt.sound_mode, rw_synth_skipped,
+          rw_head_skipped);
+   if (rw_opt.gather_prof)
+   {
+      /* Where a restore's time goes, part by part (means over the restores
+       * since the last line; restore_us above is their sum plus the
+       * timers).  load = the state loader on everything but the arrays,
+       * split below it into cpu / input+main / memory / sound / tail. */
+      uint32_t g[9];
+      static uint32_t n0;
+      static uint64_t arr0;
+      uint32_t rn = rw_restore_n - n0;
+      (void)rn; (void)arr0;
+      gpsp_rewind_rprof(g);
+      if (g[0])
+         fe_evt("rewind_rprof n=%u jit_close_us=%u arrays_us=%u verify_us=%u "
+                "rest_copy_us=%u sound_clear_us=%u load_us=%u "
+                "(cpu=%u inmain=%u memory=%u sound=%u tail=%u) maps_us=%u "
+                "audio_us=%u", g[0],
+                (unsigned)(rw_rs_jit_us / g[0]),
+                rn ? (unsigned)((rw_restore_arr_us - arr0) / rn) : 0,
+                (unsigned)(rw_rs_verify_us / g[0]),
+                g[3] / g[0], g[1] / g[0], g[2] / g[0],
+                g[4] / g[0], g[5] / g[0], g[6] / g[0], g[7] / g[0],
+                g[8] / g[0],
+                (unsigned)(rw_rs_maps_us / g[0]),
+                (unsigned)(rw_rs_aud_us / g[0]));
+      n0 = rw_restore_n;
+      arr0 = rw_restore_arr_us;
+      rw_rs_jit_us = rw_rs_verify_us = rw_rs_maps_us = rw_rs_aud_us = 0;
+   }
+}
+
+static uint32_t rw_stepped;
+
+int fe_host_rewind_tick(int held)
+{
+   return fe_host_rewind_tick_step(held, 1);
+}
+
+void fe_host_rewind_set_tick_budget(uint32_t us)
+{
+   if (rw_on)
+      fe_rewind_set_budget(us);
+}
+
+void fe_host_rewind_set_head_skip(int on)
+{
+   rw_head_skip = on;
+}
+
+void fe_host_rewind_set_cadence(uint32_t stride, int quiet)
+{
+   if (!rw_on)
+      return;
+   fe_rewind_set_stride(stride);
+   rw_cad_quiet = quiet;
+}
+
+int fe_host_rewind_tick_step(int held, uint32_t step)
+{
+   fe_rewind_shown s;
+   uint64_t t0;
+   int r;
+
+   if (fe_host_rewind_blocked())
+   {
+      /* Refused from here on (a link session began).  If that happened in
+       * the middle of a rewind the machine is on some old frame: the
+       * control is let go and the rewind LANDS first, as after any release
+       * (returning FE_RW_PLAY here let the game go on from that frame, with
+       * the save writable again). */
+      if (!rw_on || !rw_gesture_live())
+         return FE_RW_PLAY;
+      held = 0;
+   }
+   if (held && !rw_gesture && rw_wr_quiet < rw_opt.save_quiet &&
+       !(rw_opt.sav_mutant & 4))
+   {
+      /* the game is saving: not now (see rw_wr_quiet) */
+      if (!rw_denied_now)
+      {
+         rw_denied_now = 1;
+         rw_denied_saving++;
+         fe_evt("rewind_denied why=saving frames_since_write=%u",
+                (unsigned)rw_wr_quiet);
+      }
+      held = 0;
+   }
+   else if (!held)
+      rw_denied_now = 0;
+   if (held && !rw_gesture)
+   {
+      (void)rw_flush_help(1);   /* the game's own save reaches the stick first */
+      rw_gesture_mark();        /* before the tick: its work counts too */
+   }
+   else if (held || rw_gesture)
+      (void)rw_flush_help(0);
+   t0 = rw_now();
+   s.pix = NULL;
+   rw_held_tick = held;
+   r = fe_rewind_tick_step(held, step, &s, &rw_stepped);
+   rw_held_tick = 0;
+   if (gba_rewind_backup_ro_hits != rw_ro_hits_seen)
+   {
+      /* Re-run frames passed over save writes: refused, as they must be
+       * (the save is the game's last word, not the rewind's). */
+      rw_replay_save_hits += gba_rewind_backup_ro_hits - rw_ro_hits_seen;
+      rw_ro_hits_seen = gba_rewind_backup_ro_hits;
+   }
+   if (gba_rewind_rlog_miss != rw_rlog_miss_seen)
+   {
+      /* A re-run frame read save bytes the first pass did not read: it is
+       * not the frame it claims to be (or the log was cut under it).  It
+       * got the live bytes.  Said, counted; must not happen. */
+      rw_rlog_miss_seen = gba_rewind_rlog_miss;
+      fe_evt("rewind_save_read_unlogged n=%u frame=%u",
+             (unsigned)gba_rewind_rlog_miss, (unsigned)fe_rewind_frame_mach());
+   }
+   if (r == FE_RW_PLAY)
+   {
+      /* (a snapshot that was due is taken in there too: part of what
+       * recording costs a normal frame) */
+      if (host.time_us)
+      {
+         uint32_t d = (uint32_t)(rw_now() - t0);
+         rw_work_us += d;
+         if (d > rw_work_max_us)
+            rw_work_max_us = d;
+      }
+      rw_limit_said = 0;
+      if (rw_gesture)
+      {
+         /* Play resumes, from the frame on screen. */
+         rw_gesture = 0;
+         rw_jit_close();
+         rw_gesture_evt();
+         /* From here on the save is read as it is, and logged from where
+          * the frames just re-run left the log. */
+         gba_rewind_rlog_end = gba_rewind_rlog_pos;
+         rw_rlog_pos_seen = gba_rewind_rlog_pos;
+         /* (the log's end went back with the timeline: so does the chunk it
+          * is in; the frames noted for the chunks up to it still hold) */
+         rw_rlog_chunk = gba_rewind_rlog_pos
+            ? (gba_rewind_rlog_pos - 1) / (rw_rlog_bytes / RW_RLOG_CHUNKS) : 0;
+         gba_rewind_bk_acc = 0;
+         if (rw_hash_fp)
+            fprintf(rw_hash_fp, "E %u %u %08x\n",
+                    (unsigned)fe_rewind_frame_now(),
+                    (unsigned)gba_rewind_backup_busy(), (unsigned)rw_sav_crc());
+      }
+      return r;
+   }
+   if (fe_rewind_at_limit())
+   {
+      /* Held with nothing earlier to show: say once per press where the
+       * history starts and why (the readout's stop state). */
+      if (!rw_limit_said)
+      {
+         const char *const *why = rw_why_name;
+         (void)why;
+         fe_host_rewind_info inf;
+         fe_host_rewind_info_get(&inf);
+         fe_evt("rewind_limit frame=%u why=%s", (unsigned)fe_rewind_frame_now(),
+                why[inf.limit_reason]);
+         rw_limit_said = 1;
+      }
+   }
+   else if (!held)
+      rw_limit_said = 0;
+   rw_gesture = 1;
+   if (rw_opt.no_capture)
+   {
+      /* Nothing was kept: the picture holds.  The timeline still moved. */
+      if (r == FE_RW_SHOW && rw_hash_fp)
+         fprintf(rw_hash_fp, "S %u\n", (unsigned)s.frame);
+   }
+   else if (r == FE_RW_SHOW)
+   {
+      if (s.pix)
+      {
+         unsigned y;
+         uint32_t vc = 0;
+         if (!rw_opt.show || rw_hash_fp)
+            for (y = 0; y < FE_GBA_HEIGHT; y++)
+            {
+               memcpy(rw_present + y * FE_GBA_WIDTH, s.pix + y * rw_pitch,
+                      FE_GBA_WIDTH * 2);
+               vc = fe_crc32(vc, s.pix + y * rw_pitch, FE_GBA_WIDTH * 2);
+            }
+         rw_present_valid = 1;
+         last_frame = rw_present;
+         last_pitch = FE_GBA_WIDTH * 2;
+         if (rw_hash_fp && (rw_opt.sound_mode || s.pix_frame != s.frame))
+            /* (a rewind that keeps no sound, or a picture every few
+             * frames: the picture only, and which frame it is of) */
+            fprintf(rw_hash_fp, "R %u %08x silent 0 %u\n", (unsigned)s.frame,
+                    (unsigned)vc, (unsigned)s.pix_frame);
+         else if (rw_hash_fp)
+            fprintf(rw_hash_fp, "R %u %08x %08x %u\n", (unsigned)s.frame,
+                    (unsigned)vc, (unsigned)fe_crc32(0, s.aud, s.aud_n * 4),
+                    (unsigned)s.aud_n);
+      }
+      else
+      {
+         rw_nopic_shown++;
+         if (rw_hash_fp)        /* a frame that kept no picture: a step */
+            fprintf(rw_hash_fp, "S %u\n", (unsigned)s.frame);
+      }
+      if (rw_opt.show)
+         rw_opt.show(s.pix);
+      if (host.audio_frames && s.aud_n && !rw_opt.sound_mode && !rw_cad_quiet)
+         host.audio_frames(s.aud, s.aud_n);
+   }
+   /* Every rewind tick presents, so the platform's readout stays live while
+    * the picture holds. */
+   if (host.video_frame && !rw_opt.no_capture && !rw_opt.show)
+      host.video_frame(rw_present_valid ? rw_present : NULL, FE_GBA_WIDTH,
+                       FE_GBA_HEIGHT, FE_GBA_WIDTH * 2);
+   if (host.time_us)
+   {
+      uint32_t d = (uint32_t)(rw_now() - t0);
+      rw_tick_us += d;
+      rw_tick_n++;
+      if (d > rw_tick_max_us)
+         rw_tick_max_us = d;
+      if (d > rw_g_tick_max)
+         rw_g_tick_max = d;
+   }
+   return r;
+}
+
+/* A rewind is in progress: a tick has answered something other than PLAY
+ * and none has answered PLAY since.  (Not fe_rewind_active(): that stays
+ * true after the landing until the first frame is played.) */
+static int rw_gesture_live(void)
+{
+   return rw_gesture;
+}
+
+int fe_host_rewind_busy(void)
+{
+   return rw_on && rw_gesture_live();
+}
+
+int fe_host_rewind_unvetted(void)
+{
+   return rw_on && rw_gesture_live() && fe_rewind_mach_noland();
+}
+
+int fe_host_rewind_land(uint32_t budget_us)
+{
+   uint64_t t0 = rw_now();
+   uint32_t n = 0, from;
+   int ok = 1;
+
+   if (!rw_on || !rw_gesture_live())
+      return 1;
+   from = fe_rewind_frame_mach();
+   /* The control is up: every tick snaps `now` to a frame play may continue
+    * from and brings the machine nearer to it; FE_RW_PLAY = it is there. */
+   while (fe_host_rewind_tick_step(0, 1) != FE_RW_PLAY)
+   {
+      n++;
+      if ((budget_us && host.time_us &&
+           (uint32_t)(rw_now() - t0) >= budget_us) || n >= 100000u)
+      {
+         ok = 0;
+         break;
+      }
+   }
+   if (ok)
+      rw_lands++;
+   else
+      rw_land_fails++;
+   (void)from;
+   fe_evt("rewind_land ok=%d ticks=%u us=%u mach=%u->%u now=%u budget_us=%u",
+          ok, (unsigned)n, (unsigned)(rw_now() - t0), (unsigned)from,
+          (unsigned)fe_rewind_frame_mach(), (unsigned)fe_rewind_frame_now(),
+          (unsigned)budget_us);
+   return ok;
+}
+
+void fe_host_rewind_info_get(fe_host_rewind_info *out)
+{
+   memset(out, 0, sizeof(*out));
+   if (!rw_on)
+      return;
+   out->active       = fe_rewind_active();
+   out->back_frames  = fe_rewind_frame_top() - fe_rewind_frame_now();
+   out->avail_frames = fe_rewind_frame_now() - fe_rewind_frame_oldest();
+   out->ring_used    = fe_rewind_ring_used();
+   out->ring_bytes   = rw_opt.ring_bytes;
+   out->records      = fe_rewind_ring_records();
+   out->at_limit     = fe_rewind_at_limit();
+   out->stepped      = rw_stepped;
+   out->now_frame    = fe_rewind_frame_now();
+   out->mach_frame   = fe_rewind_frame_mach();
+   out->ring_granted  = rw_ring_granted;
+   out->frame_us      = rw_e_frame;
+   out->rerun_pic_us  = rw_e_pic;
+   out->rerun_head_us = rw_e_head;
+   {
+      const fe_rewind_stats *t = fe_rewind_get_stats();
+      out->restore_us = t->restores
+         ? (uint32_t)((t->restore_us + t->unpack_us) / t->restores) : 0;
+   }
+   /* The stop is the state load (or the cheat change, ...) only if the
+    * oldest frame still held is the one the history started at; once the
+    * ring has dropped older snapshots the stop is simply how much it holds. */
+   out->limit_reason = fe_rewind_frame_oldest() <= rw_floor_frame + 2
+                          ? rw_floor_why : FE_RW_LIMIT_HISTORY;
+}
+
+static void rw_shutdown(void)
+{
+   const fe_rewind_stats *t;
+   if (!rw_on)
+   {
+      /* reserved and never enabled, or suspended: nothing to report, but
+       * the memory and the pool still have to be let go */
+      rw_mem_drop(0);
+      rw_suspended = 0;
+      rw_reset_owed = 0;        /* the game is going away: nothing to reset */
+      gpsp_rewind_marks_want(0);
+      if (rw_hash_fp)
+         fclose(rw_hash_fp);
+      rw_hash_fp = NULL;
+      free(rw_hash_state);
+      rw_hash_state = NULL;
+      return;
+   }
+   t = fe_rewind_get_stats();
+   (void)t;
+   /* the history ended in the middle of a rewind: landed first / could not /
+    * went on from the machine's own (vetted) frame / the game was reset */
+   fe_evt("rewind_ends lands=%u land_fails=%u unlanded_ok=%u "
+          "unvetted_resets=%u", rw_lands, rw_land_fails, rw_unlanded_ok,
+          rw_unvetted_resets);
+   rw_reset_owed = 0;
+   fe_evt("rewind_stats snaps=%u bytes=%llu max=%u evicted=%u overflow=%u "
+          "gather_us=%llu/%u pack_us=%llu/%u ring_used=%u records=%u "
+          "history_frames=%u",
+          t->snapshots, (unsigned long long)t->packed_bytes, t->packed_max,
+          t->evicted, t->overflow_resets,
+          (unsigned long long)t->gather_us, t->gather_max_us,
+          (unsigned long long)t->pack_us, t->pack_max_us,
+          (unsigned)fe_rewind_ring_used(), (unsigned)fe_rewind_ring_records(),
+          (unsigned)(fe_rewind_frame_now() - fe_rewind_frame_oldest()));
+   fe_evt("rewind_use engages=%u show=%u stall=%u limit=%u catchup=%u "
+          "catchup_run_max=%u steps_back=%u unpack_us=%llu/%u restores=%u "
+          "restore_us=%llu/%u replayed=%u replay_us=%llu audio_clipped=%u "
+          "save_barriers=%u cheat_barriers=%u serial_barriers=%u "
+          "replay_save_hits=%u "
+          "jit_rom_emit=%llu jit_ram_emit=%llu "
+          "snaps_back=%u snaps_fwd=%u snap_max=%u",
+          t->engages, t->ticks_show, t->ticks_stall, t->ticks_limit,
+          t->ticks_catchup, t->catchup_run_max, t->steps_back,
+          (unsigned long long)t->unpack_us, t->unpack_max_us, t->restores,
+          (unsigned long long)t->restore_us, t->restore_max_us, t->replayed,
+          (unsigned long long)t->replay_us, t->audio_clipped, rw_rlog_trims + rw_rlog_resets,
+          rw_barriers_cheat, rw_barriers_serial, rw_replay_save_hits,
+          (unsigned long long)rw_jit_rom_emit,
+          (unsigned long long)rw_jit_ram_emit,
+          t->snaps_back, t->snaps_fwd, t->snap_max);
+   /* The save under rewind: frames that wrote it / touched the chip; bytes
+    * of it the game read (first pass) and re-runs were served from the log;
+    * reads with nothing logged (must be 0); history cut because the log is
+    * a ring (trims keep the newer part, resets do not). */
+   fe_evt("rewind_save write_frames=%u busy_frames=%u read_bytes=%u "
+          "rerun_served=%u unlogged=%u rerun_writes_refused=%u "
+          "rlog_bytes=%u rlog_trims=%u rlog_resets=%u busy_now=%u "
+          "gaps=%u/%u/%u/%u/%u/%u/%u/%u flush_waits=%u/%ums flush_yields=%u "
+          "denied_saving=%u",
+          rw_save_write_frames, rw_bk_busy_frames,
+          (unsigned)gba_rewind_rlog_end, (unsigned)gba_rewind_rlog_served,
+          (unsigned)gba_rewind_rlog_miss, rw_replay_save_hits,
+          (unsigned)rw_rlog_bytes, rw_rlog_trims, rw_rlog_resets,
+          (unsigned)gba_rewind_backup_busy(),
+          rw_bk_gaps[0], rw_bk_gaps[1], rw_bk_gaps[2], rw_bk_gaps[3],
+          rw_bk_gaps[4], rw_bk_gaps[5], rw_bk_gaps[6], rw_bk_gaps[7],
+          rw_flush_engage_waits, (unsigned)(rw_flush_engage_max_us / 1000u),
+          rw_flush_tick_yields, rw_denied_saving);
+   /* The bound that makes tapping harmless, and what it cost here.  core =
+    * inside fe_rewind_tick; host adds presenting the frame. */
+   fe_evt("rewind_tick n=%u mean_us=%u host_max_us=%u core_max_us=%u "
+          "frames_max=%u restores_max=%u engage_us=%llu/%u anomalies=%u "
+          "selfcheck=%d verify=%u/%u restore_verify_bad=%u",
+          rw_tick_n, rw_tick_n ? (unsigned)(rw_tick_us / rw_tick_n) : 0,
+          rw_tick_max_us, t->tick_max_us, t->tick_frames_max,
+          t->tick_restores_max, (unsigned long long)t->engage_us,
+          t->engage_max_us, t->anomalies + rw_restore_bad,
+          fe_rewind_selfcheck(), t->verify_bad_words, t->verify_runs,
+          rw_restore_bad);
+   if (rw_hash_fp)
+      fclose(rw_hash_fp);
+   rw_hash_fp = NULL;
+   free(rw_hash_state);
+   rw_hash_state = NULL;
+   rw_mem_drop(0);
+   gpsp_rewind_clock_mode(0);
+   gpsp_rewind_marks_want(0);
+   rw_on = 0;
+   rw_mask_on = 0;
+}
+#endif /* REWIND */
+
+#ifdef GPSP_CHEATS
+#include "fe_cheats.h"
+/* One Game Boy cheat write (fe_cheats_gb_frame).  gbcore_poke refuses ROM
+ * and I/O itself; fe_cheats has already refused everything but work RAM and
+ * high RAM, so cartridge (save) RAM is never asked for. */
+static int gb_cheat_poke(void *ctx, uint16_t addr, uint8_t value)
+{
+   return gbcore_poke((gbcore_t *)ctx, addr, &value, 1);
+}
+#endif
 
 void fe_host_run_frame(void)
 {
@@ -3619,8 +6379,17 @@ void fe_host_run_frame(void)
          if (gbdual_advance(gb_dual, gb_dual_input, NULL) != 1)
             fe_evt("gb_dual_advance FAILED frame=%u", frame_count);
       }
-      else if (gbcore_run_frame(gb_core, gb_buttons_from_retro(pad)) != 0)
-         fe_evt("gb_run_frame FAILED frame=%u", frame_count);
+      else
+      {
+#ifdef GPSP_CHEATS
+         /* Game Boy cheats (docs/CHEATS.md): the enabled GameShark writes,
+          * once per emulated frame, before the core runs it.  Never in the
+          * dual (link) path above; a no-op with nothing switched on. */
+         fe_cheats_gb_frame(gb_cheat_poke, gb_core);
+#endif
+         if (gbcore_run_frame(gb_core, gb_buttons_from_retro(pad)) != 0)
+            fe_evt("gb_run_frame FAILED frame=%u", frame_count);
+      }
       if (core_t0 && host.time_us)
       {
          uint32_t elapsed = (uint32_t)(host.time_us() - core_t0);
@@ -3652,17 +6421,29 @@ void fe_host_run_frame(void)
       host.core_counters(&rf0, &ff0, &sf0, &df0, &pl0);
 
 #ifdef GBA_LINK
+   if (host.gba_dual && !host.gba_dual_session && !fe_gbadual_active())
+      gba_dual_bench_idle();
    if (fe_gbadual_active())
       fe_gbadual_frame(fe_gbadual_keys_from_retro(
          (host.input_bitmask ? host.input_bitmask() : 0) | injected_mask));
    else
 #endif
+   {
+#ifdef REWIND
+   rw_latch_input();
+#endif
    retro_run();
+   }
    fe_host_guest_fault_check();
 
    if (core_t0)
    {
       uint32_t d = (uint32_t)(host.time_us() - core_t0);
+#ifdef REWIND
+      rw_frame_core_us = d;
+      if (!rw_ff)
+         rw_ema(&rw_e_frame, d);
+#endif
       core_run_us_total += d;
       core_run_calls++;
       if (d > core_run_max_us || d > core_win_max_us)
@@ -3691,6 +6472,21 @@ void fe_host_run_frame(void)
       }
    }
    frame_count++;
+#ifdef REWIND
+   {
+      /* Everything rewind adds to a normal frame OUTSIDE retro_run (which
+       * core_prof times): the input log, a snapshot when one is due. */
+      uint64_t w0 = rw_on && host.time_us ? host.time_us() : 0;
+      rw_after_frame();
+      if (w0)
+      {
+         uint32_t d = (uint32_t)(host.time_us() - w0);
+         rw_work_us += d;
+         if (d > rw_work_max_us)
+            rw_work_max_us = d;
+      }
+   }
+#endif
 
    /* Keep an in-progress save write moving (ADR-0020) — a few 4 KiB blocks
     * per frame under a wall-clock budget, never a 128 KiB stall.  Both of
@@ -3709,6 +6505,9 @@ void fe_host_run_frame(void)
       smc_addr_evt();
       smc_block_evt();
       core_phase_evt();
+#ifdef REWIND
+      rw_win_evt();
+#endif
 #ifdef GBA_LINK
       fe_gbadual_stats_evt(gbadual_evt);
 #endif
@@ -3751,15 +6550,25 @@ const void *fe_host_netpacket_cb(void)
    return !gb_family && netpacket_registered ? (const void *)&netpacket_cb : NULL;
 }
 
+/* The save half of fe_host_shutdown, on its own so the host tests can run
+ * exactly what an exit runs (tools/tests/test_sram_exit_retry.c). */
+static void sram_shutdown(void)
+{
+   fe_host_sram_flush(0);
+   fe_host_sram_sync();     /* exit must never close over pending blocks */
+   sram_close();
+}
+
 void fe_host_shutdown(void)
 {
    /* ADR-0025 ordering contract: the writer thread is already stopped and
     * fe_host_set_io(NULL) already called, so everything below is
     * single-threaded — which is what makes it safe to close the file and
     * then let retro_unload_game() free the buffer the writer was reading. */
-   fe_host_sram_flush(0);
-   fe_host_sram_sync();     /* exit must never close over pending blocks */
-   sram_close();
+   sram_shutdown();
+#ifdef REWIND
+   rw_shutdown();
+#endif
    if (gbl)
    {
       /* Quitting mid-session: nothing is committed (fe_gblink.h). */

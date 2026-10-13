@@ -68,7 +68,17 @@ CORE_COMMON="SMC_GATES=1 SMC_GATES_SIMPLE=1 SMC_GATES_RANKED=1 SMC_GATE_BITMAP=1
 SMC_PARTIAL_SAFE=1 SMC_PARTIAL_STABLE_THUNK=1 SMC_PARTIAL_DIRECT_LINKS=1
 GBA_PC_MASK=1 BADJUMP_SAFE=1 SMC_GATE_CHARGE=1 DISPATCH_CYCLE_CHECK=1 DMA_SMC_FLUSH=1
 DISPATCH_CACHE=1 SMC_RETIRE_WINDOW=1 SERIAL_IDLE_FAST=1
-JIT_CODE_DISCIPLINE=1"
+JIT_CODE_DISCIPLINE=1 ENTRY_GATES=1
+SCHED_FAST=1 IRQ_IO_FAST=1"
+# SCHED_FAST / IRQ_IO_FAST (2026-10-11, 4.0.0 beta; docs/GBA-LINK-MIRROR.md
+# 24-25): two exact scheduler / interrupt-register fast paths, for every game.
+# The build switch compiles them in; the run-time switches sched_fast and
+# irq_io_fast turn them on (psp/main_psp.c PLAY_SCHED_FAST / PLAY_IRQ_IO_FAST,
+# config.ini keys of the same names as kill switches).  Corpus oracle:
+# state-identical to the build without them over the whole library
+# (DRCORPUS_SHIP=1 tools/drprof/dr_corpus.py full base fast2 fast2off).
+# NOT here, on purpose: TIMER_LAZY (refuted: guest-visible, no gain),
+# DRPROF_HW (profiler build), HOT_ORD=layout/hot_pair.ord (withdrawn).
 
 profile_flags() {   # sets CORE_FLAGS, FE_DEFS, TITLE, KIND
   PSP_MAKE_FLAGS=""
@@ -194,10 +204,25 @@ profile_flags "$PROFILE"
 if [ "${GBA_LINK:-0}" = 1 ]; then
   CORE_FLAGS="$CORE_FLAGS GBA_LINK=1"
   PSP_MAKE_FLAGS="$PSP_MAKE_FLAGS GBA_LINK=1"
+  # GBALINK_LEAN_OUTLINE=1 (serial.h): the lean cable hooks out of line, so
+  # update_gba keeps its single-player size in the pinned hot core.
+  if [ "${GBALINK_LEAN_OUTLINE:-0}" = 1 ]; then
+    CORE_FLAGS="$CORE_FLAGS GBALINK_LEAN_OUTLINE=1"
+  fi
   [ -n "${GPSP_EBOOT_TITLE:-}" ] || [ "$KIND" = release ] || TITLE="$TITLE LINK"
 fi
 
 # One-off VARIANTS of a non-release profile (tools/drprof/stage_hw_drprof.py):
+# REWIND=1: the rewind (docs/REWIND.md) compiled in, for any profile.  It is
+# a switch of its own, like GBA_LINK, because a release refuses CORE_EXTRA and
+# PSP_EXTRA: `GBA_LINK=1 REWIND=1 tools/build.sh release` is the playable
+# build with the Settings toggle (which stays off until the player turns it
+# on).  Both makes need it: the core's store marks and the frontend.
+if [ "${REWIND:-0}" = 1 ]; then
+  CORE_FLAGS="$CORE_FLAGS REWIND=1"
+  PSP_MAKE_FLAGS="$PSP_MAKE_FLAGS REWIND=1"
+fi
+
 # CORE_EXTRA is appended to the ROOT make's flags (DISPATCH_CACHE=1,
 # DRPROF_HW=1, ...), FE_EXTRA to the frontend defines.  Refused for a release:
 # the release flag list lives in profile_flags and nowhere else.
@@ -284,10 +309,38 @@ LAYOUT_PIN="${LAYOUT_PIN:-1}"
 LAYOUT_PAD_BYTES="${LAYOUT_PAD_BYTES:-0}"
 case "$LAYOUT_PIN" in 0|1) ;; *) die "LAYOUT_PIN must be 0 or 1" ;; esac
 note "layout  : LAYOUT_PIN=$LAYOUT_PIN LAYOUT_PAD_BYTES=$LAYOUT_PAD_BYTES"
-run core  /build      "make platform=psp1 GIT_VERSION='$BUILD_VERSION' $CORE_FLAGS LAYOUT_PIN=$LAYOUT_PIN -j4"
+# CHEATS: the per-game cheats menu (docs/CHEATS.md), default on in every
+# profile.  CHEATS=0 is the kill switch, and it must reach BOTH makes (the
+# core half is cheats.c, the frontend half fe_cheats.c + the menu).
+CHEATS="${CHEATS:-1}"
+case "$CHEATS" in 0|1) ;; *) die "CHEATS must be 0 or 1" ;; esac
+note "cheats  : CHEATS=$CHEATS"
+run core  /build      "make platform=psp1 GIT_VERSION='$BUILD_VERSION' $CORE_FLAGS LAYOUT_PIN=$LAYOUT_PIN CHEATS=$CHEATS -j4"
 [ -f "$ROOT/gpsp_libretro_psp1.a" ] || die "core archive missing"
-run eboot /build/psp  "make EXTRA_DEFS='$FE_DEFS' PSP_EBOOT_TITLE='$TITLE' $PSP_MAKE_FLAGS LAYOUT_PIN=$LAYOUT_PIN LAYOUT_PAD_BYTES=$LAYOUT_PAD_BYTES"
+run eboot /build/psp  "make EXTRA_DEFS='$FE_DEFS' PSP_EBOOT_TITLE='$TITLE' $PSP_MAKE_FLAGS LAYOUT_PIN=$LAYOUT_PIN LAYOUT_PAD_BYTES=$LAYOUT_PAD_BYTES CHEATS=$CHEATS"
 [ -f "$ROOT/psp/EBOOT.PBP" ] || die "EBOOT missing"
+
+# HOT-CORE BUDGET (docs/GBA-LINK-MIRROR.md 24-25).  psp/layout/hot_order.txt was
+# generated for the function sizes of one build; a hot function that grows
+# moves everything linked behind it (update_gba +688 bytes cost the link pair
+# 8,400 I-cache misses a frame on a PSP-3000 and nothing in the build said
+# so).  Report the core against its budget on every pinned build;
+# HOT_BUDGET_STRICT=1 makes an overrun fail the build.
+if [ "$LAYOUT_PIN" = 1 ] && [ -f "$ROOT/psp/gpsp_adhoc.elf" ]; then
+  docker run --rm -v "$ROOT":/build -w /build "$DOCKER_IMAGE" sh -c     "psp-nm -S -n psp/gpsp_adhoc.elf" > "$ROOT/.build-elf.nm" 2>/dev/null || true
+  PYB=python3; command -v python3 >/dev/null 2>&1 || PYB=python
+  # a native Windows python needs native paths (MSYS_NO_PATHCONV is set above)
+  HB_PY="$ROOT/tools/layout/hot_budget.py"; HB_ORD="$ROOT/psp/layout/hot_order.txt"; HB_NM="$ROOT/.build-elf.nm"
+  case " $PSP_MAKE_FLAGS " in *" HOT_ORD=layout/hot_pair.ord "*) HB_ORD="$ROOT/psp/layout/hot_pair_order.txt" ;; esac
+  if command -v cygpath >/dev/null; then
+    HB_PY=$(cygpath -w "$HB_PY"); HB_ORD=$(cygpath -w "$HB_ORD"); HB_NM=$(cygpath -w "$HB_NM")
+  fi
+  if [ "${HOT_BUDGET_STRICT:-0}" = 1 ]; then
+    "$PYB" "$HB_PY" "$HB_ORD" "$HB_NM" --strict       || die "the pinned hot core overran its budget (tools/layout/regen.sh)"
+  else
+    "$PYB" "$HB_PY" "$HB_ORD" "$HB_NM" || true
+  fi
+fi
 
 warning_gate "$ROOT/.build-core.log"  "core"
 warning_gate "$ROOT/.build-eboot.log" "eboot"

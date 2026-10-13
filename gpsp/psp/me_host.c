@@ -101,8 +101,14 @@ int me_host_init(const char *base_dir)
       }
       sceKernelDelayThread(5000);
    }
-   fe_evt("me_init state=unavailable reason=handshake magic=0x%08X",
-          (unsigned)((volatile me_mbox *)ME_UNCACHED(&g_mbox_storage))->magic);
+   /* `version` beside the magic: a module from another build answers with
+    * the right magic and the wrong version (me_mbox.h, v3), and that must not
+    * read as "the second core never came up". */
+   fe_evt("me_init state=unavailable reason=handshake magic=0x%08X "
+          "version=%u want=%u",
+          (unsigned)((volatile me_mbox *)ME_UNCACHED(&g_mbox_storage))->magic,
+          (unsigned)((volatile me_mbox *)ME_UNCACHED(&g_mbox_storage))->version,
+          (unsigned)ME_MBOX_VERSION);
    /* module_start succeeded, so module_start() has already patched the ME
     * reset vector and enabled its bus clock. A failed handshake must unwind
     * that platform state before we fall back to CPU rendering. */
@@ -143,6 +149,24 @@ int me_host_idle(void)
 int me_host_input_done(void)
 {
    return g_mb && g_mb->input_seq == g_mb->cmd_seq;
+}
+
+int me_host_render_refused(void)
+{
+   return g_mb && g_mb->refused_seq == g_mb->cmd_seq;
+}
+
+int me_host_sync(unsigned timeout_us)
+{
+   unsigned t0;
+   if (!me_host_up() || !me_host_idle())
+      return -1;
+   me_post(ME_CMD_SYNC, 0, 0, 0, 0, 0, 0);
+   t0 = (unsigned)sceKernelGetSystemTimeLow();
+   while (!me_host_idle())
+      if ((unsigned)sceKernelGetSystemTimeLow() - t0 >= timeout_us)
+         return -1;
+   return 0;
 }
 
 int me_host_post_pitch_copy(const void *src, void *dst,

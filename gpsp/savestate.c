@@ -20,6 +20,12 @@
 #include "common.h"
 
 const u8 *state_mem_read_ptr;
+#ifdef REWIND
+/* Set around a load by the rewind (libretro.c): 1 = flush the RAM
+ * translation cache only; 2 = flush nothing (the caller compared the bytes
+ * under RAM code and none changed); 0 = an ordinary load. */
+u32 gba_rewind_light_restore;
+#endif
 u8 *state_mem_write_ptr;
 
 /* Validate the complete BSON tree before any of the legacy lookup helpers use
@@ -151,16 +157,46 @@ bool bson_has_int32_array(const u8 *srcp, const char *key, u32 count)
   return size == 5u + count * 8u;
 }
 
+#ifdef REWIND
+/* A rewind restore reads a document's keys in the order they were written,
+ * and every lookup used to walk the document from its top: the sound part
+ * alone was 0.6 ms of a 4 ms restore on hardware.  While such a restore is
+ * loading, a lookup starts at the element the last one in the same document
+ * found, and only walks from the top when the key is not from there on. */
+static const u8 *bk_doc, *bk_at;
+#endif
+
 const u8* bson_find_key(const u8 *srcp, const char *key)
 {
   unsigned keyl = strlen(key) + 1;
   unsigned doclen = bson_read_u32(srcp);
   const u8* p = &srcp[4];
+#ifdef REWIND
+  int hinted = 0;
+  if (gba_rewind_light_restore && bk_doc == srcp && bk_at)
+  {
+    p = bk_at;
+    hinted = 1;
+  }
+again:
+#endif
   while (*p != 0 && (p - srcp) < doclen) {
     u8 tp = *p;
     unsigned tlen = strlen((char*)&p[1]) + 1;
+#ifdef REWIND
+    if (keyl == tlen && !memcmp(key, &p[1], tlen))
+    {
+      if (gba_rewind_light_restore)
+      {
+        bk_doc = srcp;
+        bk_at = p;
+      }
+      return &p[tlen + 1];
+    }
+#else
     if (keyl == tlen && !memcmp(key, &p[1], tlen))
       return &p[tlen + 1];
+#endif
     p += 1 + tlen;
     if (tp == BSON_TYPE_DOC || tp == BSON_TYPE_ARR)
       p += bson_read_u32(p);
@@ -169,6 +205,14 @@ const u8* bson_find_key(const u8 *srcp, const char *key)
     else if (tp == BSON_TYPE_INT32)
       p += 4;
   }
+#ifdef REWIND
+  if (hinted)
+  {
+    hinted = 0;
+    p = &srcp[4];
+    goto again;
+  }
+#endif
   return NULL;
 }
 
@@ -220,6 +264,26 @@ bool bson_read_bytes(const u8 *srcp, const char *key, void* buffer, unsigned cnt
   return false;
 }
 
+#ifdef REWIND
+/* Measurement (rewind_gprof): where the loader's time goes on a rewind
+ * restore.  cpu / input+main / memory / sound / the tail (palette, video
+ * counters, translation cache), microseconds, summed. */
+u32 gba_rewind_lprof[5];
+uint64_t (*gba_rewind_lclock)(void);
+static uint64_t lp_t;
+static int lp_mark(int n)
+{
+  if (gba_rewind_lclock)
+  {
+    uint64_t t = gba_rewind_lclock();
+    if (n >= 0)
+      gba_rewind_lprof[n] += (u32)(t - lp_t);
+    lp_t = t;
+  }
+  return 1;
+}
+#endif
+
 bool gba_load_state(const void* src)
 {
   u32 i, tmp, docsize;
@@ -229,6 +293,14 @@ bool gba_load_state(const void* src)
   docsize = bson_read_u32(srcptr);
   if (docsize != GBA_STATE_MEM_SIZE)
     return false;
+#ifdef REWIND
+  /* A rewind's image was written by this very build a moment ago and never
+   * left memory: the checks below, which exist for files, are skipped.
+   * They were most of what a restore cost once the arrays stopped being
+   * copied whole (every check looks its keys up from the top again). */
+  if (!gba_rewind_light_restore)
+#endif
+  {
   if (!bson_validate_document(srcptr, GBA_STATE_MEM_SIZE, 0, false))
     return false;
 
@@ -244,12 +316,23 @@ bool gba_load_state(const void* src)
       !memory_check_savestate(srcptr) ||
       !sound_check_savestate(srcptr))
      return false;
+  }
 
+#ifdef REWIND
+  bk_doc = NULL;            /* (bson_find_key's place is per load) */
+  lp_mark(-1);
+  if (!(cpu_read_savestate(srcptr) && lp_mark(0) &&
+      input_read_savestate(srcptr) &&
+      main_read_savestate(srcptr) && lp_mark(1) &&
+      memory_read_savestate(srcptr) && lp_mark(2) &&
+      sound_read_savestate(srcptr) && lp_mark(3)))
+#else
   if (!(cpu_read_savestate(srcptr) &&
       input_read_savestate(srcptr) &&
       main_read_savestate(srcptr) &&
       memory_read_savestate(srcptr) &&
       sound_read_savestate(srcptr)))
+#endif
   {
      // TODO: this should not happen if the validation above is accurate.
      return false;
@@ -269,6 +352,20 @@ bool gba_load_state(const void* src)
 
   // Reset most of the frame state and dynarec state
 #ifdef HAVE_DYNAREC
+#ifdef REWIND
+  /* A rewind restore (docs/REWIND.md, "what a restore has to flush"): the
+   * cartridge has not changed, so the ROM translation cache -- a function of
+   * the ROM, the BIOS and the gate tables only -- is still right.  RAM code
+   * is not: the RAM under it was just replaced without going through the
+   * store paths that watch for that, so every RAM block goes, exactly as a
+   * self-modifying write retires them (tracked code ranges, not all 288 KiB
+   * of tags). */
+  if (dynarec_enable && gba_rewind_light_restore == 2)
+    ;   /* no byte under translated RAM code changed: it all stays */
+  else if (dynarec_enable && gba_rewind_light_restore)
+    flush_translation_cache_ram();
+  else
+#endif
   if (dynarec_enable)
     flush_dynarec_caches();
   /* Candidate counts describe this ROM and remain valuable across a state
@@ -281,6 +378,9 @@ bool gba_load_state(const void* src)
   instruction_count = 0;
   reg[OAM_UPDATED] = 1;
   reg[PAL_UPDATED] = 1;   /* palette restored without the store paths */
+#ifdef REWIND
+  lp_mark(4);
+#endif
 
   return true;
 }

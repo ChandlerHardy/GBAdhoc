@@ -20,6 +20,50 @@ cpu_alert_type dma_transfer(unsigned dma_chan, int *cycles)
 }
 
 #include "../sound.c"
+/* The BSON readers sound_read_savestate uses (--gc-sections drops the rest
+ * of the save-state code and what it would need). */
+#include "../savestate.c"
+
+/* A state's "sound" document with channel 0 `dist` ring entries from the
+ * mixer (negative = behind) and channel 1 beside it, loaded back: where did
+ * channel 0 end up, and was its phase kept? */
+static u8 st_doc[8192];
+static void check_load_distance(int dist, int expect_resync)
+{
+   const u32 mixer = 1000, phase = 0x2345678u;
+   u8 *w = st_doc + 4;
+   unsigned n;
+   u32 want = (mixer + (u32)dist) & BUFFER_SIZE_MASK;
+
+   gbc_sound_buffer_index = mixer;
+   direct_sound_channel[0].buffer_index = want;
+   direct_sound_channel[0].fifo_fractional = phase;
+   direct_sound_channel[1].buffer_index = mixer;
+   direct_sound_channel[1].fifo_fractional = 0x123u;
+   n = sound_write_savestate(w);
+   assert(n + 5 <= sizeof(st_doc));
+   w[n] = 0;
+   st_doc[0] = (u8)(n + 5); st_doc[1] = (u8)((n + 5) >> 8);
+   st_doc[2] = st_doc[3] = 0;
+   direct_sound_channel[0].buffer_index = 0x7777;
+   direct_sound_channel[0].fifo_fractional = 0;
+   gbc_sound_buffer_index = 0x5555;
+   assert(sound_read_savestate(st_doc));
+   assert(gbc_sound_buffer_index == mixer);
+   assert(direct_sound_channel[1].buffer_index == mixer);
+   assert(direct_sound_channel[1].fifo_fractional == 0x123u);
+   if (expect_resync)
+   {
+      assert(direct_sound_channel[0].buffer_index == mixer);
+      assert(direct_sound_channel[0].fifo_fractional == (phase & 0xFFFFFFu));
+   }
+   else
+   {
+      /* loaded exactly as saved */
+      assert(direct_sound_channel[0].buffer_index == want);
+      assert(direct_sound_channel[0].fifo_fractional == phase);
+   }
+}
 
 static void reference_silent_advance(u32 step, u32 *fractional,
                                      u32 *buffer_index)
@@ -119,6 +163,26 @@ int main(void)
    /* If a rate change leaves phase >= step, retain the original short loop. */
    check_inactive_fast_forward(64, 0xFFFFC0, BUFFER_SIZE - 2, 1);
    sweep_inactive_fast_forward();
-   puts("PASS timer-derived audio steps stay nonzero and accumulator-safe");
+   /* State load (review A9).  Healthy states sit a few entries either side
+    * of the mixer (measured: 6 behind .. 32 ahead) and load untouched, out
+    * to the read-out holdback behind and 256 ahead; past either, the
+    * channel is put back beside the mixer -- in particular anywhere behind
+    * the holdback, where it would play a second late (the old rule left it
+    * there up to 4096 entries back). */
+   check_load_distance(0, 0);
+   check_load_distance(-2, 0);
+   check_load_distance(-6, 0);
+   check_load_distance(32, 0);
+   check_load_distance(256, 0);
+   check_load_distance(-512, 0);
+   check_load_distance(257, 1);
+   check_load_distance(4096, 1);
+   check_load_distance(-513, 1);
+   check_load_distance(-2000, 1);
+   check_load_distance(-4096, 1);
+   check_load_distance(20000, 1);
+   check_load_distance(-20000, 1);
+   puts("PASS timer-derived audio steps stay nonzero and accumulator-safe; "
+        "state load keeps a healthy channel, resyncs a runaway one");
    return 0;
 }

@@ -210,6 +210,7 @@ typedef struct nd_peer
    uint16_t  rx_expect;
    nd_rxslot reorder[ND_WINDOW];
    uint8_t   need_ack;
+   uint64_t  ack_since_us;       /* when need_ack was first set (ack riding) */
 
    /* unreliable drop-stale */
    uint16_t  urx_last;
@@ -645,6 +646,15 @@ static void arq_on_ack(netdrv *nd, nd_peer *p, uint16_t ack)
       spill_refill(nd, p);
 }
 
+/* Ack riding (nd_config.ack_ride_us): may the pending ack go out bare now?
+ * Always when the switch is off; otherwise only once it has waited its time
+ * for a ride. */
+static int ack_ride_over(const netdrv *nd, const nd_peer *p)
+{
+   return !nd->cfg.ack_ride_us ||
+          nd->now - p->ack_since_us >= nd->cfg.ack_ride_us;
+}
+
 /* Is anything of ours due to go out to this peer on this tick? Used to
  * decide whether a pending ack can piggyback (free) or must go as a bare
  * ACK straight away (ADR-0017: honest RTT samples need prompt acks). */
@@ -753,7 +763,12 @@ static void arq_rx_data(netdrv *nd, nd_peer *p, uint16_t seq,
                         const uint8_t *payload, uint16_t len)
 {
    int16_t d = (int16_t)(seq - p->rx_expect);
+   if (!p->need_ack)
+      p->ack_since_us = nd->now;
    p->need_ack = 1;
+   if (d != 0)
+      p->ack_since_us = 0;     /* ack riding: a duplicate or a gap is acked
+                                  at once -- the sender is retransmitting */
    if (d < 0)
    {
       nd->st.rx_dup++;         /* old or duplicate — re-ack, don't deliver */
@@ -1328,7 +1343,8 @@ void netdrv_pump(netdrv *nd, uint64_t now_us)
       for (i = 0; i < ND_MAX_CLIENTS; i++)
       {
          nd_peer *p = &nd->peers[i];
-         if (p->active && p->need_ack && !arq_tx_due(p, nd->now))
+         if (p->active && p->need_ack && !arq_tx_due(p, nd->now) &&
+             ack_ride_over(nd, p))
             { nd->st.tx_ack++; nd_xmit_peer(nd, p, ND_T_ACK, 0, NULL, 0); }  /* ADR-0059 */
       }
    }
@@ -1354,7 +1370,7 @@ void netdrv_pump(netdrv *nd, uint64_t now_us)
 
          arq_pump_tx(nd, p);
 
-         if (p->need_ack)
+         if (p->need_ack && ack_ride_over(nd, p))
             { nd->st.tx_ack++; nd_xmit_peer(nd, p, ND_T_ACK, 0, NULL, 0); }  /* ADR-0059 */
 
          /* Death authority (split-brain guard): the host judges clients;
@@ -1655,6 +1671,17 @@ int netdrv_local_id(const netdrv *nd)
 int netdrv_peer_count(const netdrv *nd)
 {
    return nd ? nd_peer_count_(nd) : 0;
+}
+
+void netdrv_set_ack_ride(netdrv *nd, uint32_t us)
+{
+   if (nd)
+      nd->cfg.ack_ride_us = us;
+}
+
+uint32_t netdrv_ack_ride(const netdrv *nd)
+{
+   return nd ? nd->cfg.ack_ride_us : 0u;
 }
 
 /* ---- peer frame-rate matching (ADR-0027) -------------------------------- */

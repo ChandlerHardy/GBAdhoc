@@ -75,6 +75,21 @@ static u32 ml_redo_line(const me_log_entry *e, u32 n, u32 k, u32 line)
 u8 *me_vram_shadow = NULL;
 me_log_stats_t me_log_stats;      /* work counters (telemetry, the model) */
 
+/* PER-LINE VRAM TRACKING ON EVERY FRAME (default).
+ *
+ * Tracking used to switch on only for ME_LOG_HOLD frames after a frame was
+ * seen to write, during its visible lines, a page it also displays -- so the
+ * FIRST frame of every such burst was drawn from the line-160 copy alone.
+ * That is one wrong frame each time: the strip of junk tiles across the top
+ * of the screen at the start of Growl's "Attack fell" effect in Pokemon
+ * Sapphire (issue #8; the Heart & Soul battler ghost and Mario Golf's two
+ * leftover frames are the same gap).  With tracking always on there is no
+ * first frame.  The cost is the per-line map check and a shadow copy of each
+ * page written outside the visible lines; 0 restores the hysteresis (the
+ * harness A/B key `me_vram_always`). */
+int me_log_vram_always = 1;
+#define ML_TRACKING() ((g_ml.vram_hold || me_log_vram_always) && me_vram_shadow)
+
 #if ME_TIMING_SIM
 /* Desktop cost measurement only: wall time inside the recorder. */
 #include <time.h>
@@ -107,6 +122,10 @@ static struct MidframeLog {
   u8  vis[96];                /* 0 = page reset by a per-line check          */
   u8  valid[96];              /* me_vram_shadow page == VRAM as last checked */
   u32 rel[3];                 /* pages this line's layers read (bitmask)     */
+  u32 seen[3];                /* pages some line of this frame has read      */
+  u8  pend[96];               /* written off screen after being read: the
+                               * shadow still holds the page as last shown   */
+  int npend;
   u16 relkey[5];              /* DISPCNT, BG0-3CNT the mask was built from   */
 } g_ml;
 
@@ -173,10 +192,47 @@ static void ml_resync_page(u32 p)
   g_ml.valid[p] = 1;
 }
 
+/* Diff one tracked page into the log at `line`; the shadow follows. */
+static void ml_diff_page(u32 line, u32 p)
+{
+  u32 *sh = (u32 *)(me_vram_shadow + (p << 10));
+  const u32 *cur = (const u32 *)(vram + (p << 10));
+  u32 w;
+  me_log_stats.page_diffs++;
+  for (w = 0; w < 256; w++)
+    if (sh[w] != cur[w])
+    {
+      ml_push(line, ME_LOG_VRAM, (p << 8) + w, sh[w], cur[w]);
+      sh[w] = cur[w];
+      g_ml.vram_hit = 1;
+    }
+}
+
+/* A page that an earlier line of this frame read and that was written after
+ * it left the screen (a bitmap game that flips its displayed frame on some
+ * visible line and at once starts drawing the frame it just hid).  The engine
+ * draws those earlier lines too, from a copy taken at line 160, so the writes
+ * belong in the log -- but nothing reads the page line by line any more, so
+ * one diff is enough: here when the page comes back on screen, or at line 160
+ * (ml_flush_pending).  At most one entry a word, where per-line diffs of a
+ * page being cleared and redrawn would log every word twice. */
+static void ml_flush_pending(u32 line)
+{
+  u32 p;
+  for (p = 0; p < 96 && g_ml.npend; p++)
+    if (g_ml.pend[p])
+    {
+      g_ml.pend[p] = 0;
+      g_ml.npend--;
+      ml_diff_page(line, p);
+    }
+}
+
 /* Recompute the relevance mask if this line's layer setup changed; a page
  * that just became relevant is recopied first, so its old values are right
- * from here on (what it held before this line was not on screen). */
-static void ml_update_relevance(void)
+ * from here on (what it held before this line was not on screen) -- unless an
+ * earlier line of this frame showed it: then its writes since are logged. */
+static void ml_update_relevance(u32 line)
 {
   static const u8 keys[5] = { REG_DISPCNT, REG_BG0CNT, REG_BG1CNT, REG_BG2CNT,
                               REG_BG3CNT };
@@ -195,8 +251,18 @@ static void ml_update_relevance(void)
   if (!me_vram_shadow)
     return;
   for (p = 0; p < 96; p++)
-    if (ml_bit(g_ml.rel, p) && !ml_bit(old, p) && !g_ml.valid[p])
-      ml_resync_page(p);
+    if (ml_bit(g_ml.rel, p) && !ml_bit(old, p))
+    {
+      if (g_ml.pend[p])
+      {
+        g_ml.pend[p] = 0;
+        g_ml.npend--;
+        ml_diff_page(line, p);
+      }
+      else if (!g_ml.valid[p])
+        ml_resync_page(p);
+    }
+  g_ml.seen[0] |= g_ml.rel[0]; g_ml.seen[1] |= g_ml.rel[1]; g_ml.seen[2] |= g_ml.rel[2];
 }
 
 static void ml_check_palette(u32 line)
@@ -264,21 +330,17 @@ static void ml_check_vram(u32 line)
       vram_clean[p] = 1;
       g_ml.vis[p] = 0;
       if (ml_bit(g_ml.rel, p) && g_ml.valid[p])
-      {
-        me_log_stats.page_diffs++;
-        u32 *sh = (u32 *)(me_vram_shadow + (p << 10));
-        const u32 *cur = (const u32 *)(vram + (p << 10));
-        u32 w;
-        for (w = 0; w < 256; w++)
-          if (sh[w] != cur[w])
-          {
-            ml_push(line, ME_LOG_VRAM, (p << 8) + w, sh[w], cur[w]);
-            sh[w] = cur[w];
-            g_ml.vram_hit = 1;
-          }
-      }
+        ml_diff_page(line, p);
       else if (ml_bit(g_ml.rel, p))
         ml_resync_page(p);                  /* cannot happen; stay correct */
+      else if (ml_bit(g_ml.seen, p) && g_ml.valid[p])
+      {
+        if (!g_ml.pend[p])                  /* shown earlier this frame */
+        {
+          g_ml.pend[p] = 1;
+          g_ml.npend++;
+        }
+      }
       else
         g_ml.valid[p] = 0;
     }
@@ -309,7 +371,7 @@ static void ml_frame_start_body(void)
    * gap in logging (setup; a frameskipped frame leaves the flags set) need
    * a recopy.  Store paths that bypass the flags (state load) set them. */
   me_log_stats.frames++;
-  if (g_ml.vram_hold && me_vram_shadow)
+  if (ML_TRACKING())
     me_log_stats.tracked_frames++;
   if (g_ml.resync || reg[PAL_UPDATED])
   {
@@ -343,10 +405,18 @@ static void ml_frame_start_body(void)
   for (p = 0; p < 5; p++)
     g_ml.relkey[p] = 0xFFFF;                /* force a fresh mask */
   g_ml.rel[0] = g_ml.rel[1] = g_ml.rel[2] = 0;
-  if (g_ml.vram_hold && me_vram_shadow)
+  g_ml.seen[0] = g_ml.seen[1] = g_ml.seen[2] = 0;
+  if (g_ml.npend)                           /* a frame that never reached 160 */
+  {
+    for (p = 0; p < 96; p++)
+      if (g_ml.pend[p])
+        g_ml.pend[p] = g_ml.valid[p] = 0;
+    g_ml.npend = 0;
+  }
+  if (ML_TRACKING())
   {
     g_ml.flags |= ME_LOGF_VRAM_ON;
-    ml_update_relevance();                  /* resyncs invalid relevant pages */
+    ml_update_relevance(0);                 /* resyncs invalid relevant pages */
   }
 }
 
@@ -376,14 +446,16 @@ static void ml_line_body(u32 line)
     reg[PAL_UPDATED] = 0;
     ml_check_palette(line);
   }
-  if (g_ml.vram_hold && me_vram_shadow)
+  if (ML_TRACKING())
   {
-    ml_update_relevance();          /* every line: a page can come on screen */
+    ml_update_relevance(line);      /* every line: a page can come on screen */
     if (!vram_clean[VRAM_DIRTY_ANY])/* one load unless something was written */
     {
       vram_clean[VRAM_DIRTY_ANY] = 1;
       ml_check_vram(line);
     }
+    if (line == 160 && g_ml.npend)
+      ml_flush_pending(160);        /* back to the snapshot state, like redo */
   }
 }
 
@@ -413,6 +485,8 @@ void me_capture_log_setup(void *capv, void *entries, u32 n_entries)
   /* A (re)built engine: the shadow's memory may be new or may have been
    * handed back and reclaimed (standby); trust none of it. */
   memset(g_ml.valid, 0, sizeof(g_ml.valid));
+  memset(g_ml.pend, 0, sizeof(g_ml.pend));
+  g_ml.npend = 0;
   g_ml.resync = 1;
 }
 
@@ -444,6 +518,13 @@ static void ml_visible_end_body(void)
   if (live)
     ml_line(160);                           /* writes after line 159's render */
   g_ml.on = 0;                              /* (ml_line needs it set) */
+  if (g_ml.npend)                           /* torn down: nothing was diffed */
+  {
+    for (p = 0; p < 96; p++)
+      if (g_ml.pend[p])
+        g_ml.pend[p] = g_ml.valid[p] = 0;
+    g_ml.npend = 0;
+  }
 
 
   /* VRAM, frame level: pages written during the visible lines that some

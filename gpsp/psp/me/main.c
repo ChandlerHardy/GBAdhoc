@@ -123,6 +123,7 @@ static unsigned int me_do_copy(volatile me_mbox *mb)
  * (RENDER_REPLAY + ME_CAP_VALIDATE).  v2: two-phase (snapshot -> input_seq ->
  * render), so the host resumes emulation while the ME renders in parallel. */
 extern unsigned int me_render_run(volatile me_mbox *mb, unsigned int seq);
+extern void me_render_boot(void);
 
 /* ---- the dispatcher (ME entry point, jumped to by me_stub) ------------- */
 
@@ -140,6 +141,12 @@ extern unsigned int me_render_run(volatile me_mbox *mb, unsigned int seq);
 static void me_dispatch(volatile me_mbox *mb)
 {
    unsigned int seen;
+
+   /* We are here because the ME just left reset: at load, or on the way out
+    * of a sleep (me_sysevent below), where the module and its statics stay
+    * but the renderer's work area, which is the host's volatile memory, does
+    * not.  The renderer must not believe anything it remembers about it. */
+   me_render_boot();
 
    mb->version = ME_MBOX_VERSION;
    mb->magic   = ME_MBOX_MAGIC;
@@ -217,6 +224,14 @@ static void me_dispatch(volatile me_mbox *mb)
          mb->result = sum;
          break;
       }
+      case ME_CMD_SYNC:
+         /* Nothing of ours may be left in this cache when the host gives the
+          * renderer's work memory away (me_mbox.h, ME_CMD_SYNC).  Every line
+          * goes, the stack's included: this function holds nothing in memory
+          * across the call, and a line that is merely gone is fetched again. */
+         me_dcache_wbinv_all();
+         mb->result = 0;
+         break;
       case ME_CMD_PARK:
          /* Quiet the bus: ack, then poll only every ~64k spins so a
           * parked ME steals almost no memory bandwidth from the WLAN

@@ -10,11 +10,15 @@ CORE_DIR := ../..
 CC       ?= gcc
 CFLAGS   := -O2 -g -Wall -I$(CORE_DIR)/libretro/libretro-common/include
 
+# CORE_DEFS: extra core defines for a variant, e.g.
+#   make CORE_DEFS="-DSCHED_FAST=1 -DSCHED_FAST_DEFAULT=1"
+CORE_DEFS ?=
+
 all: gl_host
 
 core_a.o: FORCE
 	$(MAKE) -C $(CORE_DIR) platform=unix clean
-	$(MAKE) -C $(CORE_DIR) platform=unix GBA_LINK=1 STATIC_LINKING=1 -j$$(nproc)
+	$(MAKE) -C $(CORE_DIR) platform=unix GBA_LINK=1 STATIC_LINKING=1 CODE_DEFINES="$(CORE_DEFS)" -j$$(nproc)
 	cd $(CORE_DIR) && ld -r -o tools/gbamirror/core_a.o \
 	  $$(find . -name '*.o' \
 	       -not -path './sdl/*' -not -path './psp/*' \

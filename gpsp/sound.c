@@ -27,7 +27,7 @@ u32 sound_frequency = GBA_SOUND_FREQUENCY;
 u32 sound_freq_bits = 16;
 
 u32 sound_on;
-#ifdef GBA_LINK
+#if defined(GBA_LINK) || defined(REWIND)
 u32 sound_synth_off;   /* sound.h */
 #endif
 /* Mix bus. Accumulates all six channels at full 16-bit output scale
@@ -103,7 +103,7 @@ unsigned sound_timer(fixed8_24 frequency_step, u32 channel)
 
     sample_status = ds->status;
   }
-#ifdef GBA_LINK
+#if defined(GBA_LINK) || defined(REWIND)
   /* Headless: advance the phase and ring position exactly as the silent
    * path does (the same quotient), write nothing.  The FIFO pop above and
    * the DMA refill below are unchanged. */
@@ -191,7 +191,18 @@ unsigned sound_timer(fixed8_24 frequency_step, u32 channel)
   }
 
   ds->buffer_index = buffer_index;
-  ds->fifo_fractional = fp8_24_fractional_part(fifo_fractional);
+  /* One output sample is owed per 1.0 of phase.  Every loop above leaves
+   * with the phase at 1.0 or more; take exactly one off.  For a step of 1.0
+   * or less (a FIFO rate up to the output rate) that is the fractional part,
+   * as it always was.  For a faster FIFO (Golden Sun: The Lost Age and The
+   * Lord of the Rings: The Third Age run theirs at 63 kHz against 32.768 kHz
+   * out) the phase stays above 1.0 and the next FIFO samples write nothing
+   * until it is used up.  Keeping only the fraction wrote one output sample
+   * per FIFO sample whatever the step: the channel played at half speed and
+   * its ring position ran away from the mixer's, round the whole ring every
+   * second, so that sound "in flight" lay anywhere in it (docs/REWIND.md
+   * 16.1: what broke a rewind, and a plain state load, in those games). */
+  ds->fifo_fractional = fifo_fractional - 0x1000000u;
 
   if(((ds->fifo_top - ds->fifo_base) % 32) <= 16)
   {
@@ -393,7 +404,7 @@ u32 gbc_sound_master_volume;
  * SOUNDCNT_X -- but nothing is mixed. */
 #define gbc_sound_render_sample_none()                                        \
 
-#ifdef GBA_LINK
+#if defined(GBA_LINK) || defined(REWIND)
 #define gbc_sound_render_case(type, side, sample_length, envelope_op, sweep_op) \
   if (sound_synth_off)                                                        \
     gbc_sound_render_##type(none, sample_length, envelope_op, sweep_op)       \
@@ -744,7 +755,9 @@ bool sound_check_savestate(const u8 *src)
       return false;
     if (!bson_read_int32(sndchan, "fifo-top", &index) || index >= 32)
       return false;
-    if (!bson_read_int32(sndchan, "fifo-frac", &index) || index > 0xFFFFFF)
+    /* (below 256.0: a step is capped at 255.0 and is added to a phase
+     * under 1.0; sound_timer) */
+    if (!bson_read_int32(sndchan, "fifo-frac", &index))
       return false;
     if (!bson_read_int32(sndchan, "volume", &index) || index > 1)
       return false;
@@ -775,6 +788,12 @@ bool sound_check_savestate(const u8 *src)
 }
 
 
+/* sound_read_savestate: how far a direct-sound channel's ring position may
+ * be from the mixer's in a state that is loaded as it is (entries; two per
+ * output sample). */
+#define DS_RESYNC_AHEAD   256u
+#define DS_RESYNC_BEHIND  512u   /* sound_read_samples' read-out holdback */
+
 bool sound_read_savestate(const u8 *src)
 {
   int i;
@@ -789,6 +808,13 @@ bool sound_read_savestate(const u8 *src)
    * time decodes as silence after load instead of random pre-load mix.
    * This makes audio output deterministic across save/load at the cost of
    * up to one frame of silence at the load point. */
+#ifdef REWIND
+  /* A rewind's quick restore (docs/REWIND.md): the ring is zero everywhere
+   * but in the stretch still in flight -- the read-out zeroes what it takes
+   * -- and sound_rewind_clear_inflight() has just zeroed that stretch.
+   * Clearing all 256 KiB again was a millisecond of every restore. */
+  if (!gba_rewind_ring_cleared)
+#endif
   memset(sound_buffer, 0, sizeof(sound_buffer));
 
   if (!(
@@ -817,6 +843,36 @@ bool sound_read_savestate(const u8 *src)
       bson_read_bytes(sndchan, "fifo-bytes", ds->fifo, sizeof(ds->fifo)) &&
       bson_read_int32(sndchan, "buf-idx", &ds->buffer_index)))
       return false;
+#ifdef REWIND
+    if (!gba_rewind_ring_cleared)   /* (a rewind's own restore: as saved) */
+#endif
+    {
+      /* A state saved by a build from before the fix in sound_timer, in a
+       * game whose FIFO runs faster than the output rate, carries a channel
+       * position that had run away from the mixer's, anywhere in the ring:
+       * loaded as it is, that channel would sound up to a second late for
+       * good.  A channel never is more than a few entries from the mixer
+       * (it is written up to its last FIFO sample, the mixer up to the end
+       * of the frame: 20 states from three consoles sit 6 entries behind
+       * to 32 ahead), so one further away is put back beside it and its
+       * phase taken below 1.0.
+       *
+       * The window is not symmetric (review A9; it was 4096 either way).
+       * BEHIND the mixer is where the harm is: read-out stops 512 entries
+       * short of the mixer, so anything written further back than that
+       * lands in ring the reader has already taken and is heard a lap --
+       * a second -- late, for good.  Up to 512 behind is still unread and
+       * plays in place.  AHEAD only delays the channel, and 256 entries
+       * (4 ms) is eight times what a healthy state shows.  A state inside
+       * the window is loaded exactly as saved: a load must stay equal to
+       * never having saved (link sessions and rewind both rest on it). */
+      u32 d = (ds->buffer_index - gbc_sound_buffer_index) & BUFFER_SIZE_MASK;
+      if (d > DS_RESYNC_AHEAD && d < BUFFER_SIZE - DS_RESYNC_BEHIND)
+      {
+        ds->buffer_index = gbc_sound_buffer_index;
+        ds->fifo_fractional &= 0xFFFFFF;
+      }
+    }
   }
 
   for (i = 0; i < 4; i++)
@@ -950,6 +1006,14 @@ u32 sound_read_samples(s16 *out, u32 frames)
    if (samples_to_read > samples_available)
       samples_to_read = samples_available;
 
+#ifdef GBA_LINK
+   /* sound_synth_off = 2 (a headless link machine, harness/config
+    * gba_link_headless_audio = 2): nothing was mixed into the ring and
+    * nobody hears what is read, so the copy-and-clear is skipped.  The ring
+    * indices move exactly as below (they are in the save state); only the
+    * bytes handed to the discarding callback differ. */
+   if (sound_synth_off < 2)
+#endif
    for(i = 0; i < samples_to_read; i++)
    {
       u32 source_index   = (sound_buffer_base + i) & BUFFER_SIZE_MASK;
@@ -983,3 +1047,106 @@ void sound_flush_ring(void)
    direct_sound_channel[0].buffer_index = gbc_sound_buffer_index;
    direct_sound_channel[1].buffer_index = gbc_sound_buffer_index;
 }
+
+#ifdef REWIND
+u32 gba_rewind_ring_cleared;
+
+/* Zero what is in flight NOW (between the read position and the furthest
+ * producer), before the positions are replaced by a restore.  With the
+ * read-out zeroing what it consumes, that leaves the whole ring zero. */
+void sound_rewind_clear_inflight(void)
+{
+  u32 idx[3], n = 0, i;
+  idx[0] = gbc_sound_buffer_index;
+  idx[1] = direct_sound_channel[0].buffer_index;
+  idx[2] = direct_sound_channel[1].buffer_index;
+  for (i = 0; i < 3; i++)
+  {
+    u32 d = (idx[i] - sound_buffer_base) & BUFFER_SIZE_MASK;
+    if (d > n)
+      n = d;
+  }
+  /* (+2: the mixers write a stereo pair at their index) */
+  n += 2;
+  if (n >= BUFFER_SIZE_MASK)
+  {
+    memset(sound_buffer, 0, sizeof(sound_buffer));
+    return;
+  }
+  for (i = 0; i < n; i++)
+    sound_buffer[(sound_buffer_base + i) & BUFFER_SIZE_MASK] = 0;
+}
+
+/* See sound.h.  Layout: u32 entries, u32 wide, then the entries in read
+ * order starting at sound_buffer_base; the rest zero, so that two images
+ * XOR to zero wherever neither uses the space. */
+void sound_rewind_extra_save(u8 *dst)
+{
+  (void)sound_rewind_extra_save_part(dst, SOUND_REWIND_EXTRA_BYTES);
+}
+
+u32 sound_rewind_extra_save_part(u8 *dst, u32 stale)
+{
+  u32 idx[3], n = 0, wide = 0, i, used;
+  idx[0] = gbc_sound_buffer_index;
+  idx[1] = direct_sound_channel[0].buffer_index;
+  idx[2] = direct_sound_channel[1].buffer_index;
+  for (i = 0; i < 3; i++)
+  {
+    /* A producer further ahead than the window is a channel that is not
+     * running (its index is stale), not a second of pending sound. */
+    u32 d = (idx[i] - sound_buffer_base) & BUFFER_SIZE_MASK;
+    if (d <= SOUND_REWIND_WINDOW && d > n)
+      n = d;
+  }
+  for (i = 0; i < n; i++)
+  {
+    s32 v = sound_buffer[(sound_buffer_base + i) & BUFFER_SIZE_MASK];
+    if (v < -32768 || v > 32767)
+      wide = 1;
+  }
+  used = 8 + n * (wide ? 4 : 2);
+  if (stale > SOUND_REWIND_EXTRA_BYTES)
+    stale = SOUND_REWIND_EXTRA_BYTES;
+  if (stale > used)
+    memset(dst + used, 0, stale - used);   /* the tail of the older save */
+  memcpy(dst, &n, 4);
+  memcpy(dst + 4, &wide, 4);
+  dst += 8;
+  for (i = 0; i < n; i++)
+  {
+    s32 v = sound_buffer[(sound_buffer_base + i) & BUFFER_SIZE_MASK];
+    if (wide)
+      memcpy(dst + i * 4, &v, 4);
+    else
+    {
+      s16 w = (s16)v;
+      memcpy(dst + i * 2, &w, 2);
+    }
+  }
+  return used;
+}
+
+void sound_rewind_extra_load(const u8 *src)
+{
+  u32 n, wide, i;
+  memcpy(&n, src, 4);
+  memcpy(&wide, src + 4, 4);
+  if (n > SOUND_REWIND_WINDOW)
+    return;
+  src += 8;
+  for (i = 0; i < n; i++)
+  {
+    s32 v;
+    if (wide)
+      memcpy(&v, src + i * 4, 4);
+    else
+    {
+      s16 w;
+      memcpy(&w, src + i * 2, 2);
+      v = w;
+    }
+    sound_buffer[(sound_buffer_base + i) & BUFFER_SIZE_MASK] = v;
+  }
+}
+#endif /* REWIND */

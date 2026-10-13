@@ -16,6 +16,11 @@ enum
    M_HELLO = 0x01, M_CONFIG = 0x02, M_NEED = 0x03, M_ROM = 0x04,
    M_ROM_RESULT = 0x05, M_SAVE = 0x06, M_READY = 0x07, M_BULK_ACK = 0x08,
    M_STATE = 0x09,
+   M_CORECFG = 0x0A,          /* host -> guest: the mask in force (the answer
+                                 to M_CAPS; never sent unasked) */
+   M_CAPS = 0x16,             /* guest -> host: the negotiable bits it can do
+                                 (only to a host that advertised) */
+   M_INPUTS = 0x15,           /* buttons for n consecutive frames (mask bit 1) */
    M_INPUT = 0x10, M_HASH = 0x11, M_END_REQ = 0x12, M_END_AT = 0x13,
    M_FINAL = 0x14, M_ABORT = 0x1F
 };
@@ -24,6 +29,16 @@ enum
 _Static_assert(HELLO_LEN == FE_GBLINK_HELLO_LEN, "fe_gblink.h HELLO size");
 #define STATE_MAX   (1024u * 1024u)
 #define CONFIG_LEN  (1 + 1 + 8 + 2 + 2)
+/* What a guest accepts in the host's CONFIG.  Every host since the first
+ * link build sends values well inside these (delay 1-30 from the player's
+ * setting, at most 60 from a rig; hash interval 60 or 240, never 0; batch
+ * 1-154 scanlines for a GB pair, 114 for a GBA pair), so a 3.5.0 host is
+ * unaffected; a damaged or hostile CONFIG is refused instead of run with.
+ * The delay bounds how far the input ring (RING) is filled ahead; a zero
+ * hash interval would switch the periodic comparison off for both consoles;
+ * the batch is how far one machine may run ahead of the other. */
+#define CONFIG_DELAY_MAX  60u
+#define CONFIG_BATCH_MAX  1232u       /* scanlines: several frames */
 #define RING        512u           /* input frames kept per machine */
 #define HASH_RING   64u
 #define CHUNK_HDR   5u             /* type + u32 offset */
@@ -195,6 +210,17 @@ struct fe_gblink
    uint32_t save_tx_off;
    int save_ready;                   /* own save re-based, can stream */
    int ready_sent, peer_ready;
+   uint32_t core_rx;             /* the host's core mask (M_CORECFG); 0 = none */
+   uint32_t own_mask;            /* layout.core_mask as this console asked    */
+   uint8_t  host_caps;           /* guest: the host's HELLO role byte         */
+   uint8_t  caps_have;           /* host: M_CAPS arrived (a build that can)   */
+   uint8_t  corecfg_wait;        /* guest: M_CAPS sent, M_CORECFG owed        */
+   uint8_t  corecfg_have;        /* guest: M_CORECFG arrived                  */
+   uint8_t  fl_logged;
+   uint32_t ib_first;            /* input batching: first held frame, count, */
+   unsigned ib_n;                /* and the held buttons                     */
+   unsigned ib_age;              /* steps the first held frame has waited    */
+   uint16_t ib_keys[2];
 
    /* running */
    gbdual_t *dual;
@@ -950,6 +976,7 @@ fe_gblink *fe_gblink_create(const fe_gblink_platform *p,
       return NULL;
    s->p = *p;
    s->l = *l;
+   s->own_mask = l->core_mask;
    snprintf(s->rom_path, sizeof(s->rom_path), "%s", l->rom_path);
    s->l.rom_path = s->rom_path;
    s->local_slot = l->is_host ? 0 : 1;
@@ -1082,7 +1109,9 @@ static void send_hello(fe_gblink *s)
    uint8_t *q = m;
    *q++ = M_HELLO;
    *q++ = FE_GBLINK_PROTO;
-   *q++ = (uint8_t)(s->l.is_host ? 1 : 0);
+   /* role: non-zero = host (all an old guest tests); a host that can
+    * negotiate says so in bit 1 (fe_gblink.h, core_mask) */
+   *q++ = (uint8_t)(s->l.is_host ? (1u | FE_GBLINK_HOSTCAP_NEGOTIATE) : 0u);
    *q++ = s->own.console;
    *q++ = s->own.palette;
    put32(q, s->own.rom_size); q += 4;
@@ -1375,6 +1404,21 @@ static void start_pair(fe_gblink *s)
 {
    gbdual_config_t cfg;
    int slot;
+   /* a guest that never sent M_CAPS is a build that cannot: plain session */
+   if (s->l.is_host && !s->caps_have)
+      s->l.core_mask &= ~FE_GBLINK_MASK_NEGOTIABLE;
+   if (!s->fl_logged)
+   {
+      int src;
+      int on = fe_gblink_fast_link(s, &src);
+      FE_EVT_ONLY(on); FE_EVT_ONLY(src);
+      s->fl_logged = 1;
+      fe_evt("gblink_fast_link on=%d source=%s own=%d role=%s", on,
+             src == FE_GBLINK_FL_HOST ? "host"
+             : src == FE_GBLINK_FL_OLD_PEER ? "old_peer" : "own",
+             (s->own_mask & FE_GBLINK_MASK_INPUT_BATCH) != 0,
+             s->l.is_host ? "host" : "guest");
+   }
    if (s->m)
    {
       start_pair_m(s);
@@ -1614,7 +1658,24 @@ static void setup_step(fe_gblink *s)
       if (s->peer_need == 1 && s->rom_tx_off < s->own.rom_size)
          stream_rom(s, &budget);
    }
-   if (!s->ready_sent && setup_complete(s))
+   if (!s->ready_sent && setup_complete(s) && !s->l.is_host)
+   {
+      if (((s->core_rx ^ s->l.core_mask) & ~FE_GBLINK_MASK_NEGOTIABLE) &&
+          (!s->corecfg_wait || s->corecfg_have))
+      {
+         /* the two consoles would compute different machines: refuse */
+         fe_evt("gblink_core_mismatch host=%08x own=%08x",
+                (unsigned)s->core_rx, (unsigned)s->l.core_mask);
+         fail(s, FE_GBLINK_E_PROTO, 1);
+         return;
+      }
+      /* the negotiable bits are the host's (0 from a host that sent none) */
+      if (!s->corecfg_wait || s->corecfg_have)
+         s->l.core_mask = (s->l.core_mask & ~FE_GBLINK_MASK_NEGOTIABLE) |
+                          (s->core_rx & FE_GBLINK_MASK_NEGOTIABLE);
+   }
+   if (!s->ready_sent && setup_complete(s) &&
+       (s->l.is_host || !s->corecfg_wait || s->corecfg_have))
    {
       uint8_t m[1] = { M_READY };
       sendm(s, m, 1);
@@ -1626,9 +1687,52 @@ static void setup_step(fe_gblink *s)
 
 /* -------------------------------------------------------- running -- */
 
+/* INPUT BATCHING (layout.core_mask bit 1, docs/GBA-LINK-MIRROR.md 28): the
+ * buttons for two consecutive frames leave in one message, so the session
+ * puts one packet on the air every second frame instead of every frame.
+ * The same buttons reach the same frames; only how they travel changes.
+ * Both consoles must agree (a build that does not know M_INPUTS would refuse
+ * it), which the core-mask handshake checks before the session starts.
+ * A held frame is flushed alone whenever the pair stalls, so batching can
+ * delay a frame's buttons by one local frame at most. */
+static void flush_input_batch(fe_gblink *s)
+{
+   uint8_t m[1 + 4 + 1 + 2 * 2];
+   unsigned i;
+   if (!s->ib_n)
+      return;
+   m[0] = M_INPUTS;
+   put32(m + 1, s->ib_first);
+   m[5] = (uint8_t)s->ib_n;
+   for (i = 0; i < s->ib_n; i++)
+      put16(m + 6 + 2 * i, s->ib_keys[i]);
+   sendm(s, m, 6 + 2 * s->ib_n);
+   s->ib_n = 0;
+}
+
 static void send_input(fe_gblink *s, uint32_t frame, uint16_t buttons)
 {
    uint8_t m[7];
+   if (s->l.core_mask & FE_GBLINK_MASK_INPUT_BATCH)
+   {
+      if (s->ib_n && s->ib_first + s->ib_n != frame)
+         flush_input_batch(s);
+      if (!s->ib_n)
+      {
+         s->ib_first = frame;
+         s->ib_age = 0;
+      }
+      s->ib_keys[s->ib_n++] = buttons;
+      /* STAGGER: the host's packet leaves on odd frames, the guest's on
+       * even ones.  Both consoles are on the same frame at about the same
+       * moment, so without this both would send together and each ack
+       * would wait two whole frames for its ride (measured in PPSSPP:
+       * the ride time ran out and bare ACKs came back).  Staggered, an
+       * ack rides on the packet that leaves one frame later. */
+      if (s->ib_n >= 2 || (frame & 1u) == (s->local_slot ? 0u : 1u))
+         flush_input_batch(s);
+      return;
+   }
    m[0] = M_INPUT;
    put32(m + 1, frame);
    put16(m + 5, buttons);
@@ -2044,6 +2148,10 @@ int fe_gblink_step(fe_gblink *s, uint16_t local_buttons)
       }
       return FE_GBLINK_IDLE;
    }
+   /* input batching: a held frame never waits more than two steps for its
+    * companion (the end of a session, a paused local machine) */
+   if (s->ib_n && ++s->ib_age > 2)
+      flush_input_batch(s);
    s->pending_buttons = local_buttons;
    {
       uint64_t t0 = clock_us(s), ta;
@@ -2120,6 +2228,7 @@ int fe_gblink_step(fe_gblink *s, uint16_t local_buttons)
    }
    s->st.stalls++;
    s->win.stalls++;
+   flush_input_batch(s);        /* never hold buttons across a stall */
    nack_maybe(s);
    if (s->streak == 0)
    {
@@ -2182,6 +2291,7 @@ void fe_gblink_receive(fe_gblink *s, const void *buf, size_t len)
          fail(s, FE_GBLINK_E_PROTO, 1);
          return;
       }
+      s->host_caps = s->l.is_host ? 0 : q[1];
       q += 2;
       s->peer.console = *q++;
       s->peer.palette = *q++;
@@ -2259,6 +2369,18 @@ void fe_gblink_receive(fe_gblink *s, const void *buf, size_t len)
          send_config(s);
          config_known(s);
       }
+      else if (s->host_caps & FE_GBLINK_HOSTCAP_NEGOTIATE)
+      {
+         /* a host that negotiates: say what this build can do (whatever
+          * this console's own setting is -- the host decides) and wait
+          * for its answer before READY */
+         uint8_t cm[5];
+         cm[0] = M_CAPS;
+         put32(cm + 1, FE_GBLINK_MASK_NEGOTIABLE);
+         sendm(s, cm, sizeof(cm));
+         s->corecfg_wait = 1;
+         fe_evt("gblink_caps sent=%08x", (unsigned)FE_GBLINK_MASK_NEGOTIABLE);
+      }
       /* A vtable pair compares SHA-1s only: wait for our own. */
       if (s->m && !s->own_hashed)
          s->lookup_pending = 1;
@@ -2272,12 +2394,53 @@ void fe_gblink_receive(fe_gblink *s, const void *buf, size_t len)
          fail(s, FE_GBLINK_E_PROTO, 1);
          return;
       }
+      if (b[1] > CONFIG_DELAY_MAX || get16(b + 10) == 0 ||
+          get16(b + 12) == 0 || get16(b + 12) > CONFIG_BATCH_MAX)
+      {
+         fe_evt("gblink_config_refused delay=%u hash_every=%u batch=%u",
+                (unsigned)b[1], (unsigned)get16(b + 10),
+                (unsigned)get16(b + 12));
+         fail(s, FE_GBLINK_E_PROTO, 1);
+         return;
+      }
       s->delay = b[1];
       s->seed = (int64_t)get64(b + 2);
       s->hash_interval = get16(b + 10);
       s->batch = get16(b + 12);
       config_known(s);
       break;
+   case M_CORECFG:
+      if (len != 5 || s->l.is_host || s->corecfg_have ||
+          s->state != FE_GBLINK_SETUP)
+      {
+         fail(s, FE_GBLINK_E_PROTO, 1);
+         return;
+      }
+      s->core_rx = get32(b + 1);
+      s->corecfg_have = 1;
+      break;
+   case M_CAPS:
+   {
+      uint8_t cm[5];
+      uint32_t can;
+      if (len != 5 || !s->l.is_host || s->caps_have ||
+          s->state != FE_GBLINK_SETUP)
+      {
+         fail(s, FE_GBLINK_E_PROTO, 1);
+         return;
+      }
+      can = get32(b + 1);
+      s->caps_have = 1;
+      /* the host decides, within what the guest's build can do */
+      s->l.core_mask = (s->l.core_mask & ~FE_GBLINK_MASK_NEGOTIABLE) |
+                       (s->l.core_mask & FE_GBLINK_MASK_NEGOTIABLE & can);
+      cm[0] = M_CORECFG;
+      put32(cm + 1, s->l.core_mask);
+      sendm(s, cm, sizeof(cm));
+      fe_evt("gblink_core_mask sent=%08x guest_can=%08x",
+             (unsigned)s->l.core_mask, (unsigned)can);
+      break;
+   }
    case M_NEED:
       if (len != 2)
       {
@@ -2346,6 +2509,17 @@ void fe_gblink_receive(fe_gblink *s, const void *buf, size_t len)
       break;
    }
    case M_READY:
+      /* One byte, during setup, after the HELLO it answers -- and, for a
+       * guest, after the CONFIG the host sends before it.  (Every build
+       * sends it so; a repeat is harmless.) */
+      if (len != 1 || s->state != FE_GBLINK_SETUP || !s->have_hello ||
+          (!s->l.is_host && !s->have_config))
+      {
+         fe_evt("gblink_ready_refused len=%u state=%d hello=%d config=%d",
+                (unsigned)len, (int)s->state, s->have_hello, s->have_config);
+         fail(s, FE_GBLINK_E_PROTO, 1);
+         return;
+      }
       s->peer_ready = 1;
       break;
    case M_BULK_ACK:
@@ -2369,6 +2543,30 @@ void fe_gblink_receive(fe_gblink *s, const void *buf, size_t len)
          fail(s, FE_GBLINK_E_PROTO, 1);
          return;
       }
+      break;
+   }
+   case M_INPUTS:
+   {
+      int r = s->local_slot ^ 1;
+      uint32_t f;
+      unsigned i, n;
+      FE_EVT_ONLY(r);
+      if (len < 8 || !s->have_config ||
+          !(s->l.core_mask & FE_GBLINK_MASK_INPUT_BATCH) ||
+          (n = b[5]) == 0 || n > 2 || len != 6 + 2 * n)
+      {
+         fail(s, FE_GBLINK_E_PROTO, 1);
+         return;
+      }
+      f = get32(b + 1);
+      for (i = 0; i < n; i++)
+         if (take_input(s, f + i, (uint16_t)get16(b + 6 + 2 * i), 0) < 0)
+         {
+            fe_evt("gblink_input_gap got=%u want=%llu", f + i,
+                   (unsigned long long)s->have[r]);
+            fail(s, FE_GBLINK_E_PROTO, 1);
+            return;
+         }
       break;
    }
    case M_HASH:
@@ -2448,6 +2646,23 @@ void fe_gblink_receive(fe_gblink *s, const void *buf, size_t len)
 /* ---------------------------------------------------- introspection -- */
 
 int fe_gblink_state(const fe_gblink *s) { return s ? s->state : FE_GBLINK_FAILED; }
+
+int fe_gblink_fast_link(const fe_gblink *s, int *source)
+{
+   int on, src;
+   if (!s)
+      return 0;
+   on = (s->l.core_mask & FE_GBLINK_MASK_INPUT_BATCH) != 0;
+   if (s->l.is_host)
+      src = (!on && (s->own_mask & FE_GBLINK_MASK_INPUT_BATCH))
+               ? FE_GBLINK_FL_OLD_PEER : FE_GBLINK_FL_OWN;
+   else
+      src = (s->host_caps & FE_GBLINK_HOSTCAP_NEGOTIATE) ? FE_GBLINK_FL_HOST
+                                                         : FE_GBLINK_FL_OLD_PEER;
+   if (source)
+      *source = src;
+   return on;
+}
 int fe_gblink_error(const fe_gblink *s) { return s ? s->error : FE_GBLINK_E_LOCAL; }
 gbdual_t *fe_gblink_dual(const fe_gblink *s) { return s ? s->dual : NULL; }
 int fe_gblink_local_slot(const fe_gblink *s) { return s ? s->local_slot : -1; }

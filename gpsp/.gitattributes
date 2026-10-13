@@ -22,3 +22,4 @@ tools/gbamirror/linkmenu/*.ui text eol=lf
 tools/ui_model/savestates/*.spec text eol=lf
 tools/ui_model/savestates/*.ui text eol=lf
 tools/ui_model/savestates/*.sh text eol=lf
+tools/e2e/goldens/*.hashes text eol=lf

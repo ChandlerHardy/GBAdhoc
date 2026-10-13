@@ -109,6 +109,15 @@ int fe_autopilot_ff(void);
 /* Returns 1 (and clears the flag) if the script requested a frame dump. */
 int fe_autopilot_dump_pending(void);
 
+#ifdef REWIND
+/* REWIND builds: `rewind N` in a script holds the rewind control for N
+ * display ticks.  1 while the tick fe_autopilot_frame() just decided is one
+ * of them: the frontend then calls fe_host_rewind_step() instead of
+ * fe_host_run_frame(), and fe_host_rewind_release() on the first tick that
+ * is not. */
+int fe_autopilot_rewind(void);
+#endif
+
 #ifdef GPSP_PERF_RIG
 /* Returns 1 (and clears the flag) if the script requested a savestate RELOAD
  * (`state`).  Harness builds only, so the release ELF stays byte-identical:

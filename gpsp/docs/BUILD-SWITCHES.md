@@ -34,6 +34,7 @@ alike. Changing one changes emulation.
 | `SMC_GATES_SIMPLE` | the 2.0.1 add-only gate rule. Once placed, a gate never moves, so an already-translated block can never disagree with the table. 2.0.2's evicting rule is what crashed Heart & Soul. |
 | `SMC_GATES_RANKED` | promote after 64 observed writes when at least half changed the word. Counts are lifetime within one ROM: there is no active staleness window, so sound-mode changes do not reset the evidence. See below. |
 | `SMC_GATE_BITMAP` | same gate table and boundaries, tested through a bitmap instead of comparing every live gate per compiled instruction. |
+| `ENTRY_GATES` | when the RAM translation cache is exhausted, every RAM block start becomes a gate and the gated block jumps straight to its continuation, so a routine entered at many points is translated once instead of once per entry (Driver 2: 887 cache-full flushes -> 1 at 384 KiB, per-frame state bit-identical on the twin, 24-35 -> 59.7 fps on a PSP-3000's small tier). Armed only by an exhaustion flush; reset with the SMC gates (ROM load, link cold start). Requires `SMC_GATE_BITMAP`. |
 | `SMC_PARTIAL_SAFE` | after a reported SMC trap, selectively retires ranges for a bounded ARM STMIA/LR shape; this M4A-motivated heuristic is not ROM-specific. Other reported writes use the full flush. Block-store emitters check only the final word, so an earlier code write can escape detection if that final word is untagged. |
 | `SMC_PARTIAL_STABLE_THUNK` | a permanent per-block RAM entry thunk, so retiring a block redirects the thunk rather than orphaning inbound links. |
 | `SMC_PARTIAL_DIRECT_LINKS` | keep RAM→RAM links direct; route only persistent ROM→RAM links through an island. Requires the stable thunk. |
@@ -246,7 +247,7 @@ caches at startup instead of at compile time, so one EBOOT serves every model.
 The SMALL tier (2 MB ROM / 384 KB RAM code, `SMALL_TRANSLATION_CACHE`) is
 static and is what a PSP-1000 always gets.  In `retro_init`, before the ROM
 page cache takes the heap, `dynarec_select_translation_caches()` tries one
-`malloc` of the LARGE tier (10 MB / 512 KB) plus 20 MB of headroom (the
+`malloc` of the LARGE tier (10 MB / 384 KB) plus 20 MB of headroom (the
 15-block ROM cache, the 1 MB post-load reserve, 4 MB frontend slack); if that
 fits -- only possible with the 64 MiB layout -- it allocates the LARGE tier
 from the heap, otherwise it keeps the static arrays and touches nothing.

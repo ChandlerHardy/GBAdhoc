@@ -88,6 +88,16 @@ const char *fe_np_start_reason(void);
 /* ADR-0062: override netdrv's ARQ timers before fe_np_start(). Microseconds;
  * 0 = leave the build-time ND_* default. See the comment at the definition. */
 void fe_np_set_arq_timers(uint32_t rto_first_max_us, uint32_t rto_min_us);
+/* Ack riding for the next session (netdrv.h nd_config.ack_ride_us; 0 = off). */
+void fe_np_set_ack_ride(uint32_t us);
+/* The product value a running GBA Link Cable session rides at (0 = never);
+ * not a latch: fe_np_ack_ride_session applies and removes it. */
+void fe_np_set_ack_ride_product(uint32_t us);
+/* The ride in force in the open session right now (0 = none / no session). */
+uint32_t fe_np_ack_ride_now(void);
+/* A session that runs Fast link turns ack riding on for its length (and off
+ * again at its end), unless fe_np_set_ack_ride fixed a value. */
+void fe_np_ack_ride_session(int on);
 
 /* Per-frame service: pumps netdrv (delivering into the core), emits
  * net_stats. Safe to call when not started (no-op). */

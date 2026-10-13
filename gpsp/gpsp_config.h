@@ -14,6 +14,12 @@
 /* Cache sizes and their config knobs */
 #if defined(SMALL_TRANSLATION_CACHE)
   #define ROM_TRANSLATION_CACHE_SIZE (1024 * 1024 * 2)
+  /* ONE RAM code cache size on every tier and on both cores of a link
+   * session: two copies of the same machine then fill -- and, with
+   * ENTRY_GATES, gate -- at the same moment whatever tier each one got.
+   * 384 KiB, not 512: this array is static in both link cores, and instance
+   * B's state is padded to whole MiB blocks (psp/gbalink_core_b.ld) with
+   * under 128 KiB to spare, so 512 here cost a PSP-1000 1.2 MiB of image. */
   #define RAM_TRANSLATION_CACHE_SIZE (1024 * 384)
 #else
   #define ROM_TRANSLATION_CACHE_SIZE (1024 * 1024 * 10)
@@ -26,7 +32,7 @@
  * They are the sizes the old BIG_JIT=1 build compiled in. */
 #if defined(RUNTIME_JIT_CACHE)
   #define ROM_TRANSLATION_CACHE_SIZE_LARGE (1024 * 1024 * 10)
-  #define RAM_TRANSLATION_CACHE_SIZE_LARGE (1024 * 512)
+  #define RAM_TRANSLATION_CACHE_SIZE_LARGE (1024 * 384)   /* = the SMALL tier's, see above */
 #endif
 
 /* LAYOUT_PIN (PSP, OPT-IN: defined only by `make LAYOUT_PIN=1`, off by

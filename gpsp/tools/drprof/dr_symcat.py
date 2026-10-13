@@ -103,7 +103,10 @@ def main():
             size = "0"
         else:
             continue
-        if name in ("rom_translation_cache", "ram_translation_cache",
+        # the pair twin: instance B is the core renamed gbab_* -- same
+        # category as the symbol it was renamed from, bucket under its own name
+        base = name[5:] if name.startswith("gbab_") else name
+        if base in ("rom_translation_cache", "ram_translation_cache",
                     "rom_translation_cache_static", "ram_translation_cache_static"):
             out.append((int(addr, 16), int(size, 16), C["other"], name))
             continue
@@ -111,8 +114,8 @@ def main():
             continue
         if name.startswith(".pic."):
             name = name[5:]
-        if name in member:
-            c = cat_for(name, member[name])
+        if base in member:
+            c = cat_for(base, member[base])
         elif name.startswith(HOST_PREFIX):
             c = "host"
         else:

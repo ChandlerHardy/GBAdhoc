@@ -32,18 +32,22 @@ static int *g_mer_stage[2] = {&stage[0], &stage[1]};
 static unsigned char vram_clean[96];
 static unsigned now, done_at, latency, posts, watchdogs, blits;
 static int teardown;
+static int refused;           /* the ME's answer to the render in flight */
+static const char *teardown_why = "ff_render_wedge";
 
 static unsigned sceKernelGetSystemTimeLow(void) { now += 100; return now; }
 static int me_host_idle(void) { return now >= done_at; }
+static int me_host_render_refused(void) { return refused; }
 static int me_host_up(void) { return g_me_rend; }
 static int me_host_input_done(void) { return 1; }
 static void mer_note_sum(void) {}
 static int me_host_watchdog_frame(void) { watchdogs++; return 0; }
 static void me_rend_teardown(const char *why)
 {
-   assert(strcmp(why, "ff_render_wedge") == 0);
+   assert(strcmp(why, teardown_why) == 0);
    teardown++;
    g_me_rend = 0;
+   g_mer_pending = g_mer_ready = g_mer_last_presented = -1;   /* as the real one */
 }
 static void me_rend_fill_desc(int out)
 {
@@ -106,6 +110,8 @@ static void reset(void)
    g_ff_gate = g_ff_uncapped = g_ff_mult = 0;
    g_mer_drops = g_fps_drawn = g_mer_miss = g_mer_census = 0;
    g_mer_watch_us = now = done_at = posts = watchdogs = blits = teardown = 0;
+   refused = 0;
+   teardown_why = "ff_render_wedge";
    latency = 12000;
 }
 
@@ -264,6 +270,26 @@ int main(void)
    me_rend_frame(1);
    assert(teardown == 1 && !g_me_rend && posts == 1);
    assert(now - start >= MER_INPUT_US && now - start < MER_INPUT_US + 1000);
+
+   /* A render the ME REFUSED (its desc named no work area; me/me_mbox.h)
+    * completes like any other, but its stage holds no frame: it must never be
+    * promoted or presented, nothing more may be posted, and the engine goes
+    * down so the core draws again.  At 1x and under the gate alike. */
+   for (i = 0; i < 2; i++)
+   {
+      reset();
+      g_ff_gate = g_ff_uncapped = i;
+      teardown_why = "refused";
+      me_rend_frame(1);
+      assert(posts == 1 && g_mer_pending == 0);
+      refused = 1;
+      now = done_at;
+      me_rend_frame(1);
+      assert(teardown == 1 && !g_me_rend && posts == 1);
+      assert(g_mer_ready == -1 && g_fps_drawn == 0);
+      me_rend_present();
+      assert(blits == 0);
+   }
 
    /* Normal play is untouched: a late render is dropped after the 9 ms
     * budget and does not tear down below the miss limit. */

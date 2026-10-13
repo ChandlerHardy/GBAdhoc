@@ -33,6 +33,7 @@ OBJS = main_psp.o usb_handoff.o icprobe.o heap_trace.o \
        ../frontend-common/fe_evt.o \
        ../frontend-common/fe_util.o \
        ../frontend-common/fe_favs.o \
+       ../frontend-common/fe_share.o share_psp.o \
        ../frontend-common/fe_linkmode.o \
        ../frontend-common/fe_autopilot.o \
        ../frontend-common/netpacket_host.o \
@@ -183,10 +184,23 @@ LAYOUT_PIN ?= 0
 LAYOUT_PAD_BYTES ?= 0
 ifeq ($(LAYOUT_PIN),1)
 CFLAGS  += -ffunction-sections
-LDFLAGS += -Wl,--section-ordering-file=layout/hot.ord
+# HOT_ORD: the ordering file (default the single-player order).  The link
+# pair's candidate order is layout/hot_pair.ord (docs/GBA-LINK-MIRROR.md 25):
+#   PSP_EXTRA="HOT_ORD=layout/hot_pair.ord" tools/build.sh ...
+HOT_ORD ?= layout/hot.ord
+LDFLAGS += -Wl,--section-ordering-file=$(HOT_ORD)
 endif
 ifneq ($(LAYOUT_PAD_BYTES),0)
 CFLAGS  += -DLAYOUT_PAD_BYTES=$(LAYOUT_PAD_BYTES)
+endif
+
+# CHEATS (default 1; CHEATS=0 is the kill switch): the per-game cheats menu
+# (docs/CHEATS.md).  The ROOT make takes the same switch for the core half
+# (cheats.c); tools/build.sh passes one value to both.
+CHEATS ?= 1
+ifeq ($(CHEATS),1)
+CFLAGS += -DGPSP_CHEATS=1
+OBJS   += ../frontend-common/fe_cheats.o
 endif
 
 # HEAP_TRACE=1 (diagnostic harness builds only, PSP_EXTRA): every allocation
@@ -208,6 +222,15 @@ CORE_LIB = ../gpsp_libretro_psp1.a
 # the EBOOT's, so the two instances share nothing else.  Static for now: it
 # costs every game its size in heap (the census in the doc), which is why it
 # is a separate build flag and not in any release.
+# REWIND=1: the rewind prototype (docs/REWIND.md), measurement wiring only on
+# the PSP so far.  The core must be built with REWIND=1 too (root make):
+#   CORE_EXTRA="REWIND=1" PSP_EXTRA="REWIND=1" tools/build.sh harness
+# Off by default; without it not one line of the rewind code is compiled.
+REWIND ?= 0
+ifeq ($(REWIND),1)
+OBJS += ../frontend-common/fe_rewind.o ../frontend-common/fe_rewind_pack.o
+CFLAGS += -DREWIND
+endif
 GBA_LINK ?= 0
 ifeq ($(GBA_LINK),1)
 OBJS += ../frontend-common/fe_gbadual.o ../gbalink/gbalink_bus.o \
@@ -342,6 +365,11 @@ transport_inet.o: ../netdrv/transport_inet.c ../netdrv/transport_inet.h ../netdr
 # does not touch any header, so -MMD cannot see it: clean-build after edits.
 # The appended TGB_OPT overrides the global -O2 for these objects only.
 $(TGB_OBJS) ../gbcore/tgbdual/tgb_shared.o: CFLAGS += $(TGB_CFLAGS)
+# Share game data (docs/SAVE-SHARE.md) runs from the ROM browser only and
+# none of it is speed-critical; what it costs every boot is its code size,
+# which comes out of the PSP-1000's heap.  -Os for its objects (the screens
+# in ui_share.inc carry the same switch as a pragma).
+../frontend-common/fe_share.o share_psp.o: CFLAGS += -Os
 # The GB core keeps one .text per object under LAYOUT_PIN too: it is partial-
 # linked twice (gbcore_instance.ld) and none of it is on the GBA hot path.
 $(GB_CORE_OBJS) ../gbcore/tgbdual/tgb_shared.o: CFLAGS += -fno-function-sections

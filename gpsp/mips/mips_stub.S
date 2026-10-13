@@ -757,6 +757,14 @@ fnptrs:
   .long flush_translation_cache_ram_dma # 11
   .long smc_prof_note_store            # 12  (ADR-0030, counters only)
 
+#ifdef REWIND
+# Rewind's written-page map (gba_memory.h, RW_CLEAN_BYTES = 360).  Here, a
+# 16-bit offset from `reg`, so a store stub marks a page with three
+# instructions and no lui: srl / addu $16 / sb $zero.
+defobj(gba_rewind_clean)
+  .space 360
+#endif
+
 #if !defined(MMAP_JIT_CACHE)
 
 # Make this section executable!

@@ -22,8 +22,14 @@
  * Every layout sees the SAME trace, so differences between layouts are the
  * layouts, not the run.
  *
+ * THE PAIR (GBA link, tools/layout/pair_sim.sh): jit= may be given up to
+ * MAXJ times, one per translation-cache range of the twin (instance A's
+ * ROM+RAM caches, instance B's ROM cache, instance B's RAM cache -- B's two
+ * are NOT contiguous on a PSP, where B is the SMALL static tier); a layout
+ * line then carries one more PSP base per extra range after the frame file.
+ *
  * Args: out=FILE, layouts=FILE (lines: "name map_file jit_base_hex
- *       frame_file|-"), jit=LO:HI (hex), mark=HEX (per-frame marker, the
+ *       frame_file|- [jit_base2_hex ...]"), jit=LO:HI (hex), mark=HEX (per-frame marker, the
  *       twin's drprof_host_mark), skip=N (frames before counting),
  *       size=16384 ways=2 line=64, counts=FILE (optional: per-address
  *       execution counts, as tools/cachemap/icount_plugin.c writes them).
@@ -39,6 +45,7 @@
 QEMU_PLUGIN_EXPORT int qemu_plugin_version = QEMU_PLUGIN_VERSION;
 
 #define MAXL 160
+#define MAXJ 4
 enum { GJ, GS, GF, NG };
 
 typedef struct
@@ -48,7 +55,7 @@ typedef struct
    uint64_t *age;
    uint64_t acc[NG], miss[NG];
    GHashTable *map;                  /* twin addr -> psp addr (shared) */
-   uint32_t jit_line;                /* PSP JIT base >> lshift */
+   uint32_t jit_line[MAXJ];          /* PSP JIT base >> lshift, per range */
    uint32_t *frame;                  /* per-frame PSP lines */
    unsigned nframe;
    char *name;
@@ -56,7 +63,8 @@ typedef struct
 
 typedef struct
 {
-   int jit;                          /* translated code: lines are offsets */
+   int jit;                          /* translated code: lines are offsets;
+                                        1 + the range's index */
    unsigned nj;
    uint32_t *jl;                     /* jit line offsets */
    unsigned n[MAXL];
@@ -68,8 +76,10 @@ typedef struct
 
 static cache_t C[MAXL];
 static unsigned nl, lshift;
-static char *out_path, *counts_path;
-static uint64_t mark_addr, skip_marks, marks, jit_lo, jit_hi;
+static char *out_path, *counts_path, *misses_path;
+static GHashTable *miss_by_line;     /* misses=FILE: layout 0, PSP line -> n */
+static uint64_t mark_addr, skip_marks, marks, jit_lo[MAXJ], jit_hi[MAXJ];
+static unsigned njit;
 static int armed = 1;
 static uint64_t tick;
 static GPtrArray *recs;
@@ -90,6 +100,12 @@ static inline void access_line(cache_t *c, uint32_t line, int g)
          return;
       }
    c->miss[g]++;
+   if (miss_by_line && c == &C[0])
+   {
+      gpointer k = GSIZE_TO_POINTER((gsize)line);
+      g_hash_table_insert(miss_by_line, k, GSIZE_TO_POINTER(
+         GPOINTER_TO_SIZE(g_hash_table_lookup(miss_by_line, k)) + 1));
+   }
    for (w = 0; w < c->ways; w++)
       if (a[w] < oldest)
       {
@@ -112,7 +128,7 @@ static void on_tb(unsigned int vcpu, void *udata)
    {
       for (k = 0; k < nl; k++)
          for (i = 0; i < r->nj; i++)
-            access_line(&C[k], C[k].jit_line + r->jl[i], GJ);
+            access_line(&C[k], C[k].jit_line[r->jit - 1] + r->jl[i], GJ);
       return;
    }
    for (k = 0; k < nl; k++)
@@ -136,6 +152,8 @@ static void on_mark(unsigned int vcpu, void *udata)
          memset(C[k].acc, 0, sizeof(C[k].acc));
          memset(C[k].miss, 0, sizeof(C[k].miss));
       }
+      if (miss_by_line)
+         g_hash_table_remove_all(miss_by_line);
       if (counts_path)
          for (i = 0; i < recs->len; i++)
             ((tbrec *)g_ptr_array_index(recs, i))->count = 0;
@@ -160,15 +178,19 @@ static void tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
       for (i = 0; i < n; i++)
          r->vaddr[i] = qemu_plugin_insn_vaddr(qemu_plugin_tb_get_insn(tb, i));
    }
-   if (jit_hi && va0 >= jit_lo && va0 < jit_hi)
+   for (k = 0; k < njit; k++)
+      if (va0 >= jit_lo[k] && va0 < jit_hi[k])
+         break;
+   if (k < njit)
    {
       uint32_t last = UINT32_MAX;
-      r->jit = 1;
+      unsigned jr = k;
+      r->jit = 1 + (int)jr;
       r->jl = g_new0(uint32_t, n);
       for (i = 0; i < n; i++)
       {
          uint64_t va = qemu_plugin_insn_vaddr(qemu_plugin_tb_get_insn(tb, i));
-         uint32_t l = (uint32_t)((va - jit_lo) >> lshift);
+         uint32_t l = (uint32_t)((va - jit_lo[jr]) >> lshift);
          if (l != last)
             r->jl[r->nj++] = l;
          last = l;
@@ -232,6 +254,20 @@ static void at_exit(qemu_plugin_id_t id, void *p)
                     C[k].acc[g]);
          fprintf(fh, "\n");
       }
+      fclose(fh);
+   }
+   if (misses_path && miss_by_line && (fh = fopen(misses_path, "w")))
+   {
+      /* layout 0's misses per PSP line address (line << shift), for
+       * tools/layout/pair_misses.py: which code is being evicted */
+      GHashTableIter it;
+      gpointer key, val;
+      fprintf(fh, "# frames %" PRIu64 " layout %s\n", marks, nl ? C[0].name : "-");
+      g_hash_table_iter_init(&it, miss_by_line);
+      while (g_hash_table_iter_next(&it, &key, &val))
+         fprintf(fh, "%" PRIx64 " %" PRIu64 "\n",
+                 (uint64_t)GPOINTER_TO_SIZE(key) << lshift,
+                 (uint64_t)GPOINTER_TO_SIZE(val));
       fclose(fh);
    }
    if (counts_path && (fh = fopen(counts_path, "w")))
@@ -327,18 +363,25 @@ QEMU_PLUGIN_EXPORT int qemu_plugin_install(qemu_plugin_id_t id,
    {
       if (!strncmp(argv[i], "out=", 4)) out_path = g_strdup(argv[i] + 4);
       else if (!strncmp(argv[i], "counts=", 7)) counts_path = g_strdup(argv[i] + 7);
+      else if (!strncmp(argv[i], "misses=", 7))
+      {
+         misses_path = g_strdup(argv[i] + 7);
+         miss_by_line = g_hash_table_new(g_direct_hash, g_direct_equal);
+      }
       else if (!strncmp(argv[i], "layouts=", 8)) lay = g_strdup(argv[i] + 8);
       else if (!strncmp(argv[i], "size=", 5)) size = atoi(argv[i] + 5);
       else if (!strncmp(argv[i], "ways=", 5)) ways = atoi(argv[i] + 5);
       else if (!strncmp(argv[i], "line=", 5)) line = atoi(argv[i] + 5);
       else if (!strncmp(argv[i], "mark=", 5)) mark_addr = strtoull(argv[i] + 5, NULL, 16);
       else if (!strncmp(argv[i], "skip=", 5)) skip_marks = strtoull(argv[i] + 5, NULL, 10);
-      else if (!strncmp(argv[i], "jit=", 4))
+      else if (!strncmp(argv[i], "jit=", 4) && njit < MAXJ)
       {
          char *e;
-         jit_lo = strtoull(argv[i] + 4, &e, 16);
+         jit_lo[njit] = strtoull(argv[i] + 4, &e, 16);
          if (*e == ':')
-            jit_hi = strtoull(e + 1, NULL, 16);
+            jit_hi[njit] = strtoull(e + 1, NULL, 16);
+         if (jit_hi[njit])
+            njit++;
       }
    }
    if (!out_path || !lay || !(fh = fopen(lay, "r")))
@@ -348,19 +391,23 @@ QEMU_PLUGIN_EXPORT int qemu_plugin_install(qemu_plugin_id_t id,
    while (nl < MAXL && fgets(buf, sizeof(buf), fh))
    {
       char name[256], map[512], frame[512];
-      unsigned long long jb;
+      unsigned long long jb, jx[MAXJ - 1] = { 0, 0, 0 };
       cache_t *c = &C[nl];
-      if (buf[0] == '#' || sscanf(buf, "%255s %511s %llx %511s", name, map,
-                                  &jb, frame) != 4)
+      int nf, q;
+      if (buf[0] == '#' ||
+          (nf = sscanf(buf, "%255s %511s %llx %511s %llx %llx %llx", name, map,
+                       &jb, frame, &jx[0], &jx[1], &jx[2])) < 4)
          continue;
       if (jb & (line - 1))
          return -1;                 /* JIT bases are line-aligned (memalign) */
+      for (q = 0; q < MAXJ - 1; q++)
+         c->jit_line[q + 1] = (uint32_t)((q < nf - 4 ? jx[q] : jb) >> lshift);
       c->ways = ways;
       c->nsets = size / (ways * line);
       c->tag = g_new0(uint32_t, c->nsets * ways);
       c->age = g_new0(uint64_t, c->nsets * ways);
       c->map = load_map(maps, map);
-      c->jit_line = (uint32_t)(jb >> lshift);
+      c->jit_line[0] = (uint32_t)(jb >> lshift);
       c->name = g_strdup(name);
       if (!c->map || load_frame(c, frame) != 0)
          return -1;

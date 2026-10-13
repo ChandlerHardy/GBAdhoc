@@ -14,6 +14,7 @@ int filestream_close(RFILE *stream)
 { (void)stream; return 0; }
 
 u32 cpu_ticks;
+u32 frame_counter;   /* the savestate writer brings the RTC base up to date (rtc_clock.h) */
 u32 reg[64];
 u32 cph_bkr, cph_bkw;
 u16 palette_ram[512];

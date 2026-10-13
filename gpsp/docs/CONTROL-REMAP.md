@@ -19,6 +19,8 @@ assumed.
 | `psp/ui_psp.c` | The Controls page (`SCR_CONTROLS`), the Settings entry row, and the demo scripts. |
 | `tools/tests/test_ctl_map.c` | The host unit test, registered in the `fe_ini_bounds` suite. The runner caps the suite count at 30. |
 
+Turbo buttons (four more actions, each with a rate and a mode) are section 13.
+
 ![Settings, with the Controls entry at the bottom](img/control-remap/01-settings-entry.png)
 ![The Controls page, defaults](img/control-remap/02-defaults.png)
 
@@ -155,6 +157,9 @@ the Menu row (once locked too) is now the START+SELECT / HOME toggle of
 section 10. UP/DOWN walk the rows in the same order as the old single list
 (down the game buttons, then down the shortcuts); LEFT/RIGHT cross between the
 columns.
+
+**Turbo buttons** have one row at the foot of GAME BUTTONS, which opens
+their own page (section 13).
 
 ---
 
@@ -765,3 +770,412 @@ folder.
     the popup flag off under it after 1 s. That should leave the open dialog
     alone, since the flag is only consulted when HOME goes down, but this is
     only confirmable on hardware.
+
+---
+
+## 13. Turbo buttons
+
+Branch `claude/turbo`, from `claude/rc-4.0.0-beta` (c86e7d6). 2026-10-11, for
+the update after the 4.0.0 beta. Nothing here is on by default.
+
+A turbo button presses A or B for the player, on and off, at a fixed rate.
+There are four of them, **Turbo A, Turbo A (2), Turbo B, Turbo B (2)**, and
+they are **separate actions**: four more rows of the control table, not a
+flag on the A and B rows. All four start unbound.
+
+| | |
+|---|---|
+| ![The row on the Controls page](img/control-remap/16-turbo-row.png) | ![Capture](img/control-remap/21-turbo-capture.png) |
+| ![Bound, and the conflict said in words](img/control-remap/17-turbo-conflict.png) | ![The mode cell and its help](img/control-remap/18-turbo-mode.png) |
+| ![Light theme, two set](img/control-remap/19-turbo-light.png) | ![During link play](img/control-remap/20-turbo-link.png) |
+
+### 13a. What the player gets
+
+- **Each one takes any single bindable input**: a button or a stick
+  direction, never a chord. Turbo A on ✕ and Turbo B on ○ is fine.
+- **The conflict rule is the page's own (§3).** A turbo button that takes an
+  input another action holds leaves that action blank, and the plate says
+  so: `X was B  -  B is now blank (disabled)`. It works the other way too:
+  binding A to a turbo button's input blanks the turbo button.
+- **Each has its own rate and its own mode**, so the two Turbo A buttons can
+  behave differently.
+
+| Setting | Values | Default | CONFIG.INI |
+|---|---|---|---|
+| Button | any one input, or none | none | `bind_turbo_a`, `bind_turbo_a2`, `bind_turbo_b`, `bind_turbo_b2` |
+| Rate | 10 / 15 / 30 presses a second | 15 | `turbo_a_rate`, `turbo_a2_rate`, `turbo_b_rate`, `turbo_b2_rate` = `10` \| `15` \| `30` |
+| Mode | Hold / Toggle | Hold | `turbo_a_mode`, `turbo_a2_mode`, `turbo_b_mode`, `turbo_b2_mode` = `hold` \| `toggle` |
+
+- **Hold** pulses for as long as the button is held. **Toggle** starts
+  auto-fire on a press and stops it on the next press. A Toggle says so when
+  it starts and stops (`Turbo B: auto-fire on` / `off`), because auto-fire
+  with nothing held should never be a surprise.
+- **Auto-fire stops** when the in-game menu opens, when a state is loaded,
+  when the game is left, and when the console sleeps. A Toggle then stays
+  off until it is pressed again. A Hold button that is still down simply
+  starts again.
+- **Normal A held together with Turbo A is A held.** The pulse is OR-ed into
+  the game's buttons; a turbo button never takes a press away. Two turbo
+  buttons for the same game button are OR-ed too.
+
+### 13b. The pulse: emulated frames, not time
+
+| Rate | Frames on / off |
+|---|---|
+| 30 a second | 1 / 1 |
+| 15 a second | 2 / 2 |
+| 10 a second | 3 / 3 |
+
+- The pattern is a pure function of the **emulated frame number**
+  (`fe_host_frame_count()`), counted from the frame the press was first
+  seen. The first frame of a press is always ON, so the shortest tap is one
+  press, whatever the rate.
+- Nothing reads a clock. The same pad input on the same frames gives the
+  game the same buttons, every run.
+- **Fast-forward** runs three emulated frames per pad sample. Each of the
+  three gets its own phase, so the game sees the same train as at 1x and it
+  goes by three times as fast.
+- **GB/GBC, the GB link and the GBA link** all read the one callback
+  (`plat_input_bitmask`, §5), so turbo is the same thing in every core.
+- **Scripted input is untouched.** Autopilot scripts inject GBA buttons
+  after the mapping (`fe_host_input_inject`); turbo reads the pad. The
+  harness's `pad_script` stands in for the real pad, so it does drive turbo:
+  that is how the runs below press the buttons.
+
+### 13c. Link play: off
+
+A turbo button does **nothing at all** while a session is up: GBA link
+cable, GBA wireless, GB/GBC link, a cable host that is only waiting, and
+Mystery Gift. That is the cheats' test, word for word
+(`link_session_any()`, shared by `cheats_link_poll` and `turbo_frame`). Its
+PSP button is bound to nothing else (the conflict rule), so the game sees no
+input from it.
+
+- Pressing one during a session toasts **"Turbo is off for link play"**
+  (the fast-forward lock's idiom: say why at the moment it is pressed).
+- The Turbo page's plate reads **"Turbo is off during link play. It comes
+  back when it ends."**, the Cheats page's sentence. The chips go to the
+  locked style, on the page and on its row. The settings can still be
+  edited.
+- A Toggle that was running when the session started is stopped, not
+  paused. It does not start by itself when the session ends.
+
+### 13d. The pages
+
+The two columns of the Controls page are full (ten rows each at an 18 px
+pitch, and the rewind build's SHORTCUTS column has eleven). Four rows that
+each need a rate and a mode do not fit in a chip row. So:
+
+- **GAME BUTTONS gains one row, "Turbo buttons"**, under Right. Its chip
+  says how many are set (`none`, `2 set`). The column goes from ten rows to
+  eleven, which makes its pitch 16 px; nothing else on the page moves.
+- **X on it opens the Turbo page.** It is still the Controls screen
+  (`screen_turbo`, drawn by `screen_controls`), so both ways in, capture and
+  the plate are the ones the page already had.
+- **Three cells a row: Button, Rate, Mode.** The d-pad moves the cell
+  cursor (an outline round the chip). The keys are the Controls page's:
+
+| Key | On Button | On Rate | On Mode |
+|---|---|---|---|
+| ✕ | rebind (capture) | 10 → 15 → 30 → 10 | Hold ↔ Toggle |
+| △ | none (its default) | 15 | Hold |
+| □ | none | - | - |
+| ○ | back to the Controls page | | |
+
+- Two lines of help under the rows follow the cell.
+- **"Reset to defaults"** unbinds all four and returns them to 15 and Hold.
+  A rate or a mode alone makes the Settings row read "custom".
+
+### 13e. Zero cost, zero change when nothing is bound
+
+- **`ctl_game_mask()` is untouched.** It does not know turbo exists.
+- `plat_input_bitmask()` adds one test of one byte (`g_turbo.live`), which
+  is zero unless a bound turbo button is firing right now.
+- The main loop adds one OR of the four bindings per iteration, and calls
+  `turbo_frame()` only when it is nonzero or something is live.
+- `ctl_yields()` scans the shortcuts only (`CTL_SC_END`), the rows it always
+  scanned.
+- **CONFIG.INI is byte-identical** for a player who never binds one. The
+  keep rule (§4) covers all twelve keys: written only when not the default,
+  or when already in the file.
+- **Old builds reading a new config** ignore the keys: every build reads
+  CONFIG.INI by key, and an unknown key is only ever reported
+  (`cfg_unknown`) by telemetry builds. This follows from the reader; it
+  was not run against an older binary.
+- **A hand-edited value we do not know** (`turbo_a_rate = 20`, an empty or
+  over-long value, a chord on `bind_turbo_a`) falls back to the default, is
+  reported as `config_bind_invalid`, and is repaired by the next save.
+
+### 13f. Table order, and the rewind build
+
+The turbo rows are the **last** rows of the table (`CTL_TURBO_A1 =
+CTL_SC_END`), after every game button and shortcut.
+
+- The load-time repair gives a contested input to the explicit binding, and
+  between two explicit ones to the **earlier** row (§3). Every turbo row is
+  later than every other row and has no default. So whatever a file's older
+  keys resolved to before, they resolve to now: a turbo key can only win
+  against a row that is on its default, which is what the menu does too.
+- **Merging with `claude/rc-4.0.0-beta-x` (rewind).** That branch appends
+  `CTL_SC_REWIND` as the last shortcut, with Triangle as its default, taken
+  from Video preset. Last, so that an existing CONFIG.INI which binds
+  Triangle to something else keeps that. The merged enum is:
+
+  ```c
+     CTL_SC_CATCH,
+  #ifdef REWIND
+     CTL_SC_REWIND,
+  #endif
+     CTL_SC_END,                  /* one past the last shortcut */
+     CTL_TURBO_A1 = CTL_SC_END, CTL_TURBO_A2, CTL_TURBO_B1, CTL_TURBO_B2,
+     CTL_ACTIONS
+  ```
+
+  and `INFO[]` takes the rewind row before the four turbo rows. Rewind stays
+  the last **shortcut**, which is all its rule needs: its position relative
+  to every row that existed before either feature is unchanged, and the
+  turbo rows after it have no default to contest Triangle with. A turbo
+  button explicitly bound to Triangle takes it from rewind's default, as any
+  explicit binding does. `ctl_yields()` keeps scanning to `CTL_SC_END`, so
+  rewind is in the scan and the turbo rows are not.
+- **The rest of the rewind merge:**
+  1. `turbo_frame(pad, pad_new, 1)` in the main loop becomes
+     `turbo_frame(pad, pad_new, !g_rw_held)`. A held rewind then stops every
+     train: nothing fires while the game runs backwards, and a Toggle does
+     not carry on by itself when play resumes.
+  2. Nothing else. The rewind log stores each frame's **resolved** input
+     word (`rw_latch_input` reads `host.input_bitmask()`, which already
+     contains the pulse), so a replayed segment gets exactly the buttons the
+     game got, and the turbo state is not part of any snapshot.
+     `frame_count`, which the pulse counts, is not the rewind timeline and
+     never goes back.
+  3. On the Controls page both columns then have eleven rows.
+
+### 13g. Validation
+
+**Host** (`python tools/run_host_tests.py`): **30 passed, 0 failed, 0
+skipped**. `test_ctl_map.c` gains `test_turbo`, built in both flavours:
+
+- the pulse of each rate frame by frame (`X.X.`, `XX..`, `XXX...`), the
+  presses in 60 frames (30, 15, 10), a one-frame tap at twelve different
+  starting frames, release and re-press, the frame counter wrapping;
+- fast-forward's three frames per pad sample;
+- normal A held with Turbo A; both Turbo A buttons at different rates,
+  together and offset; Turbo B beside them;
+- Toggle: start, let go, stop, start again; each stop point; a Hold button
+  held through a stop;
+- link play: nothing fires in either mode, the rest of the pad still plays,
+  a session starting stops a train, a Toggle stays off afterwards;
+- **nothing bound: for all 65,536 pad words** (twelve buttons and the four
+  stick directions, system bits mixed in) the composed input equals
+  `ctl_game_mask()`, and 3.0's mask for the twelve buttons;
+- the conflict rule in every direction, the legality rules, Reset, repair of
+  a corrupt rate or mode;
+- CONFIG.INI: a default file untouched byte for byte, the exact file a
+  bound table writes, the keep rule, every rate and mode on every action,
+  five kinds of bad value, load-time duplicates, 2,000 random pre-turbo
+  files that resolve the same with and without a turbo key added, and the
+  round trip through `pcfg_load`/`pcfg_save`.
+- **Mutation-checked**: 18 edits to `ctl_map.c` each fail the test (rates
+  exchanged, phase inverted, phase taken from the global frame count, link
+  ignored, Toggle as Hold, Toggle on the level, Hold that never releases, a
+  stop that does nothing, Turbo B pressing A, chords allowed, keys always
+  written, the keep flag dropped, Reset or "is default" ignoring turbo, a
+  turbo row with a default, `20` accepted as a rate, the rate clamp
+  removed). A 19th, scanning the turbo rows in `ctl_yields()`, survives
+  because it changes cost and not behaviour.
+
+**PPSSPP** (harness builds of the base c86e7d6 and of this branch; software
+GPU, a private namespace per run; `pad_script` drives the real pad):
+
+| Run | Result |
+|---|---|
+| Emerald, 1,500 frames, a pad script of every default button and shortcut, **default config**, base vs branch | **vhash (1,444 frames), the input and shortcut events and the saved config: identical** |
+| Pokemon Red (GB), the same | **identical** (the config differs in `gb_rtc_utc_since`, the wall clock of each run) |
+| Emerald, four turbo buttons, one of each kind (`evidence/mix.inputlog.txt`) | 15: 2 on / 2 off. 30: 1 / 1. 10: 3 / 3. Toggle on at f=900, off at f=960. Both A buttons held: `XXX.` |
+| ...quick load while a Toggle runs | the pulses stop at the load |
+| ...Triangle (Turbo A) during fast-forward | sampled once per loop (every third frame) the 2 / 2 train reads on, on, off, off |
+| Pokemon Red (GB), the same script | the same input log, line for line, through f=1290 (the part before fast-forward), and the same Toggle and quick-load events |
+| **Triangle held for 1,000 frames: A on Triangle vs Turbo A on Triangle** | Emerald: the plain hold is still on the title screen at f=1421; turbo is in Birch's speech. vhash differs from f=443. Red: title screen vs Oak's speech; differs from f=421. 5 input changes vs 505. |
+| A Toggle running when the menu opens (`ui_controls_demo = 6`) | pulses f=201..300, none after the menu closes |
+| A Toggle running through a simulated sleep (`sleep_sim_at`) | none after the wake overlay's Continue |
+| `ui_turbo_lock = 1` (turbo as a link session has it) | two presses, two `turbo_locked`, no A or B from them; ○ still presses A |
+| `ui_controls_demo = 1`, the existing walk, its script one DOWN and one UP longer for the new row | the six binds and the reset it has always made |
+
+The input log line is written before the turbo step of its loop iteration,
+so each train appears one line late and one line long; the frames
+themselves get the pattern from the press's own frame (the host test, and
+the first vhash difference, show it).
+
+**Not exercised in PPSSPP:** a real link or wireless session (one emulator
+cannot hold one; the predicate is the cheats' own), and anything on
+hardware.
+
+**Harness keys** (GPSP_PERF_RIG builds): `ui_controls_demo = 6` walks the
+Turbo page and dumps `log/ge_tb_0..7.bmp`; `ui_turbo_lock = 1` shows both
+pages, and makes the buttons behave, as in a link session.
+
+### 13h. Builds
+
+| Build (a173d8a, clean tree, `GBA_LINK=1` as the beta is built) | EBOOT.PBP md5 | gbadhoc_me.prx md5 | gbadhoc_home.prx md5 |
+|---|---|---|---|
+| **release** (`builds/turbo-out/release`) | `28e8716fafaebb7580ec185dcf2efcd5` | `0f2840f85c04f6da4d0bc01110008318` | `d3434f4fd02260583c2e97ce7fe757e6` |
+| harness (`builds/turbo-out/harness`), every PPSSPP run above | `7193167e4b48fc7a3de76d3442df9d56` | `2f252eeb3c48c26e9016ed5a4f336d65` | `d3434f4fd02260583c2e97ce7fe757e6` |
+| base harness, c86e7d6 (`builds/turbo-out/base-harness`) | `17e67f61d59e9be2225ac642415447fd` | | |
+
+Screenshots, both themes: `builds/turbo-out/screens/`. Logs and end frames
+of the runs: `builds/turbo-out/evidence/`. The rig: `builds/turbo-out/rig/`.
+
+Both profiles pass `tools/build.sh`'s warning gate and binary audit. The
+hot-core note the script prints (7,008 bytes against a 6,144 budget) is the
+base's own, identical on c86e7d6.
+
+### 13i. Owner's hand test
+
+Install the **release** EBOOT, `gbadhoc_me.prx` and `gbadhoc_home.prx` from
+`builds/turbo-out/release`.
+
+1. **Nothing changed.** With your current CONFIG.INI, play a minute. Open
+   Controls and back out. CONFIG.INI has no `turbo` line.
+2. **Bind.** Controls > Turbo buttons > X on Turbo A > press ✕. The plate
+   says ✕ was B. Back in game, holding ✕ mashes A; B is on nothing until you
+   rebind it.
+3. **Rate.** Set Turbo A to 30 and Turbo A (2), on another button, to 10.
+   The difference is plain in any text box.
+4. **Toggle.** Set Turbo B to Toggle. One press starts it, with a toast;
+   the next stops it. Start it, open the menu, close it: it is off.
+5. **Fast-forward** while holding a turbo button: faster with the game.
+6. **GB/GBC.** The same in a Game Boy game.
+7. **Link.** Start any link (GB trade, GBA cable, wireless). A turbo button
+   does nothing and says "Turbo is off for link play"; the Turbo page shows
+   the plate. End the session: Hold works again, a Toggle waits for a press.
+8. **Sleep** with a Toggle running: after Continue it is off.
+9. **Power-cycle.** The bindings, rates and modes are still there.
+
+### 13j. In the REWIND build (`claude/turbo-x`)
+
+Branch `claude/turbo-x` = `claude/rc-4.0.0-beta-x` (686235c) with
+`claude/turbo` merged in (a3e5ca2), the merge of 13f applied as written:
+
+- `CTL_SC_REWIND` is the last shortcut (`CTL_SC_END - 1`); the four turbo
+  rows follow it.
+- The loop calls `turbo_frame(pad, pad_new, !g_rw_held)`.
+- The Controls page has eleven rows in each column.
+
+**Host:** 30 passed, 0 failed, 0 skipped. `test_ctl_map.c` gains
+`test_turbo_rewind`. Its first half runs in every flavour: a held rewind in
+the middle of a Hold press (nothing while held, a fresh train after), a
+Toggle ended by a held rewind and still off afterwards, a turbo button
+pressed during the hold. Its second half is a third build of the file with
+`-DREWIND`: the order of the merged table, rewind's defaults, the "old
+config that binds Triangle elsewhere keeps it" rule with and without turbo
+keys, the conflict rule between rewind and a turbo row both ways, and the
+rewind control and the game mask unchanged for all 65,536 pad words with
+turbo buttons bound.
+
+**PPSSPP** (harness `GBA_LINK=1 REWIND=1 BUILD_PRX=1`, against the 686235c
+harness in `builds/rcbx-out/s3g-harness`):
+
+| Run | Result |
+|---|---|
+| Emerald, 1,500 frames, the pad script of 13g, default config, 686235c vs this branch | **vhash (1,444), events and saved config identical** |
+| Pokemon Red (GB), the same | **identical** (config: the `gb_rtc_utc_since` wall-clock stamp only) |
+| `ui_controls_demo = 1`, 686235c vs this branch | the same binds, captures and reset |
+| `tools/rewind_player.sh` (Driver 2, `pp.d2.txt`, 5,200 frames; the player's state) | **PASS**, B late (905 frames shown backwards) and B at boot (881), never denied, checker clean |
+| Rewind on; Turbo A (Hold) held from f=600; autopilot `rewind 60` at 700 and at 1,160; Turbo B (Toggle) pressed at f=1000 | A pulses 2 / 2 up to the hold, nothing for its 54 frames, a fresh train after; B pulses from 1,000 until the second hold and never again |
+| `ui_controls_demo = 6`, dark and light | Turbo A takes Triangle from Rewind and says so; screenshots in `builds/turbo-out/screens-x/` |
+
+A `pad_script` cannot hold the rewind button for a set time when rewind is
+on: the frame counter it is keyed to stands still at the limit of the
+history, so the press never ends (the same on 686235c). Script a rewind with
+the autopilot's `rewind N`.
+
+| Build (a3e5ca2, clean tree) | EBOOT.PBP md5 | Other files |
+|---|---|---|
+| harness PRX, `GBA_LINK=1 REWIND=1 PSP_EXTRA="BUILD_PRX=1"` (`builds/turbo-out/x-harness`) | `42198c189b73e52c9358aae3f9eb5ee8` | `gbadhoc.prx` `69fc804e4bfb7ce0bb2f268515e88fe1`, `gbadhoc_me.prx` `2f252eeb3c48c26e9016ed5a4f336d65` |
+| player, release profile, title "GBAdhoc BETA", `GBA_LINK=1 REWIND=1` (`builds/turbo-out/x-play`) | `cf132983d63d99acecc2405bceb8042a` | `gbadhoc_me.prx` `0f2840f85c04f6da4d0bc01110008318`, `gbadhoc_home.prx` `d3434f4fd02260583c2e97ce7fe757e6` |
+
+### 13k. Exercising turbo on hardware from a script (harness build)
+
+`config.ini`, beside the EBOOT:
+
+```ini
+bind_turbo_a = SQUARE
+```
+
+(Square is taken from Fast-forward. In a REWIND build do not use Triangle
+unless rewind is meant to lose it.) Optional: `turbo_a_rate = 30`,
+`turbo_a_mode = toggle`.
+
+`.gpsp-harness.ini`:
+
+```ini
+rom = <game>
+pad_script = pad.txt
+autoexit_frames = 1500
+```
+
+`pad.txt`, beside the EBOOT (`<frame> <frames held> <buttons>`):
+
+```
+600 120 SQUARE
+```
+
+`log/frontend.log` then alternates, every two emulated frames at 15 a
+second (every one at 30, every three at 10):
+
+```
+EVT input mask=0x100 held=0 f=601 net=down
+EVT input mask=0x000 held=0 f=602 net=down
+EVT input mask=0x100 held=0 f=604 net=down
+```
+
+- 0x100 is A (Turbo B shows 0x001). A plain `bind_a = SQUARE` gives one
+  line at f=600 and one at f=720 instead.
+- The line is written before the turbo step of its loop, so a train shows
+  one line late and one line long; 120 frames held at 15 a second is about
+  60 changes. `log_input = 0` in the harness ini switches these lines off;
+  leave it at its default.
+- A Toggle logs `EVT turbo_toggle key=bind_turbo_a on=1 f=...` on each
+  press. `ui_turbo_lock = 1` makes the run behave as a link session: each
+  press logs `EVT turbo_locked pad_new=0x8000` and no mask line follows.
+- The real pad is OR-ed with the script, so the button can also simply be
+  held by hand.
+
+### 13l. The release candidate (`claude/rc-4.0.0-rc`)
+
+`claude/turbo-x` (664eb5c) with `claude/rewind-savefix` (b917ae0) merged in
+(7d46dad). The rewind sleep-safety work changed what "a rewind is going on"
+means, and turbo follows it:
+
+- **`playing` is `!(g_rw_on && (g_rw_held || fe_host_rewind_busy()))`.**
+  `fe_host_rewind_busy()` is "no tick has said PLAY yet": it covers the
+  landing after the control is let go, which `g_rw_held` alone missed.
+  `g_rw_held` stays in for the loop the press arrives on, before the first
+  tick has made the gesture live.
+- **`psp_rewind_land()` stops every train** when it has something to land
+  (sleep park, state save, state load, the menu or pause overlay, Mystery
+  Gift, cable start), and so does the reset behind "Slept during a rewind:
+  game restarted from its save". Both are `ctl_turbo_stop()`: frontend state
+  only. No landing call, its order or its budget is changed.
+- `test_turbo_rewind` gains the landing span, a Toggle pressed during it,
+  and the stop on a landing or reset.
+
+| Test (tree 7d46dad) | Result |
+|---|---|
+| `tools/run_host_tests.py` | 30 passed, 0 failed, 0 skipped |
+| `test_ctl_map`, three flavours (incl. `test_turbo`, `test_turbo_rewind`, `-DREWIND`) | OK |
+| `tools/rewind_all.sh` (twin `rc1`) | 70 of 70, first pass; timing-only frames 444 |
+| `rewind_savetest.py --mutants`, testdata save | K=5, 17 of 17 |
+| `rewind_sleeptest.py`, every tick 3690..3840 | 151 sleeps, 91 inside save 1's sequence, all landed, 0 resets, 0 damaged |
+| PPSSPP `rewind_player.sh` (Driver 2) | PASS, B late (941 shown backwards) and B at boot (905), never denied |
+| PPSSPP default config vs `rewind-out/psp/s14-harness`, Emerald and Red | vhash (1,444), events and saved config identical (Red: the `gb_rtc_utc_since` stamp only) |
+| PPSSPP Controls walk vs s14; Turbo page walk, dark and light | same binds as s14; Turbo A takes Triangle from Rewind |
+| PPSSPP turbo across two scripted rewinds | silent for each gesture, fresh Hold train after, Toggle off after |
+
+A landing forced in the middle of a gesture with a turbo button down (menu
+or sleep during a rewind) is covered by the host model and by reading the
+code, not by a PPSSPP run.
+
+Builds of 7d46dad, clean tree, `GBA_LINK=1 REWIND=1`: `builds/rc-out/rc1-harness`
+(`BUILD_PRX=1`) and `builds/rc-out/rc1-play` (title "GBAdhoc BETA").

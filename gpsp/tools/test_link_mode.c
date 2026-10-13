@@ -129,6 +129,21 @@ static void test_rooms(void)
    CHECK(room_parse("GPSP7", &num, code) == ROOM_OTHER);
    CHECK(room_parse("GBLNK7", &num, code) == ROOM_OTHER);
    CHECK(room_parse(NULL, &num, code) == ROOM_OTHER);
+   /* "Share game data" rooms (docs/SAVE-SHARE.md): their own kind, never a
+    * cable or adapter room, and a round trip through room_make. */
+   {
+      char g[9], lb[ROOM_LABEL_CAP];
+      CHECK(room_parse("GS07DATA", &num, code) == ROOM_SHARE && num == 7 &&
+            code[0] == 0);
+      CHECK(room_parse("GS07DATB", &num, code) == ROOM_OTHER);
+      CHECK(room_parse("GS07DAT", &num, code) == ROOM_OTHER);
+      CHECK(room_parse("GS7DATA", &num, code) == ROOM_OTHER);
+      CHECK(!strcmp(room_make(ROOM_SHARE, 42, NULL, g, sizeof(g)),
+                    "GS42DATA"));
+      CHECK(room_parse(g, &num, code) == ROOM_SHARE && num == 42);
+      CHECK(!strcmp(room_label(g, lb, sizeof(lb)), "Room 42"));
+      CHECK(room_number(g) == 42);
+   }
    CHECK(!strcmp(room_label("GPSP07", b, sizeof(b)), "Room 7"));
    CHECK(!strcmp(room_label("GC07AMKE", b, sizeof(b)), "Room 7"));
    CHECK(!strcmp(room_label("GB99GAME", b, sizeof(b)), "Room 99"));

@@ -50,7 +50,11 @@ static const ctl_action_info INFO[CTL_ACTIONS] = {
    { "bind_left",         "Left",           CTL_LEFT,     RJ_LEFT,   CTL_F_GAME },
    { "bind_right",        "Right",          CTL_RIGHT,    RJ_RIGHT,  CTL_F_GAME },
    { "bind_ff",           "Fast-forward",   CTL_SQUARE,   0,         CTL_F_YIELD },
+#ifdef REWIND
+   { "bind_video",        "Video preset",   0,            0,         0 },
+#else
    { "bind_video",        "Video preset",   CTL_TRIANGLE, 0,         0 },
+#endif
    { "bind_quicksave",    "Quick save",     CTL_SELECT | CTL_L, 0,   CTL_F_YIELD },
    { "bind_quickload",    "Quick load",     CTL_SELECT | CTL_R, 0,   CTL_F_YIELD },
    { "bind_screenshot",   "Screenshot",     CTL_L | CTL_R | CTL_SELECT, 0,
@@ -60,6 +64,25 @@ static const ctl_action_info INFO[CTL_ACTIONS] = {
    { "bind_mystery_gift", "Mystery Gift",   CTL_SELECT | CTL_DOWN, 0, 0 },
    { "bind_catch_test",   "Crash self-test",
                           CTL_L | CTL_R | CTL_UP | CTL_TRIANGLE, 0,  CTL_F_YIELD },
+#ifdef REWIND
+   /* Yields to any longer chord that contains it: SELECT+TRIANGLE is the
+    * pause screen, not a rewind. */
+   { "bind_rewind",       "Rewind",         CTL_TRIANGLE, 0,         CTL_F_YIELD },
+#endif
+   /* Turbo buttons: unbound, and LAST (ctl_map.h).  retro_id is the game
+    * button the pulse presses. */
+   { "bind_turbo_a",      "Turbo A",        0,            RJ_A,      CTL_F_TURBO },
+   { "bind_turbo_a2",     "Turbo A (2)",    0,            RJ_A,      CTL_F_TURBO },
+   { "bind_turbo_b",      "Turbo B",        0,            RJ_B,      CTL_F_TURBO },
+   { "bind_turbo_b2",     "Turbo B (2)",    0,            RJ_B,      CTL_F_TURBO },
+};
+
+/* CONFIG.INI keys of each turbo action's rate and mode. */
+static const char *const TURBO_KEYS[CTL_TURBO_N][2] = {
+   { "turbo_a_rate",  "turbo_a_mode"  },
+   { "turbo_a2_rate", "turbo_a2_mode" },
+   { "turbo_b_rate",  "turbo_b_mode"  },
+   { "turbo_b2_rate", "turbo_b2_mode" },
 };
 
 /* Display / CONFIG.INI order: modifiers first, so a chord reads the way it
@@ -71,6 +94,9 @@ static const struct { unsigned bit; const char *name; } BUTTONS[CTL_NBUTTONS] = 
    { CTL_LEFT, "LEFT" }, { CTL_RIGHT, "RIGHT" },
    { CTL_TRIANGLE, "TRIANGLE" }, { CTL_CIRCLE, "CIRCLE" },
    { CTL_CROSS, "CROSS" }, { CTL_SQUARE, "SQUARE" },
+   /* The stick's directions last: the first twelve slots are 3.5.0's. */
+   { CTL_STICK_UP, "STICK_UP" }, { CTL_STICK_DOWN, "STICK_DOWN" },
+   { CTL_STICK_LEFT, "STICK_LEFT" }, { CTL_STICK_RIGHT, "STICK_RIGHT" },
 };
 
 const ctl_action_info *ctl_info(int a)
@@ -119,6 +145,13 @@ static void defaults_in(ctl_map *m, int legacy_swap)
    }
    m->menu_home = CTL_MENU_START_SELECT;
    m->menu_keep = 0;
+   for (a = 0; a < CTL_TURBO_N; a++)
+   {
+      m->turbo_half[a] = CTL_TURBO_HALF_DEF;
+      m->turbo_toggle[a] = 0;
+      m->turbo_rate_keep[a] = 0;
+      m->turbo_mode_keep[a] = 0;
+   }
 }
 
 void ctl_defaults(ctl_map *m)
@@ -132,6 +165,11 @@ void ctl_reset(ctl_map *m)
    for (a = 0; a < CTL_ACTIONS; a++)
       m->bind[a] = (uint16_t)ctl_default(a);
    m->menu_home = CTL_MENU_START_SELECT;
+   for (a = 0; a < CTL_TURBO_N; a++)
+   {
+      m->turbo_half[a] = CTL_TURBO_HALF_DEF;
+      m->turbo_toggle[a] = 0;
+   }
 }
 
 int ctl_is_default(const ctl_map *m)
@@ -139,6 +177,9 @@ int ctl_is_default(const ctl_map *m)
    int a;
    for (a = 0; a < CTL_ACTIONS; a++)
       if (ctl_available(a) && m->bind[a] != ctl_default(a))
+         return 0;
+   for (a = 0; a < CTL_TURBO_N; a++)
+      if (m->turbo_half[a] != CTL_TURBO_HALF_DEF || m->turbo_toggle[a])
          return 0;
    return m->menu_home == CTL_MENU_START_SELECT;
 }
@@ -159,7 +200,8 @@ int ctl_check(int a, unsigned mask)
       return CTL_OK;
    if (mask & ~CTL_ALL)
       return CTL_E_BITS;
-   if ((INFO[a].flags & CTL_F_GAME) && ctl_popcount(mask) != 1)
+   if ((INFO[a].flags & (CTL_F_GAME | CTL_F_TURBO)) &&
+       ctl_popcount(mask) != 1)
       return CTL_E_SINGLE;
    if ((mask & CTL_MENU_CHORD) == CTL_MENU_CHORD)
       return CTL_E_RESERVED;
@@ -175,7 +217,7 @@ const char *ctl_error_text(int err)
    case CTL_OK:         return "ok";
    case CTL_E_ACTION:   return "not available in this build";
    case CTL_E_BITS:     return "that button cannot be bound";
-   case CTL_E_SINGLE:   return "game buttons take one button";
+   case CTL_E_SINGLE:   return "this one takes a single button";
    case CTL_E_RESERVED: return "START+SELECT is reserved for the menu";
    case CTL_E_TOO_MANY: return "at most 4 buttons";
    default:             return "invalid";
@@ -210,6 +252,67 @@ static unsigned button_bit(const char *s, size_t n)
    if (name_eq(s, n, "LTRIGGER")) return CTL_L;
    if (name_eq(s, n, "RTRIGGER")) return CTL_R;
    return 0;
+}
+
+const char *ctl_stick_name(int mode)
+{
+   return mode == CTL_STICK_MOVE ? "move" :
+          mode == CTL_STICK_CUSTOM ? "custom" : "off";
+}
+
+int ctl_stick_parse(const char *s, int *out)
+{
+   const char *e;
+   size_t n;
+   if (!s || !out)
+      return -1;
+   while (*s == ' ' || *s == '\t')
+      s++;
+   e = s + strlen(s);
+   while (e > s && (e[-1] == ' ' || e[-1] == '\t' || e[-1] == '\r' ||
+                    e[-1] == '\n'))
+      e--;
+   n = (size_t)(e - s);
+   if (name_eq(s, n, "OFF") || name_eq(s, n, "0"))
+      *out = CTL_STICK_OFF;
+   else if (name_eq(s, n, "MOVE") || name_eq(s, n, "1"))
+      *out = CTL_STICK_MOVE;
+   else if (name_eq(s, n, "CUSTOM") || name_eq(s, n, "2"))
+      *out = CTL_STICK_CUSTOM;
+   else
+      return -1;
+   return 0;
+}
+
+unsigned ctl_stick_bits(int mode, int lx, int ly, unsigned *state)
+{
+   unsigned st = state ? *state : 0, d = 0;
+   int dx = lx - 128, dy = ly - 128;
+   /* Engaged directions stay engaged down to the release threshold. */
+   if (dx <= -(st & CTL_STICK_LEFT ? CTL_STICK_OFF_AT : CTL_STICK_ON))
+      d |= CTL_STICK_LEFT;
+   else if (dx >= (st & CTL_STICK_RIGHT ? CTL_STICK_OFF_AT : CTL_STICK_ON))
+      d |= CTL_STICK_RIGHT;
+   if (dy <= -(st & CTL_STICK_UP ? CTL_STICK_OFF_AT : CTL_STICK_ON))
+      d |= CTL_STICK_UP;
+   else if (dy >= (st & CTL_STICK_DOWN ? CTL_STICK_OFF_AT : CTL_STICK_ON))
+      d |= CTL_STICK_DOWN;
+   if (state)
+      *state = d;
+   if (mode == CTL_STICK_CUSTOM)
+      return d;
+   if (mode == CTL_STICK_MOVE)
+      return (d & CTL_STICK_UP ? CTL_UP : 0) |
+             (d & CTL_STICK_DOWN ? CTL_DOWN : 0) |
+             (d & CTL_STICK_LEFT ? CTL_LEFT : 0) |
+             (d & CTL_STICK_RIGHT ? CTL_RIGHT : 0);
+   return 0;
+}
+
+int ctl_stick_only(unsigned mask)
+{
+   mask &= CTL_ALL;
+   return (mask & CTL_STICK_ALL) && !(mask & ~CTL_STICK_ALL);
 }
 
 const char *ctl_menu_name(int menu_home)
@@ -367,6 +470,22 @@ static int repair_in(ctl_map *m, int legacy_swap,
       m->menu_home = CTL_MENU_START_SELECT;
       changed++;
    }
+   /* Turbo behaviour: a rate we do not have, or a mode that is neither, is
+    * corruption too; the defaults (15 a second, Hold) are the answer. */
+   for (a = 0; a < CTL_TURBO_N; a++)
+   {
+      if (m->turbo_half[a] < CTL_TURBO_HALF_MIN ||
+          m->turbo_half[a] > CTL_TURBO_HALF_MAX)
+      {
+         m->turbo_half[a] = CTL_TURBO_HALF_DEF;
+         changed++;
+      }
+      if (m->turbo_toggle[a] > 1)
+      {
+         m->turbo_toggle[a] = 0;
+         changed++;
+      }
+   }
    for (a = 0; a < CTL_ACTIONS; a++)
    {
       if (!ctl_available(a))
@@ -490,6 +609,38 @@ int ctl_load_ini(ctl_map *m, const char *path)
          }
       }
    }
+   /* Turbo behaviour.  Same rules as every key here: absent = the default
+    * and nothing is written back; a value we do not know = the default,
+    * reported, and the key stays "in the file" so the next save repairs
+    * it. */
+   for (a = 0; a < CTL_TURBO_N; a++)
+   {
+      int k;
+      for (k = 0; k < 2; k++)
+      {
+         char v[32];
+         int x = 0, ok;
+         if (!fe_ini_get(path, TURBO_KEYS[a][k], v, sizeof(v)))
+            continue;
+         ok = strlen(v) < sizeof(v) - 1 &&
+              (k ? ctl_turbo_mode_parse(v, &x)
+                 : ctl_turbo_rate_parse(v, &x)) == 0;
+         if (k)
+            m->turbo_mode_keep[a] = 1;
+         else
+            m->turbo_rate_keep[a] = 1;
+         if (!ok)
+         {
+            bad++;
+            fe_evt("config_bind_invalid key=%s value=\"%s\" reason=unparseable"
+                   " -> default", TURBO_KEYS[a][k], v);
+         }
+         else if (k)
+            m->turbo_toggle[a] = (uint8_t)x;
+         else
+            m->turbo_half[a] = (uint8_t)x;
+      }
+   }
    repair_in(m, swap, repair_evt, NULL);
    if (swap)
    {
@@ -531,6 +682,25 @@ int ctl_save_ini(ctl_map *m, const char *path)
          rc = -1;
       else
          m->menu_keep = 1;
+   }
+   for (a = 0; a < CTL_TURBO_N; a++)
+   {
+      if (m->turbo_rate_keep[a] || m->turbo_half[a] != CTL_TURBO_HALF_DEF)
+      {
+         if (fe_ini_set_int(path, TURBO_KEYS[a][0],
+                            ctl_turbo_rate(m->turbo_half[a])) != 0)
+            rc = -1;
+         else
+            m->turbo_rate_keep[a] = 1;
+      }
+      if (m->turbo_mode_keep[a] || m->turbo_toggle[a])
+      {
+         if (fe_ini_set(path, TURBO_KEYS[a][1],
+                        ctl_turbo_mode_name(m->turbo_toggle[a])) != 0)
+            rc = -1;
+         else
+            m->turbo_mode_keep[a] = 1;
+      }
    }
    return rc;
 }
@@ -581,6 +751,16 @@ unsigned ctl_shortcuts(const ctl_map *m, unsigned pad, unsigned pad_new)
    if (ctl_available(CTL_SC_CATCH) && ctl_held(pad, m->bind[CTL_SC_CATCH]) &&
        !ctl_yields(m, CTL_SC_CATCH, pad))
       f |= CTL_FIRE_CATCH;
+#ifdef REWIND
+   b = m->bind[CTL_SC_REWIND];
+   if (!ctl_yields(m, CTL_SC_REWIND, pad))
+   {
+      if (ctl_held(pad, b))
+         f |= CTL_FIRE_REWIND;
+      if (ctl_edge(pad, pad_new, b))
+         f |= CTL_FIRE_REWIND_PRESS;
+   }
+#endif
    return f;
 }
 
@@ -593,7 +773,9 @@ int ctl_yields(const ctl_map *m, int a, unsigned pad)
    ma = m->bind[a];
    if (!ma)
       return 0;
-   for (s = CTL_GAME_COUNT; s < CTL_ACTIONS; s++)
+   /* Shortcuts only (CTL_SC_END): a turbo button is one input and can never
+    * strictly contain a chord, so the scan is the one it always was. */
+   for (s = CTL_GAME_COUNT; s < CTL_SC_END; s++)
    {
       unsigned ms = m->bind[s];
       if (s == a || !ms || ms == ma || !ctl_available(s))
@@ -602,4 +784,136 @@ int ctl_yields(const ctl_map *m, int a, unsigned pad)
          return 1;
    }
    return 0;
+}
+
+/* ---- turbo buttons (ctl_map.h) -------------------------------------------- */
+
+int ctl_turbo_rate(int half)
+{
+   return half == 1 ? 30 : half == 3 ? 10 : 15;
+}
+
+int ctl_turbo_half_step(int half, int dir)
+{
+   /* 10 -> 15 -> 30 -> 10 is half 3 -> 2 -> 1 -> 3. */
+   if (dir < 0)
+      return half >= CTL_TURBO_HALF_MAX ? CTL_TURBO_HALF_MIN : half + 1;
+   return half <= CTL_TURBO_HALF_MIN ? CTL_TURBO_HALF_MAX : half - 1;
+}
+
+/* Skips leading blanks; returns the length without trailing blanks. */
+static size_t trimmed(const char **s)
+{
+   const char *e;
+   while (**s == ' ' || **s == '\t')
+      (*s)++;
+   e = *s + strlen(*s);
+   while (e > *s && (e[-1] == ' ' || e[-1] == '\t' || e[-1] == '\r' ||
+                     e[-1] == '\n'))
+      e--;
+   return (size_t)(e - *s);
+}
+
+int ctl_turbo_rate_parse(const char *s, int *half)
+{
+   size_t n;
+   if (!s || !half)
+      return -1;
+   n = trimmed(&s);
+   if (name_eq(s, n, "30"))
+      *half = 1;
+   else if (name_eq(s, n, "15"))
+      *half = 2;
+   else if (name_eq(s, n, "10"))
+      *half = 3;
+   else
+      return -1;
+   return 0;
+}
+
+const char *ctl_turbo_mode_name(int toggle)
+{
+   return toggle ? "toggle" : "hold";
+}
+
+int ctl_turbo_mode_parse(const char *s, int *toggle)
+{
+   size_t n;
+   if (!s || !toggle)
+      return -1;
+   n = trimmed(&s);
+   if (name_eq(s, n, "HOLD"))
+      *toggle = 0;
+   else if (name_eq(s, n, "TOGGLE"))
+      *toggle = 1;
+   else
+      return -1;
+   return 0;
+}
+
+const char *ctl_turbo_key(int a, int which)
+{
+   if (a < CTL_TURBO_FIRST || a >= CTL_TURBO_FIRST + CTL_TURBO_N ||
+       which < 0 || which > 1)
+      return NULL;
+   return TURBO_KEYS[a - CTL_TURBO_FIRST][which];
+}
+
+void ctl_turbo_stop(ctl_turbo *t)
+{
+   int i;
+   for (i = 0; i < CTL_TURBO_N; i++)
+      t->run[i] = 0;
+   t->live = 0;
+}
+
+void ctl_turbo_pad(const ctl_map *m, ctl_turbo *t, unsigned pad,
+                   unsigned pad_new, uint32_t frame, int enabled)
+{
+   unsigned live = 0;
+   int i;
+   for (i = 0; i < CTL_TURBO_N; i++)
+   {
+      unsigned b = m->bind[CTL_TURBO_FIRST + i];
+      if (!b || !enabled)
+         t->run[i] = 0;
+      else if (m->turbo_toggle[i])
+      {
+         /* Toggle: each press flips it; a train begins on its press. */
+         if (pad_new & b)
+         {
+            t->run[i] = (uint8_t)!t->run[i];
+            t->t0[i] = frame;
+         }
+      }
+      else if (!(pad & b))
+         t->run[i] = 0;
+      else if (!t->run[i])
+      {
+         /* Hold: the train begins on the frame the button is first seen
+          * down, so its first frame is always a press. */
+         t->run[i] = 1;
+         t->t0[i] = frame;
+      }
+      live |= t->run[i];
+   }
+   t->live = (uint8_t)live;
+}
+
+uint32_t ctl_turbo_mask(const ctl_map *m, const ctl_turbo *t, uint32_t frame)
+{
+   uint32_t r = 0;
+   int i;
+   for (i = 0; i < CTL_TURBO_N; i++)
+   {
+      unsigned half = m->turbo_half[i];
+      if (!t->run[i])
+         continue;
+      if (half < CTL_TURBO_HALF_MIN || half > CTL_TURBO_HALF_MAX)
+         half = CTL_TURBO_HALF_DEF;
+      /* `half` frames on, `half` off, from the train's first frame. */
+      if ((((frame - t->t0[i]) / half) & 1u) == 0)
+         r |= 1u << INFO[CTL_TURBO_FIRST + i].retro_id;
+   }
+   return r;
 }

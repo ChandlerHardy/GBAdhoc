@@ -128,6 +128,10 @@ EOI
     # MG_EXTRA_INI (environment): keys for every fixture of a matrix run,
     # e.g. 'gba_dual_late = 1' (GBA-LINK-MIRROR.md 19)
     if [ -n "${MG_EXTRA_INI:-}" ]; then printf '%b\n' "$MG_EXTRA_INI"; fi
+    # MG_EXTRA_INI_HOST / MG_EXTRA_INI_JOIN: keys for ONE console only (the
+    # mismatch arms: a switch both consoles must agree on, set on one)
+    if [ "$2" = host ] && [ -n "${MG_EXTRA_INI_HOST:-}" ]; then printf '%b\n' "$MG_EXTRA_INI_HOST"; fi
+    if [ "$2" = join ] && [ -n "${MG_EXTRA_INI_JOIN:-}" ]; then printf '%b\n' "$MG_EXTRA_INI_JOIN"; fi
   } > "$GAME/.gpsp-harness.ini"
   cp "$GAME/.gpsp-harness.ini" "$OUT/$2.ini"
   printf 'theme = 0\nui_shell = 0\nscale = 1\n' > "$GAME/config.ini"

@@ -103,6 +103,17 @@ int ui_state_load_done(int rc);
  * EVT shot_read n= us=. */
 void ui_shot_probe_arm(int on);
 
+#ifdef GPSP_CHEATS
+/* ---- cheats (docs/CHEATS.md) ---------------------------------------------
+ * The cheat list of the game at rom_path (only its file name matters):
+ * <app>/cheats/<name minus extension>.cht or .txt, plus the player's choices
+ * in <name>.on.  attach = 1 for the game that is RUNNING (the enabled cheats
+ * go to the core); 0 only edits the list (the ROM browser).  Returns the
+ * number of cheats that are on.  No heap, no stdio. */
+int  ui_cheats_load(const char *rom_path, int console, int attach);
+void ui_cheats_unload(void);
+#endif
+
 /* Group selected by the last Host/Join action (scan pick or room code). */
 const char *ui_group(void);
 
@@ -136,8 +147,14 @@ typedef struct
    int player;           /* cable: 1 / 2, 0 = not yet known */
    const char *room;     /* "Room 7" */
    const char *game;     /* cable host: the game the joiner must open */
+   int fast;             /* Fast link in the running GBA cable session: 1 /
+                            0, -1 = not one (fe_host_fast_link) */
+   int fast_src;         /* FE_GBLINK_FL_* : own / the host's / old peer */
 } ui_link_view;
 void ui_set_link(const ui_link_view *v);
+/* Turbo buttons are off while a link or wireless session is up (main_psp.c
+ * turbo_frame); the Controls pages say so in the cheats' words. */
+void ui_set_turbo_locked(int on);
 
 /* THE LINKING SCREEN: one screen for cable, adapter and GB, in the
  * Overlay's language over the game as it stood (the menu backdrop; set it
@@ -237,6 +254,10 @@ int ui_wake_menu(const uint16_t *frame, int frame_w, int frame_h,
  * its third frame and continues on its own. */
 void ui_wake_shot_arm(void);
 void ui_wake_inject(int choice);   /* harness: sleep_sim_choice */
+void ui_wake_inject_frame(int frame);   /* harness: sleep_sim_choice_frame */
+void ui_batt_inject(int v);        /* harness: ui_batt (the header's battery) */
+void ui_ctl_warn_inject(int on);   /* harness: ui_ctl_warn (the stick note) */
+void ui_turbo_lock_inject(int on); /* harness: ui_turbo_lock (link wording) */
 
 /* Harness self-drive (.gpsp-harness.ini ui_demo=1): scripted walk through
  * menu -> settings (cycle scale) -> wireless -> resume, with EVT markers
@@ -262,6 +283,9 @@ void ui_browser_demo_shots(void);
 /* ui_browser_script = <file under the app dir>: a text script of presses,
  * dumps and per-frame dump ranges for the README shoot (see ui_psp.c). */
 void ui_browser_script_load(const char *rel);
+/* Harness `share_burst = N`: file datagrams the sharing PSP sends a frame
+ * (docs/SAVE-SHARE.md; default 4). */
+void ui_share_burst(unsigned n);
 void ui_set_theme_black(int b);    /* runtime page theme (-1 = leave)      */
 
 #ifdef __cplusplus

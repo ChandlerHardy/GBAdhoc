@@ -92,6 +92,16 @@ u32 ewram_code_max =  0U;
 
 #define INITIAL_ROM_WATERMARK   16   // To avoid NULL aliasing
 u32 rom_cache_watermark = INITIAL_ROM_WATERMARK;
+#ifdef IRQ_IO_FAST
+/* IRQ_IO_FAST=1 (build) + irq_io_fast (run time, read when the emitter
+ * builds its stubs: set it before the game loads; harness `irq_io_fast = 1`).
+ * mips/mips_emit.h, the region-4 store stub.  Default 0: the stub is byte
+ * for byte the one it always was. */
+#ifndef IRQ_IO_FAST_DEFAULT
+#define IRQ_IO_FAST_DEFAULT 0
+#endif
+u32 irq_io_fast = IRQ_IO_FAST_DEFAULT;
+#endif
 
 u8 *bios_swi_entrypoint = NULL;
 
@@ -4168,6 +4178,57 @@ static inline int smc_gate_map_has(u32 pc)
   return map[off >> 3] & (1u << (off & 7));
 }
 
+#ifdef ENTRY_GATES
+/* ENTRY_GATES (make ENTRY_GATES=1; needs SMC_GATES + SMC_GATE_BITMAP).  A RAM routine entered at many
+ * points (a computed jump into an unrolled loop) is translated once per entry,
+ * each block holding the whole rest of the routine: Driver 2's two rasterisers
+ * (~4 KB of guest code, ~45 entries each) become ~380 KB of native code and
+ * the RAM cache fills every few frames.  When the RAM cache is EXHAUSTED,
+ * remember where every block started; from then on a scan stops at those
+ * addresses and the block jumps straight to the next one, so each stretch is
+ * translated once.  Armed only by an exhaustion flush: a game that never fills
+ * the cache never gets one.  One bit per RAM halfword, like the SMC gate map. */
+static u8 entry_gate_iwram[0x8000 >> 4];
+static u8 entry_gate_ewram[0x40000 >> 4];
+u32 entry_gates_armed, entry_gate_count;
+static void entry_gates_harvest(void)
+{
+  const u16 *t = (const u16 *)iwram;
+  u32 i, n = 0;
+  for (i = 0; i < 0x4000; i++)
+    if (VALID_TAG(t[i])) { entry_gate_iwram[i >> 3] |= (u8)(1u << (i & 7)); n++; }
+  t = (const u16 *)(ewram + 0x40000);
+  for (i = 0; i < 0x20000; i++)
+    if (VALID_TAG(t[i])) { entry_gate_ewram[i >> 3] |= (u8)(1u << (i & 7)); n++; }
+  entry_gates_armed++;
+  entry_gate_count = n;
+}
+static void entry_gates_reset(void)
+{
+  memset(entry_gate_iwram, 0, sizeof(entry_gate_iwram));
+  memset(entry_gate_ewram, 0, sizeof(entry_gate_ewram));
+  entry_gates_armed = entry_gate_count = 0;
+}
+static inline int entry_gate_has(u32 pc)
+{
+  u32 off;
+  if (!entry_gates_armed)
+    return 0;
+  if ((pc >> 24) == 3) {
+    off = (pc & 0x7FFF) >> 1;
+    return entry_gate_iwram[off >> 3] & (1u << (off & 7));
+  }
+  if ((pc >> 24) == 2) {
+    off = (pc & 0x3FFFF) >> 1;
+    return entry_gate_ewram[off >> 3] & (1u << (off & 7));
+  }
+  return 0;
+}
+#define ENTRY_GATE_SCAN(tag_gate_op)                                         else if (entry_gate_has(block_end_pc)) {                                     tag_gate_op;                                                               scan_exit_reason = SMC_SCAN_GATE;                                          entry_gate_stop = 1;                                                       goto block_end;                                                          }
+#else
+#define ENTRY_GATE_SCAN(tag_gate_op)
+#endif
+
 #define SMC_GATE_MAP_ADD(pc)       smc_gate_map_add(pc)
 #define SMC_GATE_MAP_REBUILD()     smc_gate_map_rebuild()
 #define SMC_SCAN_GATE_END(tag_gate_op) do {                                \
@@ -4176,6 +4237,7 @@ static inline int smc_gate_map_has(u32 pc)
     scan_exit_reason = SMC_SCAN_GATE;                                      \
     goto block_end;                                                        \
   }                                                                        \
+  ENTRY_GATE_SCAN(tag_gate_op)                                             \
 } while (0)
 #else
 #define SMC_GATE_MAP_ADD(pc)       do { } while (0)
@@ -4315,6 +4377,11 @@ bool translate_block_arm(u32 pc, bool ram_region)
   s32 i;
   u32 flag_status;
   u32 scan_exit_reason = 0;   /* phase 5g diagnostic: why the scan stopped */
+#ifdef ENTRY_GATES
+  u32 entry_gate_stop = 0;
+  u8 *entry_gate_branch_source = NULL;
+  u32 entry_gate_branch_target = 0;
+#endif
 #ifdef SMC_PARTIAL_DIRECT_GATE
   u8 *smc_gate_branch_source = NULL;
   u32 smc_gate_branch_target = 0;
@@ -4409,6 +4476,9 @@ bool translate_block_arm(u32 pc, bool ram_region)
     if(translation_ptr > translation_cache_limit) {
       if (ram_region) {
         flush_ram_full++;
+#ifdef ENTRY_GATES
+        entry_gates_harvest();
+#endif
         flush_translation_cache_ram();
       }
       else
@@ -4433,6 +4503,14 @@ bool translate_block_arm(u32 pc, bool ram_region)
 
   /* Unconditionally generate translation targets. In case we hit one or
      in the unlikely case that block was too big (and not finalized) */
+#ifdef ENTRY_GATES
+  if (ram_region && entry_gate_stop && block_exit_position < MAX_EXITS) {
+    generate_cycle_update();
+    entry_gate_branch_target = pc;
+    mips_emit_j_filler(entry_gate_branch_source);
+    mips_emit_nop();
+  } else
+#endif
 #ifdef SMC_PARTIAL_DIRECT_GATE
   if (ram_region && smc_partial_active && scan_exit_reason == SMC_SCAN_GATE) {
     smc_gate_branch_target = pc;
@@ -4473,6 +4551,15 @@ bool translate_block_arm(u32 pc, bool ram_region)
     }
   }
 
+#ifdef ENTRY_GATES
+  if (entry_gate_branch_source) {
+    external_block_exits[external_block_exit_position].branch_target =
+     entry_gate_branch_target;
+    external_block_exits[external_block_exit_position].branch_source =
+     entry_gate_branch_source;
+    external_block_exit_position++;
+  }
+#endif
 #ifdef SMC_PARTIAL_SAFE
   /* ROM survives a RAM-cache flush, so a direct ROM->RAM jump could later
    * enter an overwritten cache slot. Route only those persistent links
@@ -4601,6 +4688,11 @@ bool translate_block_thumb(u32 pc, bool ram_region)
   s32 i;
   u32 flag_status;
   u32 scan_exit_reason = 0;   /* phase 5g diagnostic: why the scan stopped */
+#ifdef ENTRY_GATES
+  u32 entry_gate_stop = 0;
+  u8 *entry_gate_branch_source = NULL;
+  u32 entry_gate_branch_target = 0;
+#endif
 #ifdef SMC_PARTIAL_DIRECT_GATE
   u8 *smc_gate_branch_source = NULL;
   u32 smc_gate_branch_target = 0;
@@ -4698,6 +4790,9 @@ bool translate_block_thumb(u32 pc, bool ram_region)
     {
       if (ram_region) {
         flush_ram_full++;
+#ifdef ENTRY_GATES
+        entry_gates_harvest();
+#endif
         flush_translation_cache_ram();
       }
       else
@@ -4717,6 +4812,14 @@ bool translate_block_thumb(u32 pc, bool ram_region)
 
   /* Unconditionally generate translation targets. In case we hit one or
      in the unlikely case that block was too big (and not finalized) */
+#ifdef ENTRY_GATES
+  if (ram_region && entry_gate_stop && block_exit_position < MAX_EXITS) {
+    generate_cycle_update();
+    entry_gate_branch_target = pc;
+    mips_emit_j_filler(entry_gate_branch_source);
+    mips_emit_nop();
+  } else
+#endif
 #ifdef SMC_PARTIAL_DIRECT_GATE
   if (ram_region && smc_partial_active && scan_exit_reason == SMC_SCAN_GATE) {
     smc_gate_branch_target = pc;
@@ -4755,6 +4858,15 @@ bool translate_block_thumb(u32 pc, bool ram_region)
     }
   }
 
+#ifdef ENTRY_GATES
+  if (entry_gate_branch_source) {
+    external_block_exits[external_block_exit_position].branch_target =
+     entry_gate_branch_target;
+    external_block_exits[external_block_exit_position].branch_source =
+     entry_gate_branch_source;
+    external_block_exit_position++;
+  }
+#endif
 #ifdef SMC_PARTIAL_SAFE
   for(i = 0; i < external_block_exit_position; i++)
   {
@@ -5696,6 +5808,12 @@ void smc_gates_reset(void)
   smc_cand_forget();
 #endif
   SMC_GATE_MAP_REBUILD();
+#ifdef ENTRY_GATES
+  /* Same rule as the SMC gates (gbalink_core.c lk_cold_start): entry gates
+   * move block boundaries, so a new cartridge and a link session's cold
+   * start both begin with none. */
+  entry_gates_reset();
+#endif
 }
 
 /* SMC_GATES_CODED: only gate an address that is ALREADY the start of a
@@ -6649,6 +6767,18 @@ void flush_translation_cache_rom(void)
 #endif
   DRPROF_ZONE_LEAVE(DRZ_FLUSH);
 }
+
+#ifdef REWIND
+/* Rewind measurement only (docs/REWIND.md): bytes of translated code in each
+ * cache right now, so the frontend can say how much a restore made the
+ * translator emit again. */
+void gpsp_rewind_jit_used(u32 *rom, u32 *ram);
+void gpsp_rewind_jit_used(u32 *rom, u32 *ram)
+{
+  *rom = (u32)(rom_translation_ptr - rom_translation_cache);
+  *ram = (u32)(ram_translation_ptr - ram_translation_cache);
+}
+#endif
 
 void init_dynarec_caches(void)
 {

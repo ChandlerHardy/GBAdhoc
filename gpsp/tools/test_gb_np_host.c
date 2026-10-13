@@ -15,6 +15,7 @@ struct netdrv
    int active;
    int peers;
    int local_id;
+   uint32_t ride;      /* cfg.ack_ride_us as the session has it */
 };
 
 static struct netdrv fake_nd;
@@ -53,6 +54,7 @@ netdrv *netdrv_create(const nd_transport *tp, const nd_callbacks *cb,
    memset(&fake_nd, 0, sizeof(fake_nd));
    fake_cb = *cb;
    snprintf(negotiated, sizeof(negotiated), "%s", cfg->protocol);
+   fake_nd.ride = cfg->ack_ride_us;
    return &fake_nd;
 }
 void netdrv_destroy(netdrv *nd) { (void)nd; }
@@ -99,6 +101,8 @@ void netdrv_get_stats(const netdrv *nd, nd_stats *out)
 { (void)nd; memset(out, 0, sizeof(*out)); }
 unsigned netdrv_peer_min_fps(const netdrv *nd) { (void)nd; return 0; }
 void netdrv_set_local_fps(netdrv *nd, unsigned fps) { (void)nd; (void)fps; }
+void netdrv_set_ack_ride(netdrv *nd, uint32_t us) { nd->ride = us; }
+uint32_t netdrv_ack_ride(const netdrv *nd) { return nd->ride; }
 
 static void gb_receive(void *userdata, const void *payload, size_t len,
                        uint8_t src_id)
@@ -176,6 +180,39 @@ int main(void)
    CHECK(gba_rx_count == 1 && gb_rx_count == 1);
    fe_np_stop();
 
-   puts("gb netpacket host: protocol routing/readiness passed");
+   /* ACK RIDING.  The product value is not a latch: a session is created
+    * without a ride (its setup is one-directional), rides only between
+    * fe_np_ack_ride_session(1) (RUNNING) and (0) (the close), and the next
+    * session starts without one again. */
+   fe_np_ack_ride_session(1);                 /* no session: nothing */
+   CHECK(fe_np_ack_ride_now() == 0);
+   fe_np_set_ack_ride_product(30000);
+   CHECK(fe_np_start_gb(&cfg) == 0);
+   CHECK(fake_nd.ride == 0 && fe_np_ack_ride_now() == 0);
+   fe_np_ack_ride_session(1);
+   CHECK(fake_nd.ride == 30000 && fe_np_ack_ride_now() == 30000);
+   fe_np_ack_ride_session(0);
+   CHECK(fake_nd.ride == 0);
+   fe_np_stop();
+   CHECK(fe_np_start(&cfg) == 0);             /* the next session: none */
+   CHECK(fake_nd.ride == 0);
+   fe_np_stop();
+   /* A harness value is FIXED: from creation, in every session, and the
+    * session hook leaves it alone -- 0 included. */
+   fe_np_set_ack_ride(5000);
+   CHECK(fe_np_start_gb(&cfg) == 0);
+   CHECK(fake_nd.ride == 5000);
+   fe_np_ack_ride_session(1);
+   CHECK(fake_nd.ride == 5000);
+   fe_np_ack_ride_session(0);
+   CHECK(fake_nd.ride == 5000);
+   fe_np_stop();
+   fe_np_set_ack_ride(0);
+   CHECK(fe_np_start_gb(&cfg) == 0);
+   fe_np_ack_ride_session(1);
+   CHECK(fake_nd.ride == 0);
+   fe_np_stop();
+
+   puts("gb netpacket host: protocol routing/readiness and ack riding passed");
    return 0;
 }

@@ -225,6 +225,30 @@ typedef struct fe_gblink_local
    /* Host only: gbdual_config_t.batch_lines for both consoles (0/1 =
     * strict line-by-line alternation); a vtable pair's quantum. */
    unsigned batch_lines;
+   /* The session's switches (docs/GBA-LINK-MIRROR.md 26, 29).
+    *
+    * STRICT bits change what the machines compute (bit 0: TIMER_LAZY): both
+    * consoles must run the same set, and a guest whose own differs refuses
+    * the session before it starts.
+    *
+    * NEGOTIABLE bits change only how the session talks (bit 1: "Fast link",
+    * two frames of buttons per packet).  THE HOST DECIDES: the guest's own
+    * value is ignored and it runs what the host selected -- if both builds
+    * can.  How each side learns that, without breaking a build that knows
+    * none of this (3.5.0, whose unknown-message rule is "abort"):
+    *   - the host's HELLO role byte carries FE_GBLINK_HOSTCAP_NEGOTIATE
+    *     (an old guest only tests that byte for non-zero);
+    *   - a guest that sees it answers M_CAPS (what it can do) and holds its
+    *     READY until the host's M_CORECFG (what is in force) arrives;
+    *   - a host that never got M_CAPS (an old guest) sends nothing new and
+    *     clears its negotiable bits; a guest whose host did not advertise
+    *     (an old host) sends nothing new and clears its own.
+    * So an old build on either side means the plain session. */
+   uint32_t core_mask;
+#define FE_GBLINK_MASK_TIMER_LAZY  0x1u   /* strict: guest-visible core switch */
+#define FE_GBLINK_MASK_INPUT_BATCH 0x2u   /* negotiable: "Fast link", M_INPUTS */
+#define FE_GBLINK_MASK_NEGOTIABLE  FE_GBLINK_MASK_INPUT_BATCH
+#define FE_GBLINK_HOSTCAP_NEGOTIATE 0x02u /* in the host's HELLO role byte     */
    /* NULL = the GB/GBC pair; else the machines above (console must match
     * machines->console). */
    const fe_gblink_machines *machines;
@@ -286,6 +310,12 @@ int fe_gblink_step(fe_gblink *s, uint16_t local_buttons);
 void fe_gblink_request_end(fe_gblink *s);
 
 int fe_gblink_state(const fe_gblink *s);
+/* "Fast link" as this session runs it: 1 on, 0 off (final once the session
+ * is RUNNING).  *source (optional): where the value came from. */
+enum { FE_GBLINK_FL_OWN = 0,      /* this console is the host: its setting   */
+       FE_GBLINK_FL_HOST,         /* this console is the guest: the host's   */
+       FE_GBLINK_FL_OLD_PEER };   /* off: the other build cannot do it       */
+int fe_gblink_fast_link(const fe_gblink *s, int *source);
 int fe_gblink_error(const fe_gblink *s);
 const char *fe_gblink_error_text(int error);
 /* Two short lines for the connecting screen / status chip. */

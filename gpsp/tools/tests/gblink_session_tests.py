@@ -230,6 +230,35 @@ def main() -> int:
               "a damaged cartridge was not refused", out)
         print("gblink session: damaged cartridge refused by SHA-1, nothing written")
 
+        # A guest does not run with whatever the host's CONFIG says: values
+        # no host sends (delay past the ring's use, no periodic hash, a
+        # batch of 0 or of hundreds of frames) are refused, and so is a READY
+        # of the wrong length or one that arrives before HELLO.  Nothing is
+        # written.
+        for kind in (1, 2, 3, 4):
+            rc, out = run(sim, t, "cfg%d" % kind, "rom_h=%s/dmg.gb" % t,
+                          "rom_g=%s/dmg.gb" % t, "lat=2",
+                          "bad_config=%d" % kind, *common)
+            check(rc != 0 and "config_altered kind=%d" % kind in out and
+                  "gblink_config_refused" in out and
+                  "gblink_done" not in out and
+                  not (t / ("cfg%d-h.sav" % kind)).exists() and
+                  not (t / ("cfg%d-g.sav" % kind)).exists(),
+                  "an out-of-range CONFIG (kind %d) was not refused" % kind,
+                  out)
+        for kind in (1, 2):
+            rc, out = run(sim, t, "rdy%d" % kind, "rom_h=%s/dmg.gb" % t,
+                          "rom_g=%s/dmg.gb" % t, "lat=2",
+                          "bad_ready=%d" % kind, *common)
+            check(rc != 0 and "gblink_ready_refused" in out and
+                  "gblink_done" not in out and
+                  not (t / ("rdy%d-h.sav" % kind)).exists() and
+                  not (t / ("rdy%d-g.sav" % kind)).exists(),
+                  "a malformed READY (kind %d) was not refused" % kind, out)
+        print("gblink session: out-of-range CONFIG (delay, hash interval, "
+              "batch) and malformed READY refused by the guest, nothing "
+              "written")
+
         rc, out = run(sim, t, "desync", "rom_h=%s/dmg.gb" % t,
                       "rom_g=%s/dmg.gb" % t, "lat=2", "desync_at=300",
                       "desync_addr=0xFF90", *common)

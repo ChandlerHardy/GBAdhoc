@@ -255,7 +255,18 @@ def suites(env: Env, baseline: Path | None):
          "gcc -std=gnu99 -O1 -g -Wall -Wextra -Werror "
          "-fsanitize=address,undefined -Ifrontend-common "
          "-o /tmp/t_link_mode tools/test_link_mode.c && "
-         "ASAN_OPTIONS=detect_leaks=0 /tmp/t_link_mode"),
+         "ASAN_OPTIONS=detect_leaks=0 /tmp/t_link_mode && "
+         # ...and the rewind core (frontend-common/fe_rewind.c, a REWIND=1
+         # prototype) against a fake machine: any pattern of taps on the
+         # control, every frame checked against a run that never rewound,
+         # ring consistency and bounded work per tick (docs/REWIND.md).
+         # Pure frontend-common code like the two above; same suite for the
+         # same reason, the cap.
+         "gcc -std=gnu99 -O1 -g -Wall -Wextra -Werror "
+         "-fsanitize=address,undefined -Ifrontend-common "
+         "-o /tmp/t_fe_rewind tools/tests/test_fe_rewind.c "
+         "frontend-common/fe_rewind.c frontend-common/fe_rewind_pack.c && "
+         "ASAN_OPTIONS=detect_leaks=0 /tmp/t_fe_rewind"),
 
         ("mystery_gift", True, lambda: None,
          "python3 tools/run_mgift_tests.py"),
@@ -304,7 +315,17 @@ def suites(env: Env, baseline: Path | None):
          "-Ifrontend-common -Inetdrv -Ilibretro/libretro-common/include "
          "-o /tmp/t_sram_ff_nudge "
          "tools/tests/test_sram_ff_nudge.c -Wl,--gc-sections && "
-         "ASAN_OPTIONS=detect_leaks=0 /tmp/t_sram_ff_nudge"),
+         "ASAN_OPTIONS=detect_leaks=0 /tmp/t_sram_ff_nudge && "
+         # ...and the exit path: a delta write that fails (the held-open .sav
+         # handle dies across a PSP sleep) must still end in a whole-image
+         # rewrite before the file is closed.  Same suite, so the suite count
+         # stays under MAX_HOST_SUITES.
+         "gcc -std=gnu99 -O1 -g -Wall -Wextra -Wno-unused-parameter "
+         "-fsanitize=address,undefined -ffunction-sections -fdata-sections "
+         "-Ifrontend-common -Inetdrv -Ilibretro/libretro-common/include "
+         "-o /tmp/t_sram_exit_retry "
+         "tools/tests/test_sram_exit_retry.c -Wl,--gc-sections && "
+         "ASAN_OPTIONS=detect_leaks=0 /tmp/t_sram_exit_retry"),
 
         # The gamepak buffers: file lifecycle, then the ROM page cache's
         # startup budget (docs/ROM-RESIDENCY.md) -- the real
@@ -357,7 +378,18 @@ def suites(env: Env, baseline: Path | None):
          "-o /tmp/t_cheat_codebreaker_bounds "
          "tools/test_cheat_codebreaker_bounds.c cheats.c "
          "-Wl,--gc-sections && ASAN_OPTIONS=detect_leaks=0 "
-         "/tmp/t_cheat_codebreaker_bounds"),
+         "/tmp/t_cheat_codebreaker_bounds && "
+         # GPSP_CHEATS (docs/CHEATS.md), in this suite because the suite cap
+         # is 30: the strict parser, the RAM-only accessors, the translated-
+         # code flush trigger, cheat files, the .on state, GB codes, fuzz.
+         "gcc -std=gnu99 -O1 -g -Wall -Wextra -Werror "
+         "-Wno-old-style-declaration -Wno-unused-parameter "
+         "-fsanitize=address,undefined -ffunction-sections -fdata-sections "
+         "-DGPSP_CHEATS=1 -DHAVE_DYNAREC -DINLINE=inline "
+         "-Ilibretro/libretro-common/include -Ifrontend-common "
+         "-o /tmp/t_fe_cheats tools/test_fe_cheats.c cheats.c "
+         "frontend-common/fe_cheats.c -Wl,--gc-sections && "
+         "ASAN_OPTIONS=detect_leaks=0 /tmp/t_fe_cheats"),
 
         ("savestate_bson_bounds", True, lambda: None,
          "gcc -std=gnu99 -O1 -g -Wall -Wextra -Werror "
@@ -508,6 +540,20 @@ def suites(env: Env, baseline: Path | None):
           "-DGPSP_CATCH_SELFTEST -Ifrontend-common -Ipsp "
           "-o /tmp/t_ctl_map_rel tools/tests/test_ctl_map.c psp/ctl_map.c "
           "psp/config_psp.c frontend-common/fe_util.c && /tmp/t_ctl_map_rel && "
+          # The REWIND flavour of the table (rewind the last shortcut, the
+          # turbo rows after it): test_turbo_rewind only -- the rest of the
+          # file restates 3.0's defaults, which REWIND changes.
+          "gcc -std=gnu99 -O1 -g -Wall -Wextra -Werror -DREWIND "
+          "-fsanitize=address,undefined -Ifrontend-common -Ipsp "
+          "-o /tmp/t_ctl_map_rw tools/tests/test_ctl_map.c psp/ctl_map.c "
+          "psp/config_psp.c frontend-common/fe_util.c && "
+          "ASAN_OPTIONS=detect_leaks=0 /tmp/t_ctl_map_rw && "
+          # The GBA cartridge clock's source rule (rtc_clock.h): frames
+          # unchanged, wall clock immune to fast-forward / sleep / state
+          # load, the guard, the link-session hand-over.
+          "gcc -std=gnu99 -O1 -g -Wall -Wextra -Werror "
+          "-fsanitize=address,undefined -I. -o /tmp/t_rtc_clock "
+          "tools/tests/test_rtc_clock.c && /tmp/t_rtc_clock && "
           # Save-state delete (docs/CONTROL-REMAP.md section 11): the one
           # function that names the files a delete removes.  Here because the
           # runner caps the suite count and this suite owns ctl_map, whose
@@ -516,6 +562,15 @@ def suites(env: Env, baseline: Path | None):
           "-fsanitize=address,undefined -Ifrontend-common -Ipsp "
           "-o /tmp/t_state_delete tools/tests/test_state_delete.c && "
           "ASAN_OPTIONS=detect_leaks=0 /tmp/t_state_delete && "
+          # Share game data (docs/SAVE-SHARE.md): the protocol with both ends
+          # in one process over a lossy fake radio, hostile requests, mixed
+          # versions and the temp/verify/swap commit.  Here for the same
+          # reason as the delete test (the suite cap); it shares its files.
+          "gcc -std=gnu99 -O1 -g -Wall -Wextra -Werror "
+          "-fsanitize=address,undefined -Ifrontend-common "
+          "-o /tmp/t_fe_share tools/tests/test_fe_share.c "
+          "frontend-common/fe_share.c && "
+          "ASAN_OPTIONS=detect_leaks=0 /tmp/t_fe_share && "
           # CONFIG.INI read once / written once (fe_ini_doc): the unit tests,
           # then the same pcfg_load/pcfg_save built on the old per-key path
           # (-DFE_INI_DOC_LEGACY) against the new one, on a real 3.0.0 and a

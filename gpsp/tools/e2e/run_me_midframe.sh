@@ -18,6 +18,10 @@
 #   MMF_FRAMES        frames per ROM (default 240; the first 30 are skipped)
 #   MMF_EXTRA_CFLAGS  extra -D flags for the whole core build (A/B arms)
 #   MMF_NO_BUILD=1    reuse the last build
+#   MMF_MODULE=1      also build psp/me's own renderer for the desktop and run
+#                     it beside the model (me_module_twin/mtm_driver.c); the
+#                     table gains mod_bad = frames it draws differently from
+#                     the model.  MTM_EVERY=N adds lifecycle events.
 #   MMF_DUMP=1        write raw cpu/vis images of divergent frames
 #
 # The ROMs are assembled in a throwaway Debian container with
@@ -65,7 +69,12 @@ if [ "${MMF_NO_BUILD:-0}" != 1 ]; then
     -DMMAP_JIT_CACHE -DHAVE_STRINGS_H -DHAVE_STDINT_H -DHAVE_INTTYPES_H \
     -D__LIBRETRO__ -DINLINE=inline -Wall -DHAVE_DYNAREC -DX86_ARCH -fPIC \
     -DFRONTEND_SUPPORTS_RGB565 -fno-rtti -fno-exceptions -std=c++11 \
-    -O3 -DNDEBUG -DME_TIMING_SIM=1 ${MMF_EXTRA_CFLAGS:-} -c -o video.o video.cc
+    -O3 -DNDEBUG -DME_TIMING_SIM=1 -DMTS_MODULE=${MMF_MODULE:-0} \
+    ${MMF_EXTRA_CFLAGS:-} -c -o video.o video.cc
+  rm -f mtm_module.o mtm_driver.o
+  if [ "${MMF_MODULE:-0}" = 1 ]; then
+    bash "$SCRIPT_DIR/me_module_twin/build.sh" "$B" ${MMF_EXTRA_CFLAGS:-}
+  fi
   archive() {
     rm -f sdl/libgpsp_core.a
     ar rcs sdl/libgpsp_core.a $(find . -name '*.o' -not -path './sdl/*' -not -path './psp/*' \
@@ -111,7 +120,12 @@ import re, sys
 pat = re.compile(r'^MTS f=(\d+) cpu=(\w+) post=(\w+) vis=(\w+)', re.M)
 def rows(p):
     return {int(f): (c, po, v) for f, c, po, v in pat.findall(open(p, errors='replace').read())}
+def mod_bad(p):   # MMF_MODULE=1: frames the module draws differently from the model
+    t = open(p, errors='replace').read()
+    m = re.findall(r'^MTS f=\d+ cpu=\w+ post=\w+ vis=(\w+).* mod=(\w+)$', t, re.M)
+    return sum(1 for v, md in m if v != md) if m else None
 m2, m1, name = rows(sys.argv[1]), rows(sys.argv[2]), sys.argv[3]
+mb = [mod_bad(sys.argv[1]), mod_bad(sys.argv[2])]
 fr = sorted(f for f in m2 if f > 30)
 vis = sum(1 for f in fr if m2[f][2] != m2[f][0])
 post = sum(1 for f in fr if m2[f][1] != m2[f][0])
@@ -119,6 +133,8 @@ m1bad = sum(1 for f in fr if f not in m1 or m1[f][2] != m2[f][0])
 distinct = len(set(m2[f][0] for f in fr))
 bad = vis or m1bad
 verdict = 'NO FRAMES' if not fr else ('DIVERGES' if bad else 'match')
+if mb[0] is not None:
+    verdict += ', mod_bad %d/%d' % (mb[0], mb[1] or 0) + ('' if not (mb[0] or mb[1]) else ' MODULE DIVERGES')
 print('%-15s %6d %7d %8d %7d  %s (cpu images: %d distinct)' % (name, len(fr), vis, post, m1bad, verdict, distinct))
 PYEOF
 done

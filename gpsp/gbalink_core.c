@@ -57,6 +57,45 @@ void gbalink_update_input(u32 new_key);
  * both from harness / config key gba_link_headless_audio. */
 u32 gbalink_headless_audio = 1;
 
+/* CABLE FAST PATH (docs/GBA-LINK-MIRROR.md section 21).  0 = off, the path
+ * every hardware run so far used.  1: update_gba's two cable hooks
+ * (gbalink_update_serial, gbalink_next_event) answer from this port's own
+ * state when nothing on the cable can be due, instead of walking the bus on
+ * every one of the ~1,150 scheduler iterations a machine makes per frame.
+ *
+ * Why it is the same machine.  The queue of events FOR this port changes
+ * only (a) while the other core runs or is pumped -- never while this one
+ * runs -- and (b) when this port pops what it applied.  So the time of the
+ * first waiting event, lk.in_t, is exact from the end of one lk_apply_due
+ * to the next, and every way into running this core passes through lk_pump
+ * (lk_run's first act).  With no event due and no transfer due, the full
+ * path does nothing but look: lk_take_replies only moves a queued reply into
+ * lk.reply_*, which nothing reads before the transfer's end (lk_complete) or
+ * the entry check (gbalink_entry_yield, which takes it itself), and no reply
+ * can arrive while this core runs.  Each instance has its own copy (B's is
+ * gbab_gbalink_fast); fe_gbadual sets both from harness / config key
+ * gba_link_fast. */
+u32 gbalink_fast = 0;
+/* gbalink_fast = 2: THE CHECKING MODE.  Every answer is the full walk's (so
+ * the machine is the gbalink_fast = 0 machine by construction); the fast
+ * path's answer is computed beside it and any disagreement is counted and
+ * the first one kept (gbalink_inst_stats fm_*).  For the hardware run that
+ * follows the 2026-10-10 PSP-3000 freeze with gbalink_fast = 1 (section 22):
+ * it cannot hang on the fast path's account and it names the first
+ * disagreement, if there is one. */
+
+/* PROGRESS GUARD (section 22).  One run() covers at most a lookahead plus a
+ * frame of session time (~421,000 cycles) and every scheduler call moves the
+ * clock, so a run makes a few thousand calls.  A run that reaches the limit
+ * is a core that no longer makes progress: it yields GBALINK_RUN_OVERRUN and
+ * the pair ends with an error instead of spinning.  gbalink_abort (set by a
+ * watchdog thread through fe_gbadual_abort) asks for the same at the next
+ * scheduler call. */
+#define LK_RUN_CALLS_MAX GBALINK_RUN_CALLS_MAX
+volatile u32 gbalink_abort = 0;
+/* The lean hooks' state (serial.h); gbalink_fast = 3. */
+gbalink_hot_t gbalink_hot;
+
 /* SIO modes as in serial.c */
 #define LKM_NORMAL 0
 #define LKM_MULTI  1
@@ -87,13 +126,15 @@ typedef struct
    int      active;
    unsigned slot;
    int      headless;
-   u64      cycles;          /* session cycles accounted by update_gba     */
+                             /* (the session clock is gbalink_hot.cycles)  */
    u64      horizon;
    int      yielded;         /* a postponed update_gba call is pending      */
    int      saved_remaining;
    int      yield_kind;      /* GBALINK_RUN_HORIZON / _BLOCKED              */
    u64      yield_now;       /* session time at the postponed call          */
    int      need_begin;      /* frame finished; waiting for frame_begin    */
+   u64      in_t;            /* first waiting inbound event's time; ~0 none
+                                (exact after lk_apply_due: gbalink_fast)    */
    /* this port */
    u32      wires_sent;      /* last wire word posted (~0 = none yet)      */
    u32      so_out;          /* normal mode: SO level latched              */
@@ -113,6 +154,19 @@ typedef struct
 } lk_state;
 
 static lk_state lk;
+
+/* serial.h: recompute the lean hooks' two deadlines.  Called wherever the
+ * horizon, the first waiting event (lk.in_t) or the transfer in flight can
+ * have changed: the end of lk_apply_due, of the full gbalink_update_serial,
+ * of gbalink_write_siocnt, and lk_run / lk_begin. */
+static void lk_rewake(void)
+{
+   u64 evt = lk.in_t;
+   if (lk.xfer != 0 && lk.t_done < evt)
+      evt = lk.t_done;
+   gbalink_hot.evt = evt;
+   gbalink_hot.wake = evt < lk.horizon ? evt : lk.horizon;
+}
 
 /* The cycle counter the I/O store stub saved (remaining cycles at the store),
  * see mips_emit.h / x86_stub.S.  update_gba re-seeds it with execute_cycles so
@@ -143,7 +197,7 @@ static u64 lk_io_now(void)
    done = (s32)execute_cycles - rem;
    if (done < 0)
       done = 0;
-   return lk.cycles + (u32)done;
+   return gbalink_hot.cycles + (u32)done;
 }
 
 static void lk_post(const gbalink_event *ev)
@@ -473,8 +527,36 @@ static int lk_apply_due(u64 now)
          break;
       }
    }
+   /* ev: the first event still waiting (not yet due), or none.  Read it
+    * before lk_take_replies, which may shift the queue under the pointer. */
+   lk.in_t = ev ? ev->t : ~(u64)0;
    lk_take_replies();
+   lk_rewake();
    return irq;
+}
+
+/* gbalink_fast = 2: one disagreement. */
+static void lk_fast_mismatch(u32 where, u64 cached, u64 truth)
+{
+   if (!lk.st.fast_mismatch++)
+   {
+      lk.st.fm_where = where;
+      lk.st.fm_cached = cached;
+      lk.st.fm_true = truth;
+      lk.st.fm_now = gbalink_hot.cycles;
+   }
+}
+
+/* The progress guard: 1 = this run must stop (lk.yielded is set). */
+static int lk_guard(u64 now, int remaining_cycles)
+{
+   if (++gbalink_hot.run_calls <= LK_RUN_CALLS_MAX && !gbalink_abort)
+      return 0;
+   lk.yielded = 1;
+   lk.yield_now = now;
+   lk.yield_kind = GBALINK_RUN_OVERRUN;
+   lk.saved_remaining = remaining_cycles;
+   return 1;
 }
 
 /* ---- hooks called by the core (main.c / serial.c) -------------------------- */
@@ -485,10 +567,12 @@ int gbalink_active(void) { return lk.active; }
 int gbalink_entry_yield(int remaining_cycles)
 {
    s32 rem = remaining_cycles < -64 ? -64 : remaining_cycles;
-   u64 now = lk.cycles + (u32)((s32)execute_cycles - rem);
+   u64 now = gbalink_hot.cycles + (u32)((s32)execute_cycles - rem);
    if ((s32)execute_cycles - rem < 0)
-      now = lk.cycles;
+      now = gbalink_hot.cycles;
 
+   if (lk_guard(now, remaining_cycles))
+      return 1;
    if (lk.reply_needed && !lk.reply_have)
    {
       lk_take_replies();
@@ -515,26 +599,28 @@ int gbalink_entry_yield(int remaining_cycles)
 }
 
 /* update_gba's halt loop, after an iteration (remaining == 0 next).  Same
- * rule, applied at lk.cycles. */
+ * rule, applied at gbalink_hot.cycles. */
 int gbalink_halt_yield(void)
 {
+   if (lk_guard(gbalink_hot.cycles, 0))
+      return 1;
    if (lk.reply_needed && !lk.reply_have)
    {
       lk_take_replies();
-      if (!lk.reply_have && lk.cycles >= lk.t_done)
+      if (!lk.reply_have && gbalink_hot.cycles >= lk.t_done)
       {
          lk.yielded = 1;
-         lk.yield_now = lk.cycles;
+         lk.yield_now = gbalink_hot.cycles;
          lk.yield_kind = GBALINK_RUN_BLOCKED;
          lk.saved_remaining = 0;
          lk.st.yields_blocked++;
          return 1;
       }
    }
-   if (lk.cycles >= lk.horizon)
+   if (gbalink_hot.cycles >= lk.horizon)
    {
       lk.yielded = 1;
-      lk.yield_now = lk.cycles;
+      lk.yield_now = gbalink_hot.cycles;
       lk.yield_kind = GBALINK_RUN_HORIZON;
       lk.saved_remaining = 0;
       lk.st.yields_horizon++;
@@ -545,7 +631,7 @@ int gbalink_halt_yield(void)
 
 void gbalink_account(u32 completed_cycles)
 {
-   lk.cycles += completed_cycles;
+   gbalink_hot.cycles += completed_cycles;
 }
 
 /* Cycles until the next thing this port must act on (transfer end, inbound
@@ -562,14 +648,48 @@ void gbalink_account(u32 completed_cycles)
 u32 gbalink_next_event(void)
 {
    u64 next = ~(u64)0;
-   const gbalink_event *ev = gbalink_bus_peek(lk.slot);
+   const gbalink_event *ev;
+   u32 fastv = 0;
+   if (gbalink_fast)
+   {
+      /* the same two candidates, the event's time from lk.in_t */
+      next = lk.in_t;
+      if (lk.xfer != LKX_NONE && lk.t_done < next)
+         next = lk.t_done;
+      if (next <= gbalink_hot.cycles)
+         fastv = 1;
+      else
+      {
+         next -= gbalink_hot.cycles;
+         fastv = next > 0x7FFF ? 0x7FFF : (u32)next;
+      }
+      if (gbalink_fast != 2)
+         return fastv;
+      next = ~(u64)0;          /* checking mode: the full walk decides */
+   }
+   ev = gbalink_bus_peek(lk.slot);
+   if (gbalink_fast)
+   {
+      u64 t = ev ? ev->t : ~(u64)0;
+      u64 slow = t;
+      u32 slowv;
+      if (lk.xfer != LKX_NONE && lk.t_done < slow)
+         slow = lk.t_done;
+      slowv = slow <= gbalink_hot.cycles ? 1 :
+              (slow - gbalink_hot.cycles > 0x7FFF ? 0x7FFF : (u32)(slow - gbalink_hot.cycles));
+      lk.st.fast_checks++;
+      if (t != lk.in_t)
+         lk_fast_mismatch(1, lk.in_t, t);
+      else if (slowv != fastv)
+         lk_fast_mismatch(3, fastv, slowv);
+   }
    if (lk.xfer != LKX_NONE && lk.t_done < next)
       next = lk.t_done;
    if (ev && ev->t < next)
       next = ev->t;
-   if (next <= lk.cycles)
+   if (next <= gbalink_hot.cycles)
       return 1;
-   next -= lk.cycles;
+   next -= gbalink_hot.cycles;
    return next > 0x7FFF ? 0x7FFF : (u32)next;
 }
 
@@ -582,14 +702,66 @@ void gbalink_reseed_snapshot(void)
 /* update_serial in cable mode: apply due events, finish a due transfer. */
 bool gbalink_update_serial(void)
 {
-   int irq = lk_apply_due(lk.cycles);
-   if (lk.xfer != LKX_NONE && lk.cycles >= lk.t_done)
+   int irq;
+   /* Nothing inbound is due and no transfer ends yet: the full path below
+    * would change nothing (see gbalink_fast). */
+   if (gbalink_fast)
+   {
+      int quiet = gbalink_hot.cycles < lk.in_t &&
+                  (lk.xfer == LKX_NONE || gbalink_hot.cycles < lk.t_done);
+      if (gbalink_fast != 2)
+      {
+         if (quiet)
+            return false;
+      }
+      else
+      {
+         /* checking mode: is the cached time the queue's, and does the full
+          * path really do nothing where the fast one would have skipped? */
+         const gbalink_event *ev = gbalink_bus_peek(lk.slot);
+         u64 t = ev ? ev->t : ~(u64)0;
+         u32 ev_in0 = lk.st.ev_in, post0;
+         int xfer0 = lk.xfer;
+         gbalink_bus_stats bs;
+         gbalink_bus_get_stats(&bs);
+         post0 = bs.posted[lk.slot];
+         lk.st.fast_checks++;
+         if (t != lk.in_t)
+            lk_fast_mismatch(1, lk.in_t, t);
+         /* the lean hooks' deadlines (where 4: evt, 5: wake, 6: a hook
+          * would have skipped although this call has work) */
+         {
+            u64 evt = t;
+            if (lk.xfer != LKX_NONE && lk.t_done < evt)
+               evt = lk.t_done;
+            if (gbalink_hot.evt != evt)
+               lk_fast_mismatch(4, gbalink_hot.evt, evt);
+            else if (gbalink_hot.wake != (evt < lk.horizon ? evt : lk.horizon))
+               lk_fast_mismatch(5, gbalink_hot.wake, lk.horizon);
+            else if (gbalink_hot.cycles < gbalink_hot.wake && !quiet)
+               lk_fast_mismatch(6, gbalink_hot.wake, gbalink_hot.cycles);
+         }
+         irq = lk_apply_due(gbalink_hot.cycles);
+         if (lk.xfer != LKX_NONE && gbalink_hot.cycles >= lk.t_done &&
+             (!lk.reply_needed || lk.reply_have))
+            irq |= lk_complete();
+         gbalink_bus_get_stats(&bs);
+         if (quiet && (irq || lk.st.ev_in != ev_in0 || lk.xfer != xfer0 ||
+                       bs.posted[lk.slot] != post0))
+            lk_fast_mismatch(2, lk.in_t, t);
+         lk_rewake();
+         return irq != 0;
+      }
+   }
+   irq = lk_apply_due(gbalink_hot.cycles);
+   if (lk.xfer != LKX_NONE && gbalink_hot.cycles >= lk.t_done)
    {
       if (!lk.reply_needed || lk.reply_have)
          irq |= lk_complete();
       /* else: the entry check yields before we get here; reaching it means a
        * caller outside the stepper -- complete on the next call. */
    }
+   lk_rewake();
    return irq != 0;
 }
 
@@ -642,6 +814,7 @@ cpu_alert_type gbalink_write_siocnt(u16 value)
    }
    lk_refresh_inputs();
    lk_post_wires(t);
+   lk_rewake();
    return CPU_ALERT_NONE;
 }
 
@@ -705,6 +878,10 @@ static void lk_begin(unsigned slot, int headless)
    lk.headless = headless;
    lk.need_begin = 1;
    lk.wires_sent = ~0u;
+   lk.in_t = 0;          /* unknown until the first lk_apply_due (lk_run) */
+   gbalink_abort = 0;
+   memset(&gbalink_hot, 0, sizeof(gbalink_hot));
+   gbalink_hot.lean = gbalink_fast == 3;
    serial_mode = SERIAL_MODE_CABLE;
    /* A transfer that was in flight when the state was saved has no partner
     * now: drop it. */
@@ -729,7 +906,7 @@ static void lk_end(void)
  * account them first). */
 static uint64_t lk_now(void)
 {
-   return lk.yielded ? lk.yield_now : lk.cycles;
+   return lk.yielded ? lk.yield_now : gbalink_hot.cycles;
 }
 
 static void lk_pump(void)
@@ -744,7 +921,8 @@ static void lk_frame_begin(uint16_t keys)
 {
    gbalink_update_input(keys & 0x3FF);
    skip_next_frame = lk.headless ? 1 : 0;
-   sound_synth_off = (lk.headless && gbalink_headless_audio) ? 1 : 0;
+   sound_synth_off = (lk.headless && gbalink_headless_audio) ?
+                     (gbalink_headless_audio >= 2 ? 2 : 1) : 0;
    lk.need_begin = 0;
 }
 
@@ -763,7 +941,13 @@ static int lk_run(uint64_t horizon)
    if (!lk.active || lk.need_begin)
       return GBALINK_RUN_ERROR;
    lk.horizon = horizon;
+   if (gbalink_hot.run_calls > lk.st.run_calls_max)
+      lk.st.run_calls_max = gbalink_hot.run_calls;
+   gbalink_hot.run_calls = 0;
+   if (lk.yielded && lk.yield_kind == GBALINK_RUN_OVERRUN)
+      return GBALINK_RUN_OVERRUN;      /* stopped for good (the guard) */
    lk_pump();
+   lk_rewake();                        /* the new horizon */
    if (lk.yielded)
    {
       u32 r;

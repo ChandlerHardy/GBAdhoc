@@ -157,6 +157,28 @@ void pcfg_load_doc(const char *ini_path, fe_ini_doc *doc)
    g_pcfg.me_dirty    = (int)fe_ini_get_int(cfg_path, "me_dirty", 1) ? 1 : 0;
    g_pcfg.rom_resident = (int)fe_ini_get_int(cfg_path, "rom_resident", 1) ? 1 : 0;
    g_pcfg.show_fps    = (int)fe_ini_get_int(cfg_path, "show_fps", 0) ? 1 : 0;
+#ifdef REWIND
+   g_pcfg.rewind      = (int)fe_ini_get_int(cfg_path, "rewind", PCFG_REWIND_DEFAULT) ? 1 : 0;
+   /* No key: Medium.  Any other number (a 1..8 written by an earlier build,
+    * a hand edit) becomes the nearest named length not above it. */
+   g_pcfg.rewind_mb   = pcfg_rewind_mb_snap(
+      fe_ini_get_int(cfg_path, "rewind_mb", PCFG_REWIND_MB_DEFAULT));
+#endif
+   g_pcfg.rtc_realtime = (int)fe_ini_get_int(cfg_path, "rtc_realtime", 1) ? 1 : 0;
+   {
+      /* A value we do not know is OFF: the stick must never start doing
+       * something the player did not ask for. */
+      char sv[24];
+      g_pcfg.stick = CTL_STICK_OFF;
+      if (fe_ini_get(cfg_path, "stick", sv, sizeof(sv)) &&
+          ctl_stick_parse(sv, &g_pcfg.stick) != 0)
+      {
+         fe_evt("config_stick_invalid value=\"%s\" -> off", sv);
+         g_pcfg.stick = CTL_STICK_OFF;
+      }
+      g_pcfg.stick_warned =
+         (int)fe_ini_get_int(cfg_path, "stick_warned", 0) ? 1 : 0;
+   }
    g_pcfg.gb_palette  = (int)fe_ini_get_int(cfg_path, "gb_palette", 0);
    if (g_pcfg.gb_palette < 0 || g_pcfg.gb_palette > 15)
       g_pcfg.gb_palette = 0;
@@ -264,6 +286,7 @@ void pcfg_load_doc(const char *ini_path, fe_ini_doc *doc)
    /* Session overlay chip; the WLAN-off warning is never gated by this. */
    g_pcfg.osd_wireless = (int)fe_ini_get_int(cfg_path, "osd_wireless", 1);
    g_pcfg.osd_wireless = g_pcfg.osd_wireless ? 1 : 0;
+   g_pcfg.fast_link = (int)fe_ini_get_int(cfg_path, "fast_link", 0) ? 1 : 0;
    if (!fe_ini_get(cfg_path, "group", g_pcfg.group, sizeof(g_pcfg.group)))
       strcpy(g_pcfg.group, "GPSP07");
    if (!fe_ini_get(cfg_path, "nick", g_pcfg.nick, sizeof(g_pcfg.nick)))
@@ -360,6 +383,7 @@ static int pcfg_validate(const char *when)
    PCFG_CHK(quick_return,         0, 1, 1);
    PCFG_CHK(me_boot,              0, 1, 1);
    PCFG_CHK(osd_wireless,         0, 1, 1);
+   PCFG_CHK(fast_link,            0, 1, 0);
    PCFG_CHK(net_session_fps_x100, PCFG_SESSION_FPS_MIN, PCFG_SESSION_FPS_MAX,
             PCFG_SESSION_FPS_DEF);
    PCFG_CHK(net_session_fps_snap, 0, 1, 1);
@@ -420,6 +444,35 @@ int pcfg_remember_rom(const char *name)
    return 0;
 }
 
+/* gb_rtc_utc_since: this console's LOCAL time when a release that stamps
+ * GB/GBC clock saves in UTC first booted a GB/GBC game here.  Written once
+ * and never moved: every save an older release wrote on this console is
+ * stamped at or before it (fe_host.c gb_rtc_from_legacy).  0 = no clock
+ * reading. */
+long pcfg_gb_rtc_utc_since(long now_local)
+{
+   long since;
+   if (!cfg_path[0])
+      return now_local > 0 ? now_local : 0;
+   since = fe_ini_get_int(cfg_path, "gb_rtc_utc_since", 0);
+   if (since > 0 || now_local <= 0)
+      return since > 0 ? since : 0;
+   {
+      fe_ini_doc doc;
+      int rc;
+      /* Not stored: still "now" for this boot, so every save already on
+       * the card is read as the old releases read it, and asked again at
+       * the next boot. */
+      if (pcfg_doc_begin(&doc, "gb_rtc_utc_since") != 0)
+         return now_local;
+      rc = fe_ini_set_int(cfg_path, "gb_rtc_utc_since", now_local);
+      if (pcfg_doc_end(&doc, "gb_rtc_utc_since") != 0 || rc != 0)
+         return now_local;
+   }
+   fe_evt("gb_rtc_utc_since set=%ld", now_local);
+   return now_local;
+}
+
 int pcfg_remember_console(int console)
 {
    if (console < FE_CONSOLE_GBA || console > FE_CONSOLE_GBC)
@@ -473,6 +526,27 @@ void pcfg_save(void)
    fe_ini_set_int(cfg_path, "ui_shell", g_pcfg.ui_shell);
    fe_ini_set_int(cfg_path, "me_dirty", g_pcfg.me_dirty);
    fe_ini_set_int(cfg_path, "show_fps", g_pcfg.show_fps);
+#ifdef REWIND
+   fe_ini_set_int(cfg_path, "rewind", g_pcfg.rewind);
+   fe_ini_set_int(cfg_path, "rewind_mb", g_pcfg.rewind_mb);
+#endif
+   {
+      /* The kill switch is not a menu setting: written only when it is
+       * already in the file (or off), so nobody's config.ini changes. */
+      char rv[16];
+      if (!g_pcfg.rtc_realtime ||
+          fe_ini_get(cfg_path, "rtc_realtime", rv, sizeof(rv)))
+         fe_ini_set_int(cfg_path, "rtc_realtime", g_pcfg.rtc_realtime);
+      /* Written only once changed (or already in the file): a player who
+       * never touches the stick keeps the config.ini 3.5.0 wrote. */
+      char sv[24];
+      if (g_pcfg.stick != CTL_STICK_OFF ||
+          fe_ini_get(cfg_path, "stick", sv, sizeof(sv)))
+         fe_ini_set(cfg_path, "stick", ctl_stick_name(g_pcfg.stick));
+      if (g_pcfg.stick_warned ||
+          fe_ini_get(cfg_path, "stick_warned", sv, sizeof(sv)))
+         fe_ini_set_int(cfg_path, "stick_warned", g_pcfg.stick_warned);
+   }
    fe_ini_set_int(cfg_path, "gbc_color_correction",
                   g_pcfg.gbc_color_correction);
    fe_ini_set_int(cfg_path, "gb_palette",
@@ -505,6 +579,7 @@ void pcfg_save(void)
    fe_ini_set_int(cfg_path, "quick_return", g_pcfg.quick_return);
    fe_ini_set_int(cfg_path, "me_boot", g_pcfg.me_boot);
    fe_ini_set_int(cfg_path, "osd_wireless", g_pcfg.osd_wireless);
+   fe_ini_set_int(cfg_path, "fast_link", g_pcfg.fast_link);
    fe_ini_set(cfg_path, "group", g_pcfg.group);
    fe_ini_set(cfg_path, "nick", g_pcfg.nick);
    fe_ini_set_int(cfg_path, "console", g_pcfg.console);

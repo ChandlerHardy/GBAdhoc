@@ -1196,6 +1196,99 @@ void vid_overlay_end(void)
    gu_end_list();
 }
 
+#ifdef REWIND
+#include <math.h>
+
+/* Float positions: a 3 px ring on integer vertices wobbles as it turns. */
+typedef struct
+{
+   unsigned int color;
+   float x, y, z;
+} fcvtx_t;
+
+#define VID_ARC_SEG 64            /* segments in a full turn */
+
+void vid_arc(float cx, float cy, float r, float w, float a0, float a1,
+             uint16_t rgb565, int alpha0, int alpha1, int additive)
+{
+   float span = a1 - a0;
+   int n = (int)(fabsf(span) * (VID_ARC_SEG / 6.2831853f)) + 1, i;
+   fcvtx_t *v;
+   float ri = r - w * 0.5f, ro = r + w * 0.5f;
+
+   if (n > VID_ARC_SEG)
+      n = VID_ARC_SEG;
+   v = (fcvtx_t *)sceGuGetMemory((n + 1) * 2 * sizeof(fcvtx_t));
+   for (i = 0; i <= n; i++)
+   {
+      float t = (float)i / (float)n, a = a0 + span * t;
+      float c = cosf(a), s = sinf(a);
+      unsigned int col = rgb565_to_abgr(rgb565,
+                            alpha0 + (int)((float)(alpha1 - alpha0) * t));
+      v[i * 2].color = col;
+      v[i * 2].x = cx + c * ri; v[i * 2].y = cy + s * ri; v[i * 2].z = 0;
+      v[i * 2 + 1].color = col;
+      v[i * 2 + 1].x = cx + c * ro; v[i * 2 + 1].y = cy + s * ro;
+      v[i * 2 + 1].z = 0;
+   }
+   sceGuDisable(GU_TEXTURE_2D);
+   sceGuShadeModel(GU_SMOOTH);
+   if (additive)
+      sceGuBlendFunc(GU_ADD, GU_SRC_ALPHA, GU_FIX, 0, 0xFFFFFFFF);
+   sceGuDrawArray(GU_TRIANGLE_STRIP,
+                  GU_COLOR_8888 | GU_VERTEX_32BITF | GU_TRANSFORM_2D,
+                  (n + 1) * 2, 0, v);
+   if (additive)
+      sceGuBlendFunc(GU_ADD, GU_SRC_ALPHA, GU_ONE_MINUS_SRC_ALPHA, 0, 0);
+}
+
+void vid_disc(float cx, float cy, float r, uint16_t rgb565, int alpha)
+{
+   enum { N = 14 };
+   fcvtx_t *v = (fcvtx_t *)sceGuGetMemory((N + 2) * sizeof(fcvtx_t));
+   unsigned int col = rgb565_to_abgr(rgb565, alpha);
+   int i;
+   v[0].color = col; v[0].x = cx; v[0].y = cy; v[0].z = 0;
+   for (i = 0; i <= N; i++)
+   {
+      float a = (float)i * (6.2831853f / (float)N);
+      v[i + 1].color = col;
+      v[i + 1].x = cx + cosf(a) * r;
+      v[i + 1].y = cy + sinf(a) * r;
+      v[i + 1].z = 0;
+   }
+   sceGuDisable(GU_TEXTURE_2D);
+   sceGuDrawArray(GU_TRIANGLE_FAN,
+                  GU_COLOR_8888 | GU_VERTEX_32BITF | GU_TRANSFORM_2D,
+                  N + 2, 0, v);
+}
+
+void vid_seg(float x0, float y0, float x1, float y1, float w,
+             uint16_t rgb565, int alpha)
+{
+   fcvtx_t *v = (fcvtx_t *)sceGuGetMemory(4 * sizeof(fcvtx_t));
+   unsigned int col = rgb565_to_abgr(rgb565, alpha);
+   float dx = x1 - x0, dy = y1 - y0, l = sqrtf(dx * dx + dy * dy), nx, ny;
+   int i;
+   if (l < 0.001f)
+      return;
+   nx = -dy / l * w * 0.5f;
+   ny = dx / l * w * 0.5f;
+   v[0].x = x0 + nx; v[0].y = y0 + ny;
+   v[1].x = x0 - nx; v[1].y = y0 - ny;
+   v[2].x = x1 + nx; v[2].y = y1 + ny;
+   v[3].x = x1 - nx; v[3].y = y1 - ny;
+   for (i = 0; i < 4; i++)
+   {
+      v[i].color = col;
+      v[i].z = 0;
+   }
+   sceGuDisable(GU_TEXTURE_2D);
+   sceGuDrawArray(GU_TRIANGLE_STRIP,
+                  GU_COLOR_8888 | GU_VERTEX_32BITF | GU_TRANSFORM_2D, 4, 0, v);
+}
+#endif /* REWIND */
+
 /* ------------------------------------------------------------- swap/dump */
 
 /* Black out EVERY display buffer with plain uncached stores.

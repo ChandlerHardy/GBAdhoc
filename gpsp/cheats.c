@@ -21,17 +21,158 @@
 
 typedef struct
 {
+  u32 address;
+  u32 value;
+} cheat_rec;
+
+#ifdef REWIND
+/* Rewind (docs/REWIND.md): the cheat list is not in a snapshot, and a frame
+ * re-run under a different list is a different frame.  Every change to what
+ * runs bumps this; the frontend ends the history there. */
+u32 gba_rewind_cheat_gen;
+#define RW_CHEATS_CHANGED() (gba_rewind_cheat_gen++)
+#else
+#define RW_CHEATS_CHANGED() ((void)0)
+#endif
+
+typedef struct
+{
   bool cheat_active;
-  struct {
-    u32 address;
-    u32 value;
-  } codes[MAX_CHEAT_CODES];
+#ifdef GPSP_CHEATS
+  /* Records live in one shared pool (cheat_pool): a cheat is as long as it
+   * needs to be, and sixty short ones cost what sixty short ones cost. */
+  cheat_rec *codes;
+#else
+  cheat_rec codes[MAX_CHEAT_CODES];
+#endif
   unsigned cheat_count;
 } cheat_type;
 
 cheat_type cheats[MAX_CHEATS];
 u32 max_cheat = 0;
 u32 cheat_master_hook = 0xffffffff;
+
+#ifndef GPSP_CHEATS
+/* Upstream: codes go through the CPU's own memory handlers. */
+#define CHEAT_W8(a, v)   write_memory8((a), (v))
+#define CHEAT_W16(a, v)  write_memory16((a), (v))
+#define CHEAT_W32(a, v)  write_memory32((a), (v))
+#define CHEAT_R16(a)     read_memory16(a)
+#define CHEAT_R32(a)     read_memory32(a)
+#else
+/* ---- GPSP_CHEATS: the RAM-only accessors (docs/CHEATS.md section 5) --------
+ *
+ * A cheat file is hostile input.  Whatever it says, a code can only ever
+ * touch the two work-RAM arrays, through these five functions:
+ *
+ *   - EWRAM (0x02xxxxxx) and IWRAM (0x03xxxxxx) only.  The parser refuses a
+ *     code whose fixed address lies anywhere else (ROM, I/O, VRAM, palette,
+ *     OAM and -- above all -- the cartridge save at 0x0D/0x0E); a slide or
+ *     super code that WALKS out of the region at run time has that write
+ *     dropped and counted.  The offset is masked to the array's size, so no
+ *     address can index outside the host buffer.
+ *   - 16/32-bit accesses are forced to their alignment (as the GBA bus does).
+ *   - A write that does not change the bytes is not made: same data, same
+ *     translation.  So a code that rewrites translated code every frame costs
+ *     ONE flush, not one per frame.
+ *   - A changed byte under a nonzero code tag sets cheat_smc_pending; the
+ *     flush itself happens once, after every code has run
+ *     (cheats_apply_frame).  The guest's own stores are checked by the store
+ *     stubs and DMA by dma_write_iwram/_ewram; a cheat is a third writer and
+ *     needs the same check, or translated code it patched keeps running in
+ *     its old form.
+ * Reads are plain RAM reads: no I/O side effects, no ROM page faults. */
+static cheat_rec cheat_pool[CHEAT_POOL_RECORDS];
+static unsigned cheat_pool_used;
+u32 cheats_active;
+u32 cheats_suspended;
+u32 cheat_ram_flushes;
+u32 cheat_writes_changed;
+u32 cheat_writes_dropped;
+static u32 cheat_smc_pending;
+
+static u8 *cheat_ram(u32 address, u8 **tag)
+{
+  switch ((address >> 24) & 0xF)
+  {
+    case 0x2:
+      /* A cheat is a writer of EWRAM like any other (gba_memory.h, "THE
+       * RULE").  Marked here, where the pointer is made, so no write below
+       * can forget; a read marks too, which costs a compare and no more. */
+      RW_MARK_EWRAM(address & 0x3FFFF, 4);
+      *tag = ewram + 0x40000 + (address & 0x3FFFF);
+      return ewram + (address & 0x3FFFF);
+    case 0x3:
+      *tag = iwram + (address & 0x7FFF);
+      return iwram + 0x8000 + (address & 0x7FFF);
+    default:
+      return NULL;
+  }
+}
+
+static void cheat_w8(u32 address, u8 value)
+{
+  u8 *tag, *p = cheat_ram(address, &tag);
+  if (!p) { cheat_writes_dropped++; return; }
+  if (*p == value)
+    return;
+  *p = value;
+  cheat_writes_changed++;
+  if (*tag)
+    cheat_smc_pending = 1;
+}
+
+static void cheat_w16(u32 address, u16 value)
+{
+  u8 *tag, *p = cheat_ram(address & ~1U, &tag);
+  if (!p) { cheat_writes_dropped++; return; }
+  if (readaddress16(p, 0) == value)
+    return;
+  address16(p, 0) = eswap16(value);
+  cheat_writes_changed++;
+  if (address16(tag, 0))
+    cheat_smc_pending = 1;
+}
+
+static void cheat_w32(u32 address, u32 value)
+{
+  u8 *tag, *p = cheat_ram(address & ~3U, &tag);
+  if (!p) { cheat_writes_dropped++; return; }
+  if (readaddress32(p, 0) == value)
+    return;
+  address32(p, 0) = eswap32(value);
+  cheat_writes_changed++;
+  if (address32(tag, 0))
+    cheat_smc_pending = 1;
+}
+
+static u32 cheat_r16(u32 address)
+{
+  u8 *tag, *p = cheat_ram(address & ~1U, &tag);
+  return p ? readaddress16(p, 0) : 0;
+}
+
+static u32 cheat_r32(u32 address)
+{
+  u8 *tag, *p = cheat_ram(address & ~3U, &tag);
+  return p ? readaddress32(p, 0) : 0;
+}
+
+#define CHEAT_W8(a, v)   cheat_w8((a), (v))
+#define CHEAT_W16(a, v)  cheat_w16((a), (v))
+#define CHEAT_W32(a, v)  cheat_w32((a), (v))
+#define CHEAT_R16(a)     cheat_r16(a)
+#define CHEAT_R32(a)     cheat_r32(a)
+
+static void cheats_recount(void)
+{
+  unsigned i;
+  cheats_active = 0;
+  for (i = 0; i < MAX_CHEATS; i++)
+    if (cheats[i].cheat_active)
+      cheats_active++;
+}
+#endif
 
 /* Records one CodeBreaker code occupies.  Slide (4) and super (5) codes carry
  * payload records -- raw data whose top nibble means nothing -- so every walk
@@ -55,6 +196,7 @@ static unsigned codebreaker_next_len(const cheat_type *cheat, unsigned i)
   return i + 1 < cheat->cheat_count ? codebreaker_code_len(cheat, i + 1) : 1;
 }
 
+#ifndef GPSP_CHEATS
 static bool has_encrypted_codebreaker(cheat_type *cheat)
 {
   unsigned i;
@@ -90,6 +232,8 @@ static void update_hook_codebreaker(cheat_type *cheat)
   }
 }
 
+#endif
+
 static void process_cheat_codebreaker(cheat_type *cheat, u16 pad)
 {
   unsigned i, j;
@@ -106,10 +250,10 @@ static void process_cheat_codebreaker(cheat_type *cheat, u16 pad)
     case 1:   /* Master code function */
       break;
     case 2:   /* 16 bit OR */
-      write_memory16(address, read_memory16(address) | value);
+      CHEAT_W16(address, CHEAT_R16(address) | value);
       break;
     case 3:   /* 8 bit write */
-      write_memory8(address, value);
+      CHEAT_W8(address, value);
       break;
     case 4:   /* Slide code, writes a buffer with addr/value strides */
       if (i + 1 < cheat->cheat_count)
@@ -119,7 +263,7 @@ static void process_cheat_codebreaker(cheat_type *cheat, u16 pad)
         u16 aincr = cheat->codes[  i].value;
         for (j = 0; j < count; j++)
         {
-          write_memory16(address, value);
+          CHEAT_W16(address, value);
           address += aincr;
           value += vincr;
         }
@@ -148,30 +292,30 @@ static void process_cheat_codebreaker(cheat_type *cheat, u16 pad)
           bvalue = cheat->codes[i].value >> (40 - off*8);
           break;
         };
-        write_memory8(address, bvalue);
+        CHEAT_W8(address, bvalue);
         address++;
       }
       break;
     case 6:   /* 16 bit AND */
-      write_memory16(address, read_memory16(address) & value);
+      CHEAT_W16(address, CHEAT_R16(address) & value);
       break;
     case 7:   /* Compare mem value and execute next cheat */
-      if (read_memory16(address) != value)
+      if (CHEAT_R16(address) != value)
         i += codebreaker_next_len(cheat, i);
       break;
     case 8:   /* 16 bit write */
-      write_memory16(address, value);
+      CHEAT_W16(address, value);
       break;
     case 10:   /* Compare mem value and skip next cheat */
-      if (read_memory16(address) == value)
+      if (CHEAT_R16(address) == value)
         i += codebreaker_next_len(cheat, i);
       break;
     case 11:   /* Compare mem value and skip next cheat */
-      if (read_memory16(address) <= value)
+      if (CHEAT_R16(address) <= value)
         i += codebreaker_next_len(cheat, i);
       break;
     case 12:   /* Compare mem value and skip next cheat */
-      if (read_memory16(address) >= value)
+      if (CHEAT_R16(address) >= value)
         i += codebreaker_next_len(cheat, i);
       break;
     case 13:   /* Check button state and execute next cheat */
@@ -195,21 +339,22 @@ static void process_cheat_codebreaker(cheat_type *cheat, u16 pad)
       {
         u32 value32 = (u32)((s16)value);  /* Sign extend to 32 bit */
         address &= ~1U;
-        write_memory32(address, read_memory32(address) + value32);
+        CHEAT_W32(address, CHEAT_R32(address) + value32);
       }
       else
       {
-        write_memory16(address, read_memory16(address) + value);
+        CHEAT_W16(address, CHEAT_R16(address) + value);
       }
       break;
     case 15:   /* Immediate and check and skip */
-      if ((read_memory16(address) & value) == 0)
+      if ((CHEAT_R16(address) & value) == 0)
         i += codebreaker_next_len(cheat, i);
       break;
     }
   }
 }
 
+#ifndef GPSP_CHEATS
 void process_cheats(void)
 {
    u32 i;
@@ -222,10 +367,61 @@ void process_cheats(void)
       process_cheat_codebreaker(&cheats[i], 0x3ff ^ read_ioreg(REG_P1));
    }
 }
+#else
+/* Upstream's two entry points are both INSIDE emulation: update_gba at vcount
+ * 228 (compiled out in main.c under GPSP_CHEATS) and the translator's
+ * master-hook call (mips_cheat_hook), emitted only when cheat_master_hook
+ * names a PC -- which GPSP_CHEATS never lets happen.  Neither may flush the
+ * translation cache it is running from, so under GPSP_CHEATS this symbol
+ * stays only because the stubs reference it, and does nothing. */
+void process_cheats(void)
+{
+}
+
+/* The one place codes run (libretro.c retro_run, before the CPU).  A pure
+ * function of three things: the active codes, guest work RAM, and this
+ * frame's KEYINPUT -- so the same emulated frame always gets the same patch
+ * (docs/CHEATS.md section 8, rewind). */
+void cheats_apply_frame(void)
+{
+   u32 i;
+   u16 pad = 0x3ff ^ read_ioreg(REG_P1);
+
+   cheat_smc_pending = 0;
+   for (i = 0; i <= max_cheat && i < MAX_CHEATS; i++)
+   {
+      if (!cheats[i].cheat_active)
+         continue;
+      process_cheat_codebreaker(&cheats[i], pad);
+   }
+#ifdef HAVE_DYNAREC
+   /* A code changed bytes the dynarec has translated.  The same full RAM
+    * flush as a DMA onto code (flush_translation_cache_ram_dma), but run
+    * between frames: nothing is executing from the RAM cache, and the next
+    * entry (execute_arm_translate) dispatches from reg[REG_PC] through
+    * block_lookup_address_*, exactly as after a savestate load.  ROM
+    * translations are untouched -- codes cannot reach ROM. */
+   if (cheat_smc_pending && dynarec_enable)
+   {
+      flush_translation_cache_ram();
+      cheat_ram_flushes++;
+   }
+#endif
+   cheat_smc_pending = 0;
+}
+
+void cheats_set_suspended(int on)
+{
+   if (cheats_suspended != (u32)(on ? 1 : 0))
+      RW_CHEATS_CHANGED();
+   cheats_suspended = on ? 1 : 0;
+}
+#endif
 
 void cheat_clear()
 {
    int i;
+   RW_CHEATS_CHANGED();
    for (i = 0; i < MAX_CHEATS; i++)
    {
       cheats[i].cheat_count = 0;
@@ -236,6 +432,10 @@ void cheat_clear()
     * wasting cycles on every vblank. */
    max_cheat = 0;
    cheat_master_hook = 0xffffffff;
+#ifdef GPSP_CHEATS
+   cheats_active = 0;
+   cheat_pool_used = 0;
+#endif
 }
 
 /* Soft-disable: keep the parsed code data in place so a future
@@ -252,9 +452,14 @@ void cheat_disable(unsigned index)
 {
    if (index >= MAX_CHEATS)
       return;
+   RW_CHEATS_CHANGED();
    cheats[index].cheat_active = false;
+#ifdef GPSP_CHEATS
+   cheats_recount();
+#endif
 }
 
+#ifndef GPSP_CHEATS
 cheat_error cheat_parse(unsigned index, const char *code)
 {
    int pos = 0;
@@ -267,6 +472,7 @@ cheat_error cheat_parse(unsigned index, const char *code)
     * per C even if the pointer is never dereferenced. */
    if (index >= MAX_CHEATS)
       return CheatErrorTooMany;
+   RW_CHEATS_CHANGED();
    ch = &cheats[index];
    /* Init to a known good state so any rejected replacement disables the
     * previous cheat rather than leaving stale code running. */
@@ -334,3 +540,326 @@ cheat_error cheat_parse(unsigned index, const char *code)
    /* TODO parse other types here */
    return CheatErrorNotSupported;
 }
+#endif
+
+#ifdef GPSP_CHEATS
+/* ---- GPSP_CHEATS: the strict parser (docs/CHEATS.md section 3) -------------
+ *
+ * Upstream's parser replaced every non-hex character with a space and then
+ * scanned "%08x %04hx" at a fixed 13-character stride, so a GameShark/AR code
+ * ("XXXXXXXX YYYYYYYY") was accepted and run as two garbage CodeBreaker
+ * records.  This one tokenises, and accepts exactly:
+ *
+ *   CodeBreaker   "AAAAAAAA VVVV"  (or the 12 digits run together)
+ *   raw write     "AAAAAAAA:VV" / ":VVVV" / ":VVVVVVVV" -- 8, 16, 32 bits
+ *
+ * Codes are separated by whitespace, '+', ',' or ';' (libretro .cht joins
+ * lines with '+').  One cheat is all CodeBreaker or all raw.  Raw writes are
+ * compiled to CodeBreaker records (8-bit -> type 3, 16-bit -> type 8, 32-bit
+ * -> two type 8), so there is one interpreter and one set of accessors.
+ *
+ * Then every CodeBreaker opcode is checked against the GPSP_CHEATS rules:
+ * fixed addresses in EWRAM/IWRAM, 16/32-bit accesses aligned, encrypted
+ * (type 9) refused, master/hook (type 1) and game id (type 0) accepted and
+ * ignored.  A cheat that fails any check is left inactive and takes nothing
+ * from the record pool. */
+const char *cheat_error_name(cheat_error e)
+{
+   switch (e)
+   {
+   case CheatNoError:           return "ok";
+   case CheatErrorTooMany:      return "too many cheats on";
+   case CheatErrorTooBig:       return "code too long";
+   case CheatErrorEncrypted:    return "encrypted CodeBreaker";
+   case CheatErrorNotSupported: return "incomplete code";
+   case CheatErrorSyntax:       return "not a code";
+   case CheatErrorGameShark:    return "GameShark / Action Replay";
+   case CheatErrorRegion:       return "not a RAM code";
+   case CheatErrorAlign:        return "odd address";
+   case CheatErrorMixed:        return "mixed formats";
+   }
+   return "?";
+}
+
+static int cheat_is_sep(char c)
+{
+   return c == ' ' || c == '\t' || c == '\r' || c == '\n' || c == '+' ||
+          c == ',' || c == ';';
+}
+
+static int cheat_hex(const char *p, unsigned n, u32 *out)
+{
+   u32 v = 0;
+   unsigned i;
+   if (n == 0 || n > 8)
+      return 0;
+   for (i = 0; i < n; i++)
+   {
+      char c = p[i];
+      v <<= 4;
+      if (c >= '0' && c <= '9')      v |= (u32)(c - '0');
+      else if (c >= 'a' && c <= 'f') v |= (u32)(c - 'a' + 10);
+      else if (c >= 'A' && c <= 'F') v |= (u32)(c - 'A' + 10);
+      else return 0;
+   }
+   *out = v;
+   return 1;
+}
+
+static int cheat_all_hex(const char *p, unsigned n)
+{
+   u32 d;
+   unsigned i;
+   if (n == 0)
+      return 0;
+   for (i = 0; i < n; i += 8)
+      if (!cheat_hex(p + i, n - i > 8 ? 8 : n - i, &d))
+         return 0;
+   return 1;
+}
+
+/* Next token: [*tok, *tok + *n).  Returns 0 at the end of the string. */
+static int cheat_token(const char **s, const char **tok, unsigned *n)
+{
+   const char *p = *s;
+   while (*p && cheat_is_sep(*p))
+      p++;
+   if (!*p)
+   {
+      *s = p;
+      return 0;
+   }
+   *tok = p;
+   while (*p && !cheat_is_sep(*p))
+      p++;
+   *n = (unsigned)(p - *tok);
+   *s = p;
+   return 1;
+}
+
+/* One record onto the cheat being built, from the shared pool. */
+static int cheat_push(cheat_type *ch, u32 address, u32 value)
+{
+   if ((unsigned)(ch->codes - cheat_pool) + ch->cheat_count >=
+       CHEAT_POOL_RECORDS)
+      return 0;
+   ch->codes[ch->cheat_count].address = address;
+   ch->codes[ch->cheat_count++].value = value;
+   return 1;
+}
+
+static int cheat_in_ram(u32 address)
+{
+   u32 r = (address >> 24) & 0xF;
+   return r == 0x2 || r == 0x3;
+}
+
+#define CHEAT_SLIDE_MAX 4096u
+static cheat_error cheat_validate(const cheat_type *ch)
+{
+   unsigned i, len;
+   for (i = 0; i < ch->cheat_count; i += len)
+   {
+      u32 code = ch->codes[i].address;
+      u32 address = code & 0xfffffff;
+      u32 opcode = code >> 28;
+      len = codebreaker_code_len(ch, i);
+      if (len > ch->cheat_count - i)
+         return CheatErrorNotSupported;     /* truncated slide/super payload */
+      switch (opcode)
+      {
+      case 0x0:   /* game id: ignored, as upstream */
+      case 0x1:   /* master/hook: accepted, never installed (cheats.h) */
+      case 0xD:   /* button test: no address */
+         break;
+      case 0x9:
+         return CheatErrorEncrypted;
+      case 0x3:   /* 8-bit write */
+      case 0x5:   /* super code: byte copy */
+         if (!cheat_in_ram(address))
+            return CheatErrorRegion;
+         break;
+      case 0xE:   /* add: bit 0 set = 32-bit at address & ~1 */
+         if (!cheat_in_ram(address))
+            return CheatErrorRegion;
+         if ((address & 1) && ((address & ~1U) & 3))
+            return CheatErrorAlign;
+         break;
+      default:    /* 2 4 6 7 8 A B C F: 16-bit accesses */
+         if (!cheat_in_ram(address))
+            return CheatErrorRegion;
+         if (address & 1)
+            return CheatErrorAlign;
+         /* A slide's count is a raw 16-bit value run EVERY frame with only
+          * its first address checked: 65,535 writes a frame, striding
+          * anywhere (review C10).  No real slide code needs more than a
+          * screen of tiles; refuse beyond CHEAT_SLIDE_MAX. */
+         if (opcode == 0x4 && len == 2 &&
+             (ch->codes[i + 1].address & 0xFFFF) > CHEAT_SLIDE_MAX)
+            return CheatErrorNotSupported;
+         break;
+      }
+   }
+   return CheatNoError;
+}
+
+/* Text -> records at ch->codes (which the caller pointed into the pool).
+ * Nothing is activated and nothing is taken from the pool here. */
+static cheat_error cheat_compile(cheat_type *ch, const char *code)
+{
+   const char *s = code, *t, *t2;
+   unsigned n, n2;
+   int kind = 0;   /* 1 CodeBreaker, 2 raw */
+
+   ch->cheat_count = 0;
+   if (!code)
+      return CheatErrorSyntax;
+   while (cheat_token(&s, &t, &n))
+   {
+      const char *colon = (const char *)memchr(t, ':', n);
+      u32 a = 0, v = 0;
+      if (colon)
+      {
+         unsigned an = (unsigned)(colon - t), vn = n - an - 1;
+         if (kind == 1)
+            return CheatErrorMixed;
+         kind = 2;
+         if (!cheat_hex(t, an, &a) || !cheat_hex(colon + 1, vn, &v) ||
+             (vn != 2 && vn != 4 && vn != 8))
+            return CheatErrorSyntax;
+         if (a > 0x0FFFFFFF || !cheat_in_ram(a))
+            return CheatErrorRegion;
+         if ((vn == 4 && (a & 1)) || (vn == 8 && (a & 3)))
+            return CheatErrorAlign;
+         if (vn == 2)
+         { if (!cheat_push(ch, 0x30000000 | a, v)) return CheatErrorTooBig; }
+         else if (vn == 4)
+         { if (!cheat_push(ch, 0x80000000 | a, v)) return CheatErrorTooBig; }
+         else if (!cheat_push(ch, 0x80000000 | a, v & 0xFFFF) ||
+                  !cheat_push(ch, 0x80000000 | (a + 2), v >> 16))
+            return CheatErrorTooBig;
+         continue;
+      }
+      if (!cheat_all_hex(t, n))
+         return CheatErrorSyntax;
+      if (n == 16)
+         return CheatErrorGameShark;
+      if (n == 12)
+      {
+         cheat_hex(t, 8, &a);
+         cheat_hex(t + 8, 4, &v);
+      }
+      else if (n == 8)
+      {
+         if (!cheat_token(&s, &t2, &n2) || !cheat_all_hex(t2, n2))
+            return CheatErrorSyntax;
+         if (n2 == 8)
+            return CheatErrorGameShark;
+         if (n2 != 4)
+            return CheatErrorSyntax;
+         cheat_hex(t, 8, &a);
+         cheat_hex(t2, 4, &v);
+      }
+      else
+         return CheatErrorSyntax;
+      if (kind == 2)
+         return CheatErrorMixed;
+      kind = 1;
+      if (!cheat_push(ch, a, v))
+         return CheatErrorTooBig;
+   }
+   if (ch->cheat_count == 0)
+      return CheatErrorSyntax;
+   return cheat_validate(ch);
+}
+
+/* Would cheat_parse accept this text?  Compiles into the free end of the
+ * pool and gives it straight back: no slot, no state, callable any time
+ * (the ROM browser asks before any game is loaded). */
+cheat_error cheat_check(const char *code)
+{
+   cheat_type tmp;
+   tmp.cheat_active = false;
+   tmp.codes = cheat_pool + cheat_pool_used;
+   tmp.cheat_count = 0;
+   return cheat_compile(&tmp, code);
+}
+
+cheat_error cheat_parse(unsigned index, const char *code)
+{
+   cheat_type *ch;
+   cheat_error err;
+
+   if (index >= MAX_CHEATS)
+      return CheatErrorTooMany;
+   RW_CHEATS_CHANGED();
+   ch = &cheats[index];
+   /* A rejected replacement disables the previous cheat in this slot rather
+    * than leaving stale code running.  (Its records stay in the pool until
+    * cheat_clear: the frontend rebuilds every slot on each change.) */
+   ch->cheat_count = 0;
+   ch->cheat_active = false;
+   ch->codes = cheat_pool + cheat_pool_used;
+   cheats_recount();
+   if (index > max_cheat)
+      max_cheat = index;
+
+   err = cheat_compile(ch, code);
+   if (err != CheatNoError)
+   {
+      ch->cheat_count = 0;
+      return err;
+   }
+   cheat_pool_used += ch->cheat_count;
+   ch->cheat_active = true;
+   cheats_recount();
+   return CheatNoError;
+}
+
+/* The frontend's view (frontend-common/fe_cheats.c): plain ints, so it needs
+ * no core header. */
+int cheats_fe_parse(unsigned slot, const char *code)
+{
+   return (int)cheat_parse(slot, code);
+}
+
+int cheats_fe_check(const char *code)
+{
+   return (int)cheat_check(code);
+}
+
+void cheats_fe_clear(void)
+{
+   cheat_clear();
+}
+
+unsigned cheats_fe_slots(void)
+{
+   return MAX_CHEATS;
+}
+
+void cheats_fe_suspend(int on)
+{
+   cheats_set_suspended(on);
+}
+
+unsigned cheats_fe_ram_flushes(void)
+{
+   return (unsigned)cheat_ram_flushes;
+}
+
+unsigned cheats_fe_writes(void)
+{
+   return (unsigned)cheat_writes_changed;
+}
+
+unsigned cheats_fe_dropped(void)
+{
+   return (unsigned)cheat_writes_dropped;
+}
+
+const char *cheats_fe_error_name(int err)
+{
+   return cheat_error_name((cheat_error)err);
+}
+#endif

@@ -53,6 +53,8 @@ TIMEOUT_S="${TIMEOUT_S:-600}"
 # pins Xvfb to display N (`xvfb-run -n`) instead of letting it pick (`-a`).
 EBOOT="${VREGRESS_EBOOT:-$REPO/psp/EBOOT.PBP}"
 VREGRESS_CONFIG="${VREGRESS_CONFIG:-}"
+# VREGRESS_INI_EXTRA: extra .gpsp-harness.ini lines for the run (e.g.
+# "vhash_legacy_rb = 1", the pre-ADR-0039 channel order).
 XVFB_SEL="-a"
 [ -n "${XDISPLAY:-}" ] && XVFB_SEL="-n ${XDISPLAY#:}"
 ROM="$REPO/testdata/Pokemon - Emerald Version (USA, Europe).gba"
@@ -130,6 +132,7 @@ rom = emerald.gba
 script = run.inputs
 vhash = 1
 autoexit_frames = 30000
+${VREGRESS_INI_EXTRA:-}
 EOF
 
   rm -f /dev/shm/PPSSPP_ID

@@ -24,6 +24,7 @@ Cases (see docs/ME-MIDFRAME.md for what each is expected to show):
   m4_back       mode 4, draw back page + flip in VBlank                (d)
   m4_front      mode 4, draw the DISPLAYED page, unsynchronised        (d)
   m4_flipmid    mode 4, page flip at line 80 (VCOUNT IRQ)              (d)
+  m4_fliphide   mode 4, flip on any line, then draw the page just hidden (d)
   vram_offscreen  mode 0, main loop writes VRAM no BG/OBJ reads  control
   sa2_waves     Sonic Advance 2 title sea: per-line BG2 affine by HBlank
                 DMA (PC=PD=0) + CpuFastSet palette gradient in HBlank IRQ
@@ -461,6 +462,30 @@ CASES["m4_flipmid"] = rom(
     ldrh r2, [r0]
     orr r2, r2, #0x10
     strh r2, [r0]
+""", data=M4_DATA())
+
+
+# Double-buffered with no VBlank sync (Need for Speed Underground 2): draw the
+# hidden page, flip on whatever line that ends on, and at once start drawing
+# the page that was on screen until then.  The lines above the flip showed it
+# as it was; a copy taken at line 160 has it half redrawn.
+CASES["m4_fliphide"] = rom(
+    init=M4_SETUP + set_reg(0x00, 0x0404) + "    mov r5, #1\n",
+    loop=r"""
+    ldrh r0, [r4]
+    tst r0, #0x10
+    ldreq r1, =0x0600A000     @ showing page 0 -> draw page 1
+    ldrne r1, =0x06000000
+    add r5, r5, #7
+    and r5, r5, #0xFF
+    orr r0, r5, r5, lsl #8
+    orr r0, r0, r0, lsl #16
+    ldr r2, =9600
+    bl fill_words
+    ldrh r0, [r4]
+    eor r0, r0, #0x10
+    strh r0, [r4]             @ flip, wherever the beam is
+    b main_loop
 """, data=M4_DATA())
 
 

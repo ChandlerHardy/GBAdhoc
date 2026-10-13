@@ -127,13 +127,17 @@ int gbcore_rom_title(gbcore_t *core, char *destination, size_t capacity);
  * latched, 64-bit little-endian UNIX time) stamped with the wall clock at
  * the moment of the read -- so the image changes every second even when the
  * game wrote nothing.  Use gbcore_cart_ram_size() bytes for change
- * detection. */
+ * detection.  The stamp is what the wall-clock hook returns; the format
+ * defines it as UTC, so that is what the hook should give. */
 size_t gbcore_save_ram_size(gbcore_t *core);
 size_t gbcore_cart_ram_size(gbcore_t *core);
 int gbcore_save_ram_read(gbcore_t *core, void *destination, size_t capacity);
-/* Accepts cart RAM alone or cart RAM plus a 44- or 48-byte clock trailer;
- * any other trailer, or one stamped in the future or before 1997, resets
- * the clock (the RAM is kept either way). */
+/* Accepts cart RAM alone or cart RAM plus a 44- or 48-byte clock trailer.
+ * The RAM is always kept.  The clock resumes from the trailer's registers
+ * plus the wall-clock time since its stamp; a stamp from the future adds
+ * nothing (the registers stand), and a halted clock stays where it was.  No
+ * trailer, a trailer of any other size, or a stamp before 1997 starts the
+ * clock from zero. */
 int gbcore_save_ram_write(gbcore_t *core, const void *source, size_t size);
 
 /* Save states.  The image is self-describing (magic, version, console and
@@ -144,10 +148,12 @@ size_t gbcore_state_size(gbcore_t *core);
 long gbcore_state_save(gbcore_t *core, void *destination, size_t capacity);
 int gbcore_state_load(gbcore_t *core, const void *source, size_t size);
 
-/* Wall clock for cartridge RTCs, as seconds since 1970. NULL (the default)
- * means C time(). Required on the PSP, whose time() is roughly uptime: with
- * it every MBC3 save looked like it came from the future or from 1970 and
- * the game's clock was reset on every boot. Set before gbcore_create(). */
+/* Wall clock for cartridge RTCs, as seconds since 1970 (UTC: it stamps the
+ * battery image). NULL (the default) means C time(). Required on the PSP,
+ * whose time() is roughly uptime: with it every MBC3 save looked like it
+ * came from the future or from 1970 and the game's clock was reset on every
+ * boot. Set before gbcore_create(). A hook that cannot read its clock
+ * returns 0, and the cartridge clock holds until it can. */
 void gbcore_set_wallclock(time_t (*wallclock)(void));
 
 /* DMG palette.  AUTO shows Super Game Boy colours for games that support

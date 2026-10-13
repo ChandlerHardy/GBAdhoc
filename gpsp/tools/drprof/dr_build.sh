@@ -20,16 +20,26 @@ IMAGE=${DRPROF_IMAGE:-drprof-qemu}
 VARIANT=${1:-base}
 VDEFS=${2:-}
 TWIN=${TWIN:-1}
+# DRPROF_SRC: the build tree's directory name under $DRPROF_HOME (default
+# src).  Give each concurrent build its own (dr_corpus.py does) -- the root
+# make writes objects beside the sources, so two builds must never share one.
+SRCN=${DRPROF_SRC:-src}
 
 docker image inspect "$IMAGE" >/dev/null 2>&1 || \
   docker build -t "$IMAGE" "$HERE/docker"
 
-mkdir -p "$DRPROF_HOME/src" "$DRPROF_HOME/bin"
+mkdir -p "$DRPROF_HOME/$SRCN" "$DRPROF_HOME/bin"
 rsync -a --delete --exclude .git --exclude '*.o' --exclude '*.a' \
   --exclude 'psp/*.PBP' --exclude 'psp/*.elf' --exclude 'tools/drprof/bin' \
-  "$TREE/" "$DRPROF_HOME/src/"
+  "$TREE/" "$DRPROF_HOME/$SRCN/"
+# DRPROF_PATCH: a patch (-p1, relative to the tree) applied to the rsynced
+# copy only -- the corpus oracle's deliberately broken MUTANT builds
+# (tools/drprof/mutants/).  The next build's rsync --delete restores the copy.
+if [ -n "${DRPROF_PATCH:-}" ]; then
+  patch -p1 -s -d "$DRPROF_HOME/$SRCN" < "$DRPROF_PATCH"
+fi
 
-docker run --rm -v "$DRPROF_HOME":/w -w /w/src/tools/drprof "$IMAGE" bash -c "
+docker run --rm -v "$DRPROF_HOME":/w -w /w/$SRCN/tools/drprof "$IMAGE" bash -c "
   set -e
   rm -f bin/dr_host_$VARIANT bin/libcore_$VARIANT.a
   make plugin >/dev/null

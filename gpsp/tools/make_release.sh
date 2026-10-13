@@ -198,6 +198,12 @@ cp "$ME_PRX" "$APP/gbadhoc_me.prx"
 cp "$HOME_PRX" "$APP/gbadhoc_home.prx"
 # Keep the empty folders alive through zip/unzip on every extractor.
 : > "$APP/roms/.keep"; : > "$APP/saves/.keep"; : > "$APP/log/.keep"
+# cheats/: where a player's own per-game cheat files go (docs/CHEATS.md).
+# Only the how-to ships -- never a cheat database.
+if [ -f "$REPO/assets/cheats/README.txt" ]; then
+  mkdir -p "$APP/cheats"
+  cp "$REPO/assets/cheats/README.txt" "$APP/cheats/README.txt"
+fi
 
 [ -f "$REPO/COPYING" ] || die "no COPYING in the repo — refusing to ship unlicensed"
 cp "$REPO/COPYING" "$STAGE/LICENSE"
@@ -242,6 +248,7 @@ Copy the "PSP" folder in this zip to the ROOT of your memory stick.  You get:
         gbadhoc_me.prx  Media Engine renderer module
         gbadhoc_home.prx  HOME-as-menu-button module (Settings > Controls)
         roms/         <- put your own .gba ROMs here
+        cheats/       your own per-game cheat files (see cheats/README.txt)
         saves/        (used by per-game builds)
         log/          frontend.log lands here
 

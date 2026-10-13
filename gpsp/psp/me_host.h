@@ -53,6 +53,15 @@ int  me_host_idle(void);
 int  me_host_post_render(unsigned int desc_uncached);
 unsigned int me_host_result(void);
 int  me_host_input_done(void);   /* v2: ME consumed the live inputs */
+/* v3: the render that just completed was REFUSED -- the ME found no usable
+ * work area in its desc and drew nothing (me/me_mbox.h).  Ask once the
+ * command is idle, before presenting its stage. */
+int  me_host_render_refused(void);
+/* v3: have the ME write back and drop its whole D-cache, and wait for it
+ * (bounded by timeout_us).  Returns 0 when it is done, -1 if the engine is
+ * down, busy or did not answer in time -- in which case the caller must NOT
+ * free memory the ME has been writing.  Never called from the frame loop. */
+int  me_host_sync(unsigned timeout_us);
 
 /* Watchdog: call once per frame while using the ME.  Returns 0 while
  * healthy; nonzero once the ME has missed its deadline enough times that

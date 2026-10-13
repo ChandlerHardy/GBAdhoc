@@ -1,6 +1,6 @@
 <!-- ============================================================================
      VERSION: the release number is written ONCE, on the "Version" line in the
-     hero block just below (3.5.0).  Every other sentence says "this release",
+     hero block just below (4.0.0).  Every other sentence says "this release",
      and the download button points at /releases/latest, so renaming the
      release is a one-line edit.
      ============================================================================ -->
@@ -15,34 +15,34 @@
 <h3 align="center">Game Boy Advance, Game Boy and Game Boy Color on your PSP,<br>and two PSPs that play together like two consoles and a link cable.</h3>
 
 <p align="center">
-  <sub><b>Version 3.5.0</b> &nbsp;·&nbsp; PSP-1000, 2000/3000 and Go &nbsp;·&nbsp; no BIOS needed &nbsp;·&nbsp; GPL-2.0</sub>
+  <sub><b>Version 4.0.0</b> &nbsp;·&nbsp; PSP-1000, 2000/3000 and Go &nbsp;·&nbsp; no BIOS needed &nbsp;·&nbsp; GPL-2.0</sub>
 </p>
 
 <p align="center">
   <a href="https://github.com/ShoshinFauteux/GBAdhoc/releases/latest"><b>⬇&nbsp; Download the latest release</b></a>
-  &nbsp;&nbsp;·&nbsp;&nbsp; <a href="gpsp/docs/video/trailer-3.5.0.mp4"><b>▶&nbsp; Watch the trailer</b></a>
-  &nbsp;&nbsp;·&nbsp;&nbsp; <a href="#install">Install</a>
+  &nbsp;&nbsp;·&nbsp;&nbsp; <a href="gpsp/docs/video/trailer-4.0.0.mp4"><b>▶&nbsp; Watch the trailer</b></a>
   &nbsp;&nbsp;·&nbsp;&nbsp; <a href="#whats-new-in-this-release">What's new</a>
+  &nbsp;&nbsp;·&nbsp;&nbsp; <a href="#install">Install</a>
   &nbsp;&nbsp;·&nbsp;&nbsp; <a href="#playing-together">Playing together</a>
   &nbsp;&nbsp;·&nbsp;&nbsp; <a href="#everything-it-does">Full feature list</a>
 </p>
 
 <p align="center">
-  <a href="gpsp/docs/video/trailer-3.5.0.mp4">
-    <picture>
-      <source srcset="gpsp/docs/img/hero-350.webp" type="image/webp">
-      <img src="gpsp/docs/img/hero-350-poster.jpg" alt="Two PSPs side by side: a linked Mario Kart: Super Circuit race, an Advance Wars 2 tank battle playing on both screens, and a Pokémon trade travelling down the cable from one PSP to the other" width="880">
-    </picture>
+  <a href="gpsp/docs/video/trailer-4.0.0.mp4">
+  <picture>
+    <source srcset="gpsp/docs/img/hero-400.webp" type="image/webp">
+    <img src="gpsp/docs/img/hero-400-poster.jpg" alt="A lost Fire Emblem battle runs backwards and pulls back out of a blue PSP's screen; the turn is played again, Eirika counter-attacks and wins, and a card reads: New feature, Rewind" width="880">
+  </picture>
   </a>
   <br>
-  <sub><b>Two PSPs, one game.</b> Mario Kart: Super Circuit, Advance Wars 2 and a Pokémon Crystal trade, linked over the PSP's own WiFi. <a href="gpsp/docs/video/trailer-3.5.0.mp4">Watch the 86-second trailer</a></sub>
+  <sub><b>Hold a button. Take it back.</b> Rewind is new in this release: the game runs backwards for as long as you hold, and you carry on from wherever you let go. The gameplay is real; the anime retelling is from the 4.0.0 trailer.</sub>
 </p>
 
 Race a friend in Mario Kart, fight them in Advance Wars, trade Pokémon across Game Boy
-generations: this release links two PSPs the way a cable links two Game Boys, for
-Game Boy Advance games as well as Game Boy and Game Boy Color. And for one player
-there is a new in-game menu over your paused game, save states you can see, every button
-remappable, sharper pixels, and a quit to the game list that takes about a second.
+generations: GBAdhoc links two PSPs the way a cable links two Game Boys, for Game Boy
+Advance games as well as Game Boy and Game Boy Color. This release adds **rewind**: hold
+a button and the game runs backwards. It also brings per-game cheats, save and save-state
+sharing between two PSPs, turbo buttons, and faster link play.
 
 It still runs the hard ROM hacks at full speed on a PSP-1000, because the renderer lives
 on the console's second processor, and you can still put the PSP to sleep and pick the
@@ -53,36 +53,36 @@ game up tomorrow exactly where it was.
 <table>
 <tr>
 <td width="33%" valign="top">
-<img src="gpsp/docs/img/link-race.gif" alt="A linked Mario Kart: Super Circuit race, both players' screens side by side, the lap timers identical" width="100%">
-<b>GBA link cable, over the air</b><br>
-<sub>Link-cable games between two PSPs. Each PSP runs both games; only the buttons cross the air. Mario Kart: Super Circuit, Advance Wars 2 and more.</sub>
+<img src="gpsp/docs/img/rewind.webp" alt="Mario Kart, Street Fighter and Castlevania each running backwards for a moment under a REWIND badge, then carrying on" width="100%">
+<b>Rewind</b><br>
+<sub>Hold △ and the game runs backwards, sound and all. Let go and play on from there. Your in-game saves are never undone.</sub>
 </td>
 <td width="33%" valign="top">
-<img src="gpsp/docs/img/link-aw2-battle.gif" alt="Advance Wars 2: blue's tanks fire on red's and red fires back, on both PSPs" width="100%">
-<b>Battle head to head</b><br>
-<sub>The other player's moves play out on your screen, battle animations and all, exactly as two GBAs on a cable would show them.</sub>
+<img src="gpsp/docs/img/share.gif" alt="Two PSPs side by side: one sends a save state, the other receives it and opens the game at the same spot" width="100%">
+<b>Share saves and states</b><br>
+<sub>Send a save file or a save state to the PSP next to you, over the PSP's own WiFi. ROMs are never sent.</sub>
 </td>
 <td width="33%" valign="top">
-<img src="gpsp/docs/img/link-gb-trade.gif" alt="A Pokémon Crystal trade: the Poké Ball travels down the cable on both screens" width="100%">
-<b>Game Boy trades</b><br>
-<sub>Red, Blue, Yellow, Gold, Silver, Crystal: trade and battle like two Game Boys. Only one of you needs the cartridge.</sub>
+<img src="gpsp/docs/img/link-sfa3.gif" alt="Street Fighter Alpha 3 versus mode on two PSPs, both screens showing the same fight" width="100%">
+<b>Faster link play</b><br>
+<sub>Link-cable games between two PSPs cost much less than before. Street Fighter Alpha 3 and Sonic Battle run at full speed.</sub>
 </td>
 </tr>
 <tr>
 <td valign="top">
-<img src="gpsp/docs/img/menu-states.gif" alt="The in-game menu opening over the paused game, then the Save States page: five slots with pictures and times, one deleted" width="100%">
-<b>A menu over your game</b><br>
-<sub>The game pauses behind it. Five save states with a picture and a time each; delete the ones you don't need.</sub>
+<img src="gpsp/docs/img/cheats.gif" alt="The in-game menu opens over Pokémon FireRed, then the cheat list: 27 cheats scroll past, two are switched on, and the menu row reads Cheats 2 on" width="100%">
+<b>Cheats</b><br>
+<sub>One text file per game, switched on and off from the menu. CodeBreaker for GBA, GameShark for Game Boy.</sub>
 </td>
 <td valign="top">
-<img src="gpsp/docs/img/controls.gif" alt="Settings over the game's art, then the Controls page: game buttons and shortcuts" width="100%">
-<b>Every button, your way</b><br>
-<sub>Remap the game buttons and every shortcut, or leave one blank to turn it off. HOME can open the menu.</sub>
+<img src="gpsp/docs/img/turbo.png" alt="The Turbo buttons page: four rows, each with a button, a rate and a mode" width="100%">
+<b>Turbo buttons</b><br>
+<sub>Four of them, each with its own button, speed and hold-or-toggle mode.</sub>
 </td>
 <td valign="top">
-<img src="gpsp/docs/img/quit-to-list.gif" alt="Quit to game list: the game fades into the library and the next game is one press away" width="100%">
-<b>Straight back to your library</b><br>
-<sub>Quit to game list is back in the browser in about a second, no relaunch, with your save written first.</sub>
+<img src="gpsp/docs/img/link-gb-trade.gif" alt="A Pokémon Crystal trade: the Poké Ball travels down the cable on both screens" width="100%">
+<b>Game Boy trades</b><br>
+<sub>Red, Blue, Yellow, Gold, Silver, Crystal: trade and battle like two Game Boys. Only one of you needs the cartridge.</sub>
 </td>
 </tr>
 </table>
@@ -91,150 +91,155 @@ game up tomorrow exactly where it was.
 
 ## What's new in this release
 
-Everything below is new since 3.0.0, including what the 3.1.0 beta previewed. Each item
-carries a <kbd>NEW</kbd> mark so you can tell it from the features that were already
-there.
+Everything below is new since 3.5.0. Each item carries a <kbd>NEW</kbd> mark so you can
+tell it from the features that were already there.
 
-### <kbd>NEW</kbd> GBA link cable between two PSPs
-
-<p align="center">
-  <img src="gpsp/docs/img/link-race.gif" alt="A linked Mario Kart: Super Circuit race on two PSPs, both players' screens side by side, the lap timers identical" width="720">
-</p>
-
-The GBA's link-cable games, between two PSPs, with no cable: race in **Mario Kart: Super
-Circuit**, fight in **Advance Wars 2**, and more. It works the way the Game Boy link from
-the 3.1.0 beta does: **each PSP runs both games**, and only the buttons cross the air
-([how that works](#link-cable-how-it-works)).
-
-- **Host, join, play.** Open the game on both PSPs. On one, *Wireless → Host*: the room
-  opens and **you keep playing while you wait**. On the other, *Wireless → Join: scan for
-  rooms* and pick it. The LINKING screen walks through *Checking the game*, *Sharing
-  where you are* and *Starting together*, and **both games carry on from where they
-  are**: nobody has to start over.
-- **You see each other play.** Your friend's moves play out on your screen exactly as two
-  GBAs on a cable would show them, battle animations and all.
-- **Safe by design.** Every four seconds the two PSPs compare a fingerprint of both
-  games. If they ever disagree, the link ends and **nothing is saved**. An agreed end
-  says *Link ended. Game saved.* If the other PSP leaves, *your game carries on*.
-- **What you need:** the **same ROM** on both PSPs (same version, same hack) and the same
-  GBAdhoc release. Two players.
-- **Tested on two real consoles**, a PSP-3000 hosting and a PSP-1000 joining: Advance
-  Wars 2 at 58.5–59.8 fps and a Mario Kart: Super Circuit two-player race at 58.4–59.0 fps. Also
-  run in pairs of emulated consoles, with jitter and packet loss: Sonic Advance, Mario
-  Tennis: Power Tour, and Pokémon Emerald's Cable Club trades and battles.
-
-### <kbd>NEW</kbd> Game Boy and Game Boy Color link cable
+### <kbd>NEW</kbd> Rewind
 
 <p align="center">
-  <img src="gpsp/docs/img/link-gb-trade.gif" alt="A Pokémon Crystal trade on two PSPs: the Poké Ball travels down the cable on both screens" width="560">
+  <picture>
+    <source srcset="gpsp/docs/img/rewind.webp" type="image/webp">
+    <img src="gpsp/docs/img/rewind-poster.jpg" alt="Three games each run backwards for a moment under a REWIND badge: a Mario Kart crash undone, a Street Fighter hit taken back, a Castlevania fall reversed" width="720">
+  </picture>
+  <br>
+  <sub>Real gameplay from the 4.0.0 trailer. On the PSP, a ring and a timer take the place of the trailer's REWIND badge.</sub>
 </p>
 
-Trade and battle between two PSPs, just like two Game Boys and a cable. Tested with
-Pokémon Red, Blue, Yellow, Gold, Silver and Crystal trades and battles.
+Hold a button and the game runs backwards, sound and all. Let go and you carry on from
+that moment.
 
-- **Only one PSP needs the game.** If your friend doesn't have the cartridge, it is sent
-  over for the session, kept in memory only, and never written to their Memory Stick.
-- **Safe by design.** The two PSPs keep comparing a fingerprint of both games. If they
-  ever disagree, the session stops and **nothing is saved**, so no Pokémon goes missing.
-  At the end each PSP saves only its own game.
-- A slow moment on the radio causes a brief pause, never a desync.
+- **Hold △ to rewind, let go to play.** A ring on screen turns as you go back: the dot
+  leaves the bottom and travels counter-clockwise, and when it is back where it started
+  you have reached the oldest moment you can return to. Beside it, how far back you are
+  and how much is left (`-0:06  0:04 left`).
+- **Your saves are permanent.** Rewinding past an in-game save never undoes it. The save
+  on your Memory Stick is the one the game last wrote, whatever you rewind over, and the
+  rewind will not set you down in the middle of a save.
+- **It survives the POWER switch.** Sleep in the middle of a rewind and the PSP wakes to
+  the picture you were looking at.
+- **It works with fast-forward,** so you can skim forward and step back.
+- **Turn it on in *Settings → Rewind*.** It is off by default and takes effect from the
+  next game you start. *Rewind length* chooses how much history is kept: **Short**
+  (1 MB), **Medium** (2 MB, the default) or **Long** (4 MB). How many seconds that is
+  depends on the game: about 40 seconds of Pokémon Emerald at Medium, a few seconds of
+  a busy 3D racer. Long is meant for the PSP-2000, 3000 and Go, which have the memory to
+  spare.
+- GBA games only for now. Rewind is off during link play. △ no longer cycles the video
+  preset by default; bind that wherever you like in *Controls*.
 
-### <kbd>NEW</kbd> A new in-game menu
+### <kbd>NEW</kbd> Cheats
 
-<picture>
-  <img src="gpsp/docs/img/menu-states.gif" alt="The in-game menu opening over the paused game, then the Save States page" width="480" align="right">
-</picture>
+<img src="gpsp/docs/img/cheats.gif" alt="The cheat list for Pokémon FireRed scrolling: usable codes with on/off chips, GameShark and Action Replay codes greyed out, two codes switched on" width="480" align="right">
 
-- <kbd>NEW</kbd> **It opens over your paused game,** which stays behind it, dimmed:
-  **Resume · Save states · Wireless · Settings · Quit to game list · Exit.** Hold
-  START+SELECT for about ¼ s, as before, or make it HOME (below).
-- <kbd>NEW</kbd> **Save states you can see.** Five slots, each with a picture of the
-  moment and the time you saved it. ✕ loads, □ saves (asking before it overwrites),
-  △ deletes (asking first). On the browser's save-state shelf (LEFT on a game), □
-  deletes.
-- <kbd>NEW</kbd> **Quit to game list takes about a second.** The game is unloaded inside
-  the running app and fades into the browser, no relaunch (a fresh boot takes about
-  three); your battery save is written first. After a wireless session it relaunches
-  as before.
-- <kbd>NEW</kbd> **Settings over the game's art.** Opened from the browser with START,
-  Settings sits over the selected game's hero art.
-- <kbd>NEW</kbd> **A loading screen with the game's art** behind it, and each step of the
-  load named as it happens.
+Per-game cheat lists you switch on and off from the menu.
+
+- **One text file per game** in `GBAdhoc/cheats/`, named like the ROM with `.cht`:
+  a name on one line, its codes underneath. RetroArch `.cht` files are read as they are.
+  `cheats/README.txt` in the download is a worked example.
+- **Switch codes on and off** from *Cheats* in the in-game menu, or with RIGHT on a game
+  in the list. Every cheat starts off, and your choices are remembered per game.
+- **Game Boy Advance:** CodeBreaker codes and plain `ADDRESS:VALUE` writes.
+  **Game Boy / Game Boy Color:** GameShark codes.
+- **Kept small on purpose.** A cheat can only write to the game's working memory, so a
+  bad code cannot damage a ROM or a save file. That is also why GameShark and Action
+  Replay codes for GBA, which are encrypted and often patch the cartridge, are listed
+  but cannot be switched on yet. **A larger cheat engine is planned for a following
+  update.**
+- Cheats are paused during link play and come back afterwards.
 
 <br clear="right">
 
-### <kbd>NEW</kbd> Remap every button
+### <kbd>NEW</kbd> Share game data between two PSPs
 
-<img src="gpsp/docs/img/controls.gif" alt="The Controls page: game buttons on the left, shortcuts on the right" width="480" align="right">
+<p align="center">
+  <img src="gpsp/docs/img/share.gif" alt="Two PSPs side by side: the red one sends a save state, the blue one receives it and opens Pokémon Emerald at the same spot" width="720">
+</p>
 
-**Settings → Controls → Button mapping.** Remap every game button and the d-pad, and
-every shortcut: fast-forward, video preset, quick save and load, screenshot, pause
-screen, Mystery Gift and the menu. Leave a binding blank to disable it. The old ✕/○ swap
-lives here now, and your choice carries over.
+Send a save file or a save state to a friend's PSP, or pull theirs onto yours.
 
-- <kbd>NEW</kbd> **Menu button: START+SELECT or HOME.** In HOME mode, HOME opens the
-  in-game menu and START and SELECT go to the game. HOME still shows the system's
-  *Quit game?* dialog everywhere outside a game, and holding START+SELECT always closes
-  the emulator. START+SELECT stays the default: on the PSP, HOME belongs to the system,
-  and taking it over needs kernel-level access, so if you hit any trouble with HOME
-  mode, switch back.
+- ***Settings → Share game data*** on one PSP opens a room; the other joins it from the
+  room list. You see the games you both have, and for each one the other PSP's save
+  states, with their pictures and times, and its save file.
+- **Careful with your saves.** Every transfer is checked end to end. Replacing a save
+  file asks first and keeps your old one beside it as `.sav.bak`. A file that is not
+  what it claims to be is refused before anything is written.
+- Save states need the same GBAdhoc version on both PSPs; save files do not.
+- **Saves and states only.** ROMs are never sent.
+
+### <kbd>NEW</kbd> Turbo buttons
+
+<img src="gpsp/docs/img/turbo.png" alt="The Turbo buttons page: Turbo A on Triangle at 30 a second in Toggle mode, Turbo B on Square" width="480" align="right">
+
+***Settings → Controls → Turbo buttons.*** Four turbo actions, two for A and two for B.
+Each has its own button, its own speed (10, 15 or 30 presses a second) and its own mode:
+**Hold** fires while you hold it, **Toggle** starts on one press and stops on the next.
+Nothing is bound until you bind it, and your normal A and B are untouched. Turbo is off
+during link play.
 
 <br clear="right">
 
-### <kbd>NEW</kbd> Sharper pictures, per console
+### <kbd>NEW</kbd> Faster link play
 
 <p align="center">
-  <img src="gpsp/docs/img/display-modes.png" alt="Pokémon Crystal four ways: original size, integer 2x, fit with sharp bilinear, and Ambient bars filled with the game's own art" width="720">
+  <img src="gpsp/docs/img/link-sfa3.gif" alt="Street Fighter Alpha 3 versus mode on a red PSP and a blue PSP, both screens showing the same fight" width="720">
 </p>
 
-- <kbd>NEW</kbd> **Each console remembers its own picture.** GBA, GB and GBC each keep
-  their own scale, filter, Ambient bars and palette.
-- <kbd>NEW</kbd> **Integer 2x** scaling.
-- <kbd>NEW</kbd> **Sharp bilinear**: crisp pixels without shimmer at non-integer sizes.
-- <kbd>NEW</kbd> **Ambient bars**: the bars beside the picture show the game's own art,
-  softly blurred.
-- <kbd>NEW</kbd> **More accurate Game Boy Color colours,** modelled on the real GBC
-  screen. Crystal no longer looks too dark. `gbc_color_correction = 0` in `config.ini`
-  brings the old colours back.
+- <kbd>NEW</kbd> **GBA Link Cable sessions are faster.** Each PSP runs two Game Boy
+  Advances during a link, and the second one now costs much less. On a PSP-3000 +
+  PSP-1000 pair: Advance Wars 2 at 58.6–59.0 fps, a Mario Kart: Super Circuit race at
+  58.4, and Super Street Fighter II Turbo Revival, the heaviest game we test, up from
+  about 39 fps to 47.
+- <kbd>NEW</kbd> ***Wireless → Fast link.*** Off by default, and the host decides for
+  both PSPs. It halves the number of radio packets, which helps games that still run
+  below full speed (Street Fighter II Turbo Revival reaches about 50). If a link feels
+  worse with it on, turn it off.
+- <kbd>NEW</kbd> **More games played between two real consoles:** Street Fighter
+  Alpha 3 and Sonic Battle at full speed, and Kirby multiplayer a little under it.
+- <kbd>NEW</kbd> **A finished trade is written to the Memory Stick straight away,**
+  instead of at the next periodic save.
+- A 4.0.0 PSP can still link with a 3.5.0 PSP, but update both: the new speed and Fast
+  link need both sides.
 
-### <kbd>NEW</kbd> Fast-forward, reworked
+### <kbd>NEW</kbd> Fixes
 
-*Unlimited* runs the game flat out and draws at most 30 frames a second; *Unlimited
-Smooth* runs flat out and draws up to 60. Time the PSP used to spend drawing frames it
-could never show now goes to the game. *3x* is unchanged, and the chip in the corner
-names the preset (`>> 3x`, `>> Unlimited`, `>> Unlimited Smooth`).
-
-### <kbd>NEW</kbd> Faster, and steadier
-
-- <kbd>NEW</kbd> **Dynarec optimisations** make GBA games faster across the board, and
-  the emulator's hottest code now sits at a fixed place in the CPU's instruction cache,
-  so unrelated changes can no longer make a build randomly slower. Every change was
-  checked frame for frame against the previous version on a library of 35 games.
-- <kbd>NEW</kbd> **Rare crashes on the PSP-2000, 3000 and Go** are gone, including games
-  derailing after loading a state. The cause was the PSP firmware itself: asking the
-  system to clear 16 KB or more of the instruction cache silently does nothing, so stale
-  code could run. GBAdhoc works around it everywhere.
-- <kbd>NEW</kbd> **Audio no longer drifts.** After a few minutes, sound could lag the
-  picture by up to ¾ of a second until you opened the menu; it now stays in sync.
-- <kbd>NEW</kbd> **Media Engine renderer:** sprite ghosting is gone, and effects that
-  change mid-frame (the Sonic Advance 2 title screen) draw correctly.
-- <kbd>NEW</kbd> **Joining joins the room you scanned,** and can no longer create a
-  second room of the same name by accident (Wireless Adapter sessions too).
-- <kbd>NEW</kbd> **Launching a state from the shelf** no longer quits to the XMB when the
-  state can't load, and a GB state saved under a different palette now loads.
-- <kbd>NEW</kbd> **Waking from sleep** no longer flashes an old game frame before the
-  wake prompt, and Game Boy games no longer wake to a blank screen.
-- <kbd>NEW</kbd> **`config.ini` is written once and atomically,** with a backup, so a
-  power cut mid-save can't leave it half-written.
+- <kbd>NEW</kbd> **Music is right again** in games that play samples faster than the
+  PSP's output rate: Golden Sun: The Lost Age, Castlevania: Harmony of Dissonance and
+  Iridion II had been wrong since 3.0.0.
+- <kbd>NEW</kbd> **A save always reaches the Memory Stick while you play.** When a game
+  ran below full speed, its save could sit in memory until you quit. It is now written
+  within a few seconds.
+- <kbd>NEW</kbd> **Saving after a sleep cannot leave an empty file.** The first save
+  after waking rewrote the whole file and emptied it first; it now overwrites in place.
+- <kbd>NEW</kbd> **A save is no longer dropped on exit** after a failed write.
+- <kbd>NEW</kbd> **Driver 2 Advance** runs at full speed instead of stuttering, with no
+  extra memory.
+- <kbd>NEW</kbd> **Need for Speed Underground 2** no longer flickers.
+- <kbd>NEW</kbd> **PSP-1000:** the second-processor renderer needs about 280 KB less
+  system memory, so it loads in more situations.
+- <kbd>NEW</kbd> **Sleeping again on the wake screen** no longer drops you to the XMB on
+  the next wake.
+- <kbd>NEW</kbd> **Game clocks** (Pokémon's time of day, Game Boy cartridge clocks) keep
+  better time across sleeps and time-zone changes.
 
 ### <kbd>NEW</kbd> Smaller things
 
-- Game Boy: the faint blur on the screen edge with smooth filtering is gone.
-- The fast-forward label shows `>>` again instead of `?`.
-- Menu text sits centred in the highlight bar.
+- <kbd>NEW</kbd> **The thumbstick** can act as a second d-pad, or each direction can be
+  bound like a button. *Settings → Thumbstick*; off by default.
+- <kbd>NEW</kbd> **The battery level** is in the menu header.
+- The Shelf's placeholder card for a game with no box art is shorter.
 
 <details>
-<summary><b>Release history</b>: 3.0.0 and earlier</summary>
+<summary><b>Release history</b>: 3.5.0 and earlier</summary>
+
+### 3.5.0
+
+GBA link cable between two PSPs (each PSP runs both games; only the buttons cross the
+air), the Game Boy and Game Boy Color link cable with cartridge sharing for the session,
+the in-game menu over the paused game, save states with pictures and times, Quit to game
+list in about a second, every button and shortcut remappable with HOME as an optional
+menu button, per-console picture settings with integer 2x, sharp bilinear and Ambient
+bars, reworked fast-forward presets, dynarec optimisations with a pinned instruction-cache
+layout, and the fix for rare crashes on the PSP-2000, 3000 and Go.
 
 ### 3.0.0
 
@@ -272,7 +277,7 @@ Internet, no cable.
 
 | Mode | For | What crosses the air |
 |---|---|---|
-| **Link Cable** <kbd>NEW</kbd> | GBA link-cable games, and every GB/GBC link game | only the buttons each player presses |
+| **Link Cable** | GBA link-cable games, and every GB/GBC link game | only the buttons each player presses |
 | **Wireless Adapter** | Pokémon Emerald, FireRed and LeafGreen through the AGB-015 adapter | the adapter's radio traffic |
 
 **The game picks the mode.** *Settings → Link mode* shows what the game will use:
@@ -432,43 +437,49 @@ console skin, favourites, the state shelf) are unchanged and still apply.
   make CFRU hacks (Pokémon Unbound, Heart & Soul) run at full speed.
 - Game Boy and Game Boy Color on TGB Dual, full speed with sound, with Super Game Boy
   palettes, a GB palette setting and a cartridge real-time clock.
-  <kbd>NEW</kbd> GBC colour correction modelled on the real screen.
+  GBC colour correction modelled on the real screen.
 - No BIOS needed: an open-source replacement is bundled. Drop a real `gba_bios.bin` in
   the app folder if you prefer.
 
 **Playing together**
-- <kbd>NEW</kbd> GBA link cable between two PSPs (Link Cable mode).
-- <kbd>NEW</kbd> GB/GBC link cable between two PSPs; only one needs the cartridge.
+- GBA link cable between two PSPs (Link Cable mode).
+- GB/GBC link cable between two PSPs; only one needs the cartridge.
 - AGB-015 Wireless Adapter emulation over PSP ad-hoc: Union Room, Trade Center, link
   battles, Mystery Gift.
 - Mystery Gift from an Android phone (Mystery Gift Station).
+- <kbd>NEW</kbd> Fast link, an option for games that run below full speed when linked.
+- <kbd>NEW</kbd> Share game data: send save files and save states between two PSPs.
 - Save auto-backup before every session; save states locked while linked.
 
 **Performance**
 - The renderer runs on the PSP's Media Engine, so both processors work on every frame.
-- Three fast-forward presets: **3x**, **Unlimited** (<kbd>NEW</kbd> flat out, at most
-  30 frames drawn a second) and **Unlimited Smooth** (<kbd>NEW</kbd> flat out, up to 60
+- Three fast-forward presets: **3x**, **Unlimited** (flat out, at most
+  30 frames drawn a second) and **Unlimited Smooth** (flat out, up to 60
   drawn). Hold or toggle.
-- <kbd>NEW</kbd> Dynarec optimisations and a pinned instruction-cache layout.
+- Dynarec optimisations and a pinned instruction-cache layout.
 
 **The browser**
 - Two shells, **Marquee** and **Shelf**, each in **dark** or **light**.
 - One list per console, △ to switch with the flare, per-console skins.
 - Favourites with □ and SELECT, stored in `roms/favourites.txt`.
 - Box art and hero art matched by filename.
-- <kbd>NEW</kbd> Settings over the selected game's art; a loading screen with the art.
+- Settings over the selected game's art; a loading screen with the art.
 
 **Playing**
-- <kbd>NEW</kbd> The in-game menu over the paused game.
-- <kbd>NEW</kbd> Remap every button and shortcut; HOME as the menu button if you want it.
-- <kbd>NEW</kbd> Per-console picture: scale (1x, fit, stretch, integer 2x), filter
+- <kbd>NEW</kbd> Rewind for GBA games: hold a button to run the game backwards.
+- <kbd>NEW</kbd> Per-game cheats: CodeBreaker and raw codes for GBA, GameShark for GB/GBC.
+- <kbd>NEW</kbd> Turbo buttons: four, each with its own button, speed and hold/toggle mode.
+- <kbd>NEW</kbd> The thumbstick as a second d-pad, or bound per direction.
+- The in-game menu over the paused game.
+- Remap every button and shortcut; HOME as the menu button if you want it.
+- Per-console picture: scale (1x, fit, stretch, integer 2x), filter
   (nearest, bilinear, sharp bilinear), Ambient bars, GB palette.
 
 **Saving**
-- Five save-state slots per game with pictures and <kbd>NEW</kbd> times, the state shelf
-  in the browser (LEFT), <kbd>NEW</kbd> delete (△ in game, □ on the shelf).
+- Five save-state slots per game with pictures and times, the state shelf
+  in the browser (LEFT), delete (△ in game, □ on the shelf).
 - Select + L / Select + R for a quick save and load of slot 1.
-- Battery saves flushed on exit, on HOME, <kbd>NEW</kbd> on Quit to game list, and
+- Battery saves flushed on exit, on HOME, on Quit to game list, and
   periodically as you play, with a `.sav.bak` kept. Sleeping never touches the save.
 
 **The console**
@@ -489,7 +500,8 @@ console skin, favourites, the state shelf) are unchanged and still apply.
 | L / R | GBA L / R |
 | Start / Select | Start / Select |
 | **□** | Fast-forward (hold by default; preset and hold/toggle in Settings) |
-| **△** | Cycle video preset |
+| **△** | <kbd>NEW</kbd> Rewind, while held (when *Rewind* is on; GBA) |
+| *(unbound)* | Cycle video preset |
 | **Select + L** | Quick save, slot 1 |
 | **Select + R** | Quick load, slot 1 |
 | **Select + △** | Pause screen |
@@ -512,18 +524,24 @@ confirm and ○ to go back.
 | Section | Setting | |
 |---|---|---|
 | Wireless | Room | Room 0–99 (Room 7 by default) |
-| | <kbd>NEW</kbd> Link mode | Auto, Link Cable or Wireless Adapter, per game |
+| | Link mode | Auto, Link Cable or Wireless Adapter, per game |
 | | Session overlay | show or hide the session chip during play |
-| Display <kbd>NEW</kbd> per console | Video scale | 1x, fit, stretch, <kbd>NEW</kbd> 2x (integer) |
-| | Video filter | nearest, bilinear, <kbd>NEW</kbd> sharp bilinear |
-| | <kbd>NEW</kbd> Ambient bars | off, art, art else game |
+| | <kbd>NEW</kbd> Fast link | on or off; the host decides for both PSPs |
+| | <kbd>NEW</kbd> Share game data | from the game list: share, or scan for a room |
+| Display per console | Video scale | 1x, fit, stretch, 2x (integer) |
+| | Video filter | nearest, bilinear, sharp bilinear |
+| | Ambient bars | off, art, art else game |
 | | GB palette | Auto, Grey, DMG green, Pocket |
 | Interface | Theme | dark or light |
 | | Menu style | Marquee or Shelf |
 | Gameplay | Fast-forward | 3x, Unlimited, Unlimited Smooth |
 | | FF button (Square) | hold or toggle |
 | | FPS counter | on or off |
-| Controls | <kbd>NEW</kbd> Button mapping | every button and shortcut; the menu button |
+| | <kbd>NEW</kbd> Rewind | on or off, from the next game |
+| | <kbd>NEW</kbd> Rewind length | Short, Medium or Long |
+| Controls | <kbd>NEW</kbd> Thumbstick | off, moves (a second d-pad) or custom |
+| | Button mapping | every button and shortcut; the menu button |
+| | <kbd>NEW</kbd> Turbo buttons | four turbo actions: button, rate, hold or toggle |
 
 The *Display* section is labelled with the console it applies to (*DISPLAY (GBA)*, *(GB)*
 or *(GBC)*): from the browser it edits the highlighted game's console, in game the
@@ -540,10 +558,12 @@ the Game Boy link's input delay.
 - **Battery saves**: `roms/<game>.sav` for GBA, `roms/<game>.gb.sav` and
   `roms/<game>.gbc.sav` for Game Boy. A `.sav.bak` is kept.
 - **Save states**: `roms/<game>.st0` … `.st4`, and `.gb.st0` / `.gbc.st0` … likewise,
-  each with a `.thumb` beside it and, <kbd>NEW</kbd>, a `.shot` (the full-size picture on
+  each with a `.thumb` beside it and, a `.shot` (the full-size picture on
   the Save States page).
-- **Favourites**: `roms/favourites.txt`. <kbd>NEW</kbd> **Link mode overrides**:
+- **Favourites**: `roms/favourites.txt`. **Link mode overrides**:
   `roms/linkmode.txt`.
+- <kbd>NEW</kbd> **Cheats**: `cheats/<game>.cht`, which you write, and `cheats/<game>.on`, where the
+  menu remembers what is switched on.
 - **Screenshots**: `log/`.
 - **Settings**: `config.ini` in the app folder.
 
@@ -558,7 +578,7 @@ the Game Boy link's input delay.
 2. Put your `.gba`, `.gb` and `.gbc` files in `GBAdhoc/roms/`, loose or in subfolders
    (two levels).
 3. Optional: box art in `GBAdhoc/boxart/`, hero art in `GBAdhoc/hero/` (see
-   [Artwork](#artwork)).
+   [Artwork](#artwork)), cheat files in `GBAdhoc/cheats/`.
 4. Launch it from the XMB. No BIOS needed.
 
 **Requirements:** a PSP running custom firmware (developed and tested on **ARK-4**);
@@ -611,10 +631,13 @@ repository because hero art derives from copyrighted box art.
 | **Pokémon Emerald / FireRed / LeafGreen** | Full speed. Wireless Adapter trades and battles on real consoles; Emerald's Cable Club by Link Cable in emulated pairs. |
 | **Pokémon Unbound** and other CFRU hacks | Full speed (59.9). Run it on the game's **medium music preset** for the best results. |
 | **Pokémon Heart & Soul** | Full speed (59.8) including its heaviest battles. Set its sound to **mono** for the best performance. |
-| <kbd>NEW</kbd> **Advance Wars 2** | Linked battles between two PSPs, 58.5–59.8 fps on a PSP-3000 + PSP-1000 pair. |
-| <kbd>NEW</kbd> **Mario Kart: Super Circuit** | Linked two-player races, 58.4–59.0 fps on the same pair. |
-| <kbd>NEW</kbd> **Sonic Advance, Mario Tennis: Power Tour** | Linked play passes in emulated pairs; not yet on two real consoles. |
-| <kbd>NEW</kbd> **Pokémon Red, Blue, Yellow, Gold, Silver, Crystal** | Trades and battles between two PSPs. |
+| **Advance Wars 2** | Linked battles between two PSPs, 58.6–59.0 fps on a PSP-3000 + PSP-1000 pair. |
+| **Mario Kart: Super Circuit** | Linked two-player races, 58.4 fps on the same pair. |
+| <kbd>NEW</kbd> **Street Fighter Alpha 3, Sonic Battle** | Linked play at full speed between two real consoles. |
+| <kbd>NEW</kbd> **Super Street Fighter II Turbo Revival** | Links and stays in sync at about 47 fps; about 50 with *Fast link*. |
+| <kbd>NEW</kbd> **Driver 2 Advance** | Full speed (it stuttered before this release). |
+| **Sonic Advance, Mario Tennis: Power Tour** | Linked play passes in emulated pairs; not yet on two real consoles. |
+| **Pokémon Red, Blue, Yellow, Gold, Silver, Crystal** | Trades and battles between two PSPs. |
 | **Mario Golf: Advance Tour** | Its cable link doesn't form, so GBAdhoc offers it the Wireless Adapter instead (not yet tested with it). |
 | Most commercial GBA titles | Full speed. |
 | Heavy 3D / Mode 7 GBA titles | Varies; fast-forward and frameskip are there if you need them. |
@@ -627,7 +650,7 @@ repository because hero art derives from copyrighted box art.
 **Works, tested on hardware, on all three PSP models:** Wireless Adapter link battles and
 trades, sleep/wake with the Media Engine live, GB/GBC at full speed, and Quit to game
 list (520 returns on a PSP-1000 and a PSP-3000, about a second each, against three for a
-fresh boot). <kbd>NEW</kbd> **On a PSP-3000 + PSP-1000 pair:** GBA Link Cable (Advance
+fresh boot). **On a PSP-3000 + PSP-1000 pair:** GBA Link Cable (Advance
 Wars 2, Mario Kart: Super Circuit) and the Game Boy link (24 of 24 trade, battle and
 cartridge-transfer runs).
 
@@ -639,6 +662,12 @@ cartridge-transfer runs).
 - **Not yet run between two real consoles:** the GBA Link Cable's menus as a player uses
   them (the hardware runs drove the link directly), the version check, and a third PSP
   finding a room full. They are covered on emulated pairs.
+- <kbd>NEW</kbd> **Rewind is GBA only,** and it is off during link play. With *Rewind* on, a
+  GBA game gives up a little memory to the history: on a PSP-1000 that comes out of the
+  part of a large cartridge kept in memory, about 0.7 MB at Medium and 2.7 MB at Long,
+  and it stays reserved during a link session. Use Short or Medium on a PSP-1000.
+- <kbd>NEW</kbd> **Cheats:** GameShark and Action Replay codes for GBA, and any code that patches
+  the cartridge, cannot be switched on yet.
 - **On a PSP-1000**, link support keeps about 2 MB less of the cartridge in memory in
   single player (the second GBA's code stays loaded; its working memory is lent back to
   your game until a session starts). A very large cartridge may page from the Memory
@@ -702,19 +731,19 @@ set are in [`gpsp/docs/RELEASE.md`](gpsp/docs/RELEASE.md).
 ## Documentation
 
 - [`docs/ARCHITECTURE.md`](gpsp/docs/ARCHITECTURE.md), how the pieces fit together
-- <kbd>NEW</kbd> [`docs/GBA-LINK-MIRROR.md`](gpsp/docs/GBA-LINK-MIRROR.md), the GBA Link
+- [`docs/GBA-LINK-MIRROR.md`](gpsp/docs/GBA-LINK-MIRROR.md), the GBA Link
   Cable: both games on each PSP, lockstep, and the hardware results
-- <kbd>NEW</kbd> [`docs/GBA-LINK-UI.md`](gpsp/docs/GBA-LINK-UI.md), the link menus, rooms
+- [`docs/GBA-LINK-UI.md`](gpsp/docs/GBA-LINK-UI.md), the link menus, rooms
   and messages
-- <kbd>NEW</kbd> [`docs/GB-LINK.md`](gpsp/docs/GB-LINK.md), the Game Boy link and its
+- [`docs/GB-LINK.md`](gpsp/docs/GB-LINK.md), the Game Boy link and its
   hardware runs
-- <kbd>NEW</kbd> [`docs/UI-OVERLAY.md`](gpsp/docs/UI-OVERLAY.md), the in-game menu and the
+- [`docs/UI-OVERLAY.md`](gpsp/docs/UI-OVERLAY.md), the in-game menu and the
   Save States page
-- <kbd>NEW</kbd> [`docs/CONTROL-REMAP.md`](gpsp/docs/CONTROL-REMAP.md), button mapping
+- [`docs/CONTROL-REMAP.md`](gpsp/docs/CONTROL-REMAP.md), button mapping
   and HOME as the menu
-- <kbd>NEW</kbd> [`docs/DISPLAY-FEATURES.md`](gpsp/docs/DISPLAY-FEATURES.md) and
+- [`docs/DISPLAY-FEATURES.md`](gpsp/docs/DISPLAY-FEATURES.md) and
   [`docs/SHARP-BILINEAR.md`](gpsp/docs/SHARP-BILINEAR.md), the picture settings
-- <kbd>NEW</kbd> [`docs/INPROC-RETURN.md`](gpsp/docs/INPROC-RETURN.md), Quit to game
+- [`docs/INPROC-RETURN.md`](gpsp/docs/INPROC-RETURN.md), Quit to game
   list without a relaunch
 - [`docs/ADHOC-NOTES.md`](gpsp/docs/ADHOC-NOTES.md), the RFU protocol as we found it
 - [`docs/DECISIONS.md`](gpsp/docs/DECISIONS.md), every design decision and why, including
@@ -773,6 +802,8 @@ a PSP shell and a radio transport around it.**
   [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/); modified: re-lit, screen
   replaced with GBAdhoc footage. The renders, the trailer included, are ours; the game
   content on the screens is the games'.
+
+- **Voxel Revolution** by Kevin MacLeod ([incompetech.com](https://incompetech.com/music/royalty-free/index.html?isrc=USUAN2000025)), licensed [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/); excerpted and crossfaded for the trailer.
 
 Licensed **GPL-2.0**, same as gpSP (see `COPYING`). Upstream copyright headers are intact.
 Changes to the core itself are kept minimal and are intended to be offered upstream.

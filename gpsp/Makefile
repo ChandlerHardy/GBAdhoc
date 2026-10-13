@@ -256,7 +256,7 @@ else ifeq ($(platform), psp1)
 	# model: the SMALL tier (2MB ROM / 384KB RAM code, static) fits the
 	# PSP-1000 budget and is what a 1000 always gets; a console whose heap
 	# can afford it (a 2000/3000/Go with the 64 MiB layout) allocates the
-	# LARGE tier (10MB / 512KB) instead, which is what CFRU-class ROM hacks
+	# LARGE tier (10MB / 384KB) instead, which is what CFRU-class ROM hacks
 	# (Unbound) need to stop flush-storming.
 	#
 	# BIG_JIT=1 compiled the large tier in for every model.  It is gone
@@ -401,6 +401,19 @@ else ifeq ($(platform), psp1)
 	ifeq ($(SMC_GATE_BITMAP),1)
 	CFLAGS += -DSMC_GATE_BITMAP=1
 	endif
+	# ENTRY_GATES=1: when the RAM translation cache is EXHAUSTED, every RAM
+	# block start becomes a gate, so a routine entered at many points (Driver
+	# 2's unrolled rasterisers: ~45 entries each, every entry a block holding
+	# the rest of the routine, ~380 KB of code for ~4 KB of guest) is
+	# translated once instead of once per entry.  Armed only by an exhaustion
+	# flush: a game that never fills the cache never gets one.  Needs
+	# SMC_GATES=1 and SMC_GATE_BITMAP=1 (cpu_threaded.c ENTRY_GATES).
+	ifeq ($(ENTRY_GATES),1)
+	ifneq ($(SMC_GATE_BITMAP),1)
+	$(error ENTRY_GATES=1 needs SMC_GATES=1 SMC_GATE_BITMAP=1)
+	endif
+	CFLAGS += -DENTRY_GATES=1
+	endif
 	ifneq ($(GATE_RATIO),)
 	CFLAGS += -DSMC_GATE_RATIO=$(GATE_RATIO)
 	endif
@@ -495,6 +508,15 @@ else ifeq ($(platform), psp1)
 	ifeq ($(DMA_SMC_FLUSH),1)
 	CFLAGS += -DDMA_SMC_FLUSH=1
 	endif
+	# CHEATS (default 1; CHEATS=0 is the kill switch): GBAdhoc cheats
+	# (docs/CHEATS.md).  Codes run once per frame at the top of retro_run, work
+	# RAM only, with a RAM translation flush when a code changes translated
+	# bytes.  Off: cheats.c/main.c/libretro.c are upstream's.  The frontend
+	# takes the same switch (psp/Makefile); tools/build.sh passes it to both.
+	CHEATS ?= 1
+	ifeq ($(CHEATS),1)
+	CFLAGS += -DGPSP_CHEATS=1
+	endif
 	# DRPROF_HW=1: the hardware dynarec-profile bench (drprof.h, psp/ sampler).
 	# Adds a phase store around every C call from translated code.  Never in a
 	# release (gpsp_profile.h).  The frontend needs -DDRPROF_HW too.
@@ -526,6 +548,25 @@ else ifeq ($(platform), psp1)
 	# console has no link client role; exact by construction (main.c).
 	ifeq ($(SERIAL_IDLE_FAST),1)
 	CFLAGS += -DSERIAL_IDLE_FAST=1
+	endif
+	# SCHED_FAST=1: scheduler fast paths in update_gba, compiled in but OFF
+	# until the run-time switch `sched_fast` is set (harness key sched_fast;
+	# docs/GBA-LINK-MIRROR.md 24).  Pure speed, exact by construction.
+	ifeq ($(SCHED_FAST),1)
+	CFLAGS += -DSCHED_FAST=1
+	endif
+	# IRQ_IO_FAST=1: 16-bit stores to IE / IF / IME inline in the I/O store
+	# stub, compiled in but OFF until `irq_io_fast` is set before the game
+	# loads (harness key irq_io_fast; docs/GBA-LINK-MIRROR.md 25).  Exact.
+	ifeq ($(IRQ_IO_FAST),1)
+	CFLAGS += -DIRQ_IO_FAST=1
+	endif
+	# TIMER_LAZY=1: PROTOTYPE, changes guest-visible timing (overflows of
+	# timers with no interrupt and no cascade are not scheduler events).
+	# Compiled in but OFF until `timer_lazy` is set (harness key timer_lazy;
+	# docs/GBA-LINK-MIRROR.md 26).  Not a decision to ship.
+	ifeq ($(TIMER_LAZY),1)
+	CFLAGS += -DTIMER_LAZY=1
 	endif
 	# JIT_CODE_DISCIPLINE=1: OFF by default (docs/JIT-CODE-DISCIPLINE.md).
 	# Code memory in three zones, every code write recorded through one API,
@@ -969,6 +1010,25 @@ endif
 # A core flag: it adds update_gba hooks and one store to the I/O write stub.
 ifeq ($(GBA_LINK),1)
 DEFINES += -DGBA_LINK
+ifeq ($(GBALINK_LEAN_OUTLINE),1)
+DEFINES += -DGBALINK_LEAN_OUTLINE
+endif
+endif
+
+# REWIND=1: the rewind prototype's core half (docs/REWIND.md) -- the two
+# pieces of machine state a save state does not carry.  Off by default.
+ifeq ($(REWIND),1)
+CFLAGS += -DREWIND
+# REWIND_MUTANT=n: tests only (tools/rewind_test.py mutant).  A store path
+# that forgets to mark the rewind's written-page map: 1 = the dynarec's
+# byte-store stub, 2 = DMA.  Never in a build that is handed to anyone.
+ifneq ($(REWIND_MUTANT),)
+CFLAGS += -DREWIND_MUTANT=$(REWIND_MUTANT)
+endif
+# REWIND_COUNT=1: measurement only, counts the stores the page marks ride on.
+ifeq ($(REWIND_COUNT),1)
+CFLAGS += -DREWIND_COUNT
+endif
 endif
 
 include Makefile.common

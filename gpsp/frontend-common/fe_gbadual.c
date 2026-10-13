@@ -12,6 +12,7 @@
 #include "../gbalink.h"
 #include "../gbalink/gbalink_pair.h"
 #include "../gbalink/gbalink_script.h"
+#define GBAD_WEAK_EARLY __attribute__((weak))
 
 /* Instance B: the core relocatable with every global renamed gbab_*
  * (psp/Makefile, tools/gbamirror/Makefile). */
@@ -57,6 +58,12 @@ extern int32_t gbab_jit_pin_at __attribute__((weak));
 extern uint8_t *gbab_rom_translation_cache;
 extern uint32_t gbab_rom_cache_watermark;
 extern uint32_t gbalink_headless_audio, gbab_gbalink_headless_audio;
+extern uint32_t gbalink_fast, gbab_gbalink_fast;
+extern volatile uint32_t gbalink_abort, gbab_gbalink_abort;
+/* SCHED_FAST builds: the partner's scheduler switch follows the player's */
+extern uint32_t sched_fast GBAD_WEAK_EARLY, gbab_sched_fast GBAD_WEAK_EARLY;
+extern uint32_t irq_io_fast GBAD_WEAK_EARLY, gbab_irq_io_fast GBAD_WEAK_EARLY;
+extern uint32_t timer_lazy GBAD_WEAK_EARLY, gbab_timer_lazy GBAD_WEAK_EARLY;
 extern uint32_t backup_writes, gbab_backup_writes;
 /* cache_paranoid (harness): every sync whole D+I.  The frontend sets A's;
  * B must get the same, or an A/B arm tests only half the code. */
@@ -130,9 +137,28 @@ static void lg(const char *msg)
  * player's core must leave cable mode: while it is in it, every update_gba
  * postpones itself (gbalink_entry_yield) and the frontend's plain retro_run
  * would never complete a frame again. */
+static int g_fault;       /* the pair's error when it stopped (survives D) */
+
+int fe_gbadual_fault(void) { return g_fault; }
+
+void fe_gbadual_abort(void)
+{
+   gbalink_abort = 1;
+   gbab_gbalink_abort = 1;
+}
+
+/* Section 22: the pair's wall-clock bound. */
+static void pair_guard_cfg(gbalink_pair_config *pc)
+{
+   int ms = D.cfg.step_max_ms;
+   pc->now_us = D.cfg.time_us;
+   pc->step_us_max = ms < 0 ? 0 : (uint64_t)(ms ? ms : 15000) * 1000u;
+}
+
 static void gbadual_stop(const char *why)
 {
    char msg[200];
+   g_fault = D.pair.error ? D.pair.error : -1;
    snprintf(msg, sizeof(msg), "gbadual_stop why=%s frames=%u/%u err=%d "
             "switches=%u", why, (unsigned)D.pair.frames[0],
             (unsigned)D.pair.frames[1], D.pair.error,
@@ -286,8 +312,21 @@ int fe_gbadual_load(const fe_gbadual_config *cfg)
                                           : -1;
 #endif
    gbalink_headless_audio = gbab_gbalink_headless_audio =
-      cfg->partner_audio ? 0u : 1u;
+      cfg->partner_audio > 0 ? 0u : (cfg->partner_audio < 0 ? 2u : 1u);
    D.sram_crc = cfg->sram_crc;
+   if (&sched_fast && &gbab_sched_fast)
+      gbab_sched_fast = sched_fast;
+   /* a guest-visible switch: both machines of a pair must agree (and both
+    * consoles of a session: fe_gblink's core mask) */
+   if (&timer_lazy && &gbab_timer_lazy)
+      gbab_timer_lazy = timer_lazy;
+   /* read by B's emitter when it builds its stubs (gbab_retro_load_game) */
+   if (&irq_io_fast && &gbab_irq_io_fast)
+      gbab_irq_io_fast = irq_io_fast;
+   /* Section 21: the cable fast path, the same on both machines. */
+   gbalink_fast = gbab_gbalink_fast =
+      (cfg->cable_fast >= 0 && cfg->cable_fast <= 3) ? (uint32_t)cfg->cable_fast
+                                                     : 0u;
 
    gbab_retro_set_environment(b_env);
    gbab_retro_set_video_refresh(b_video);
@@ -409,12 +448,15 @@ int fe_gbadual_state_loaded(const void *state, size_t n)
    pc.on_frame = on_frame;
    if (D.use_ap)
       pc.input = b_input;
+   pair_guard_cfg(&pc);
+   g_fault = 0;
    gbalink_pair_init(&D.pair, &D.ops[0], &D.ops[1], &pc);
    D.fed1 = 0;
    D.frames_local = 0;
    D.active = 1;
-   snprintf(msg, sizeof(msg), "gbadual_start lookahead=%u margin=%u",
-            (unsigned)D.pair.cfg.lookahead, (unsigned)D.pair.cfg.child_margin);
+   snprintf(msg, sizeof(msg), "gbadual_start lookahead=%u margin=%u fast=%u/%u",
+            (unsigned)D.pair.cfg.lookahead, (unsigned)D.pair.cfg.child_margin,
+            (unsigned)gbalink_fast, (unsigned)gbab_gbalink_fast);
    lg(msg);
    return 0;
 }
@@ -565,6 +607,10 @@ static int sess_load(int slot, const uint8_t *st, size_t stn,
  * CONFIG); the player's hook is restored at the end. */
 extern time_t (*gpsp_wallclock)(void);
 extern time_t (*gbab_gpsp_wallclock)(void) GBAD_WEAK;
+/* The player's cartridge clock is the console's wall clock (rtc_clock.h); a
+ * session's is base + frames on BOTH consoles, as it always was.  Core B
+ * never has a wall clock published, so only A's switch is needed. */
+extern int gpsp_rtc_frames_only;
 static time_t sess_clock_seed;
 static time_t (*sess_saved_wallclock)(void);
 static int sess_clock_on;
@@ -594,6 +640,7 @@ static int m_start(void *user, int local_slot, unsigned batch,
    sess_clock_seed = (time_t)clock_seed;
    sess_clock_on = 1;
    gpsp_wallclock = sess_clock;
+   gpsp_rtc_frames_only = 1;
    if (&gbab_gpsp_wallclock)
       gbab_gpsp_wallclock = sess_clock;
    for (slot = 0; slot < 2; slot++)
@@ -607,6 +654,8 @@ static int m_start(void *user, int local_slot, unsigned batch,
    pc.headless[D.local_slot ^ 1] = 1;
    pc.on_frame = sess_on_frame;
    pc.input = sess_input;
+   pair_guard_cfg(&pc);
+   g_fault = 0;
    D.sess_hook = hook;
    D.sess_hook_user = hook_user;
    gbalink_pair_init(&D.pair, slot_ops(0), slot_ops(1), &pc);
@@ -614,10 +663,12 @@ static int m_start(void *user, int local_slot, unsigned batch,
    D.frames_local = 0;
    D.active = 1;
    snprintf(msg, sizeof(msg), "gbadual_session_start local_slot=%d "
-            "lookahead=%u margin=%u state=%u/%u save=%u/%u", D.local_slot,
+            "lookahead=%u margin=%u state=%u/%u save=%u/%u fast=%u/%u",
+            D.local_slot,
             (unsigned)D.pair.cfg.lookahead, (unsigned)D.pair.cfg.child_margin,
             (unsigned)state_n[0], (unsigned)state_n[1], (unsigned)save_n[0],
-            (unsigned)save_n[1]);
+            (unsigned)save_n[1], (unsigned)gbalink_fast,
+            (unsigned)gbab_gbalink_fast);
    lg(msg);
    return 0;
 }
@@ -799,6 +850,7 @@ static void m_stop(void *user)
    if (sess_clock_on)
    {
       gpsp_wallclock = sess_saved_wallclock;
+      gpsp_rtc_frames_only = 0;
       if (&gbab_gpsp_wallclock)
          gbab_gpsp_wallclock = NULL;
       sess_clock_on = 0;
@@ -833,6 +885,12 @@ void fe_gbadual_stats_evt(void (*evt)(const char *fmt, ...))
 {
    gbalink_inst_stats s0, s1;
    gbalink_bus_stats bs;
+   /* The bench (not a session) with no pair running is ONE machine: say so
+    * on every heartbeat, or its core_prof reads as a pair's (section 21:
+    * that is how a solo Street Fighter run was taken for the pair's cost). */
+   if (!D.active && D.loaded && !D.cfg.session)
+      evt("gbadual active=0 failed=%d (the pair is NOT running: one machine; "
+          "it starts at a state load or with gba_dual_cold = 1)", D.failed);
    if (!D.active)
       return;
    D.pair.m[0].get_stats(&s0);
@@ -853,6 +911,24 @@ void fe_gbadual_stats_evt(void (*evt)(const char *fmt, ...))
        (unsigned)bs.posted[0], (unsigned)bs.posted[1],
        (unsigned)bs.depth_max, (unsigned)bs.overflow,
        (unsigned)gamepak_page_loads, (unsigned)gbab_gamepak_page_loads);
+   /* Section 22: the fast path's checking mode (gba_link_fast = 2) and the
+    * progress guard's high-water mark. */
+   if (gbalink_fast == 2 || s0.fast_mismatch || s1.fast_mismatch)
+      evt("gbalink_fast_check mode=%u checks=%u/%u mismatch=%u/%u "
+          "run_calls_max=%u/%u", (unsigned)gbalink_fast,
+          (unsigned)s0.fast_checks, (unsigned)s1.fast_checks,
+          (unsigned)s0.fast_mismatch, (unsigned)s1.fast_mismatch,
+          (unsigned)s0.run_calls_max, (unsigned)s1.run_calls_max);
+   if (s0.fast_mismatch)
+      evt("gbalink_fast_mismatch slot=0 n=%u where=%u cached=%llu true=%llu "
+          "now=%llu", (unsigned)s0.fast_mismatch, (unsigned)s0.fm_where,
+          (unsigned long long)s0.fm_cached, (unsigned long long)s0.fm_true,
+          (unsigned long long)s0.fm_now);
+   if (s1.fast_mismatch)
+      evt("gbalink_fast_mismatch slot=1 n=%u where=%u cached=%llu true=%llu "
+          "now=%llu", (unsigned)s1.fast_mismatch, (unsigned)s1.fm_where,
+          (unsigned long long)s1.fm_cached, (unsigned long long)s1.fm_true,
+          (unsigned long long)s1.fm_now);
    /* Hang study: progress guard, both machines' derails and flushes, and
     * the kernel cache calls each core made on the firmware's large-range
     * paths (I >= 16 KiB, D >= 64 KiB). */
@@ -880,15 +956,36 @@ void fe_gbadual_stats_evt(void (*evt)(const char *fmt, ...))
 int fe_gbadual_probe(char *buf, size_t n)
 {
    if (!D.loaded)
-      return snprintf(buf, n, "pair=off");
-   return snprintf(buf, n, "pair=%s run=%d step_runs=%u f=%u/%u sw=%u "
-                   "bpc=%08x bbj=%u",
-                   D.active ? "on" : (D.failed ? "failed" : "idle"),
-                   (int)D.pair.running, (unsigned)D.pair.step_runs,
-                   (unsigned)D.pair.frames[0], (unsigned)D.pair.frames[1],
-                   (unsigned)D.pair.st.switches,
-                   &gbab_reg ? (unsigned)gbab_reg[15] : 0u,
-                   GBAD_U(gbab_badjump_recoveries));
+      return snprintf(buf, n, "pair=off err=%d", g_fault);
+   {
+      /* fm: the checking mode's disagreements (slot 0/slot 1), w/c/t the
+       * first one's place, cached and true time on the slot that had it --
+       * here because the heartbeat file is written when the log ring is not */
+      gbalink_inst_stats s0, s1;
+      const gbalink_inst_stats *m;
+      memset(&s0, 0, sizeof(s0));
+      memset(&s1, 0, sizeof(s1));
+      if (D.active)
+      {
+         D.pair.m[0].get_stats(&s0);
+         D.pair.m[1].get_stats(&s1);
+      }
+      m = s0.fast_mismatch ? &s0 : &s1;
+      return snprintf(buf, n, "pair=%s run=%d step_runs=%u f=%u/%u sw=%u "
+                      "bpc=%08x bbj=%u err=%d fast=%u fm=%u/%u w=%u c=%llu "
+                      "t=%llu",
+                      D.active ? "on" : (D.failed ? "failed" : "idle"),
+                      (int)D.pair.running, (unsigned)D.pair.step_runs,
+                      (unsigned)D.pair.frames[0], (unsigned)D.pair.frames[1],
+                      (unsigned)D.pair.st.switches,
+                      &gbab_reg ? (unsigned)gbab_reg[15] : 0u,
+                      GBAD_U(gbab_badjump_recoveries), g_fault,
+                      (unsigned)gbalink_fast,
+                      (unsigned)s0.fast_mismatch, (unsigned)s1.fast_mismatch,
+                      (unsigned)m->fm_where,
+                      (unsigned long long)m->fm_cached,
+                      (unsigned long long)m->fm_true);
+   }
 }
 
 int fe_gbadual_loaded(void)

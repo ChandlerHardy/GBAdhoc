@@ -34,12 +34,19 @@
  *              a non-alphanumeric byte becomes '0').
  *   GBnnXXXX   Link Cable room nn, Game Boy / Color; XXXX = the first four
  *              alphanumeric bytes of the cartridge title, else GAME.
+ *   GSnnDATA   "Share game data" room nn (docs/SAVE-SHARE.md): a PSP in its
+ *              game list serving its saves and states, read-only.  NOT a
+ *              link room: nothing speaks the link protocol in it, so a
+ *              build from before 4.0 that joins it by its verbatim name
+ *              finds nobody to link with and gives up.
  *   other      shown verbatim, joinable, the handshake decides.
  *
  * One room NUMBER (Settings > Room) for every kind: hosting Room 7 by cable
  * makes GC07AMKE, by adapter GPSP07.  Two rooms can share a number if their
  * modes differ; the scan list shows both. */
-enum { ROOM_ADAPTER = 0, ROOM_CABLE_GBA, ROOM_CABLE_GB, ROOM_OTHER };
+enum { ROOM_ADAPTER = 0, ROOM_CABLE_GBA, ROOM_CABLE_GB, ROOM_OTHER,
+       ROOM_SHARE };
+#define ROOM_SHARE_CODE "DATA"
 
 static inline int room_is_digit(char c) { return c >= '0' && c <= '9'; }
 static inline int room_is_alnum(char c)
@@ -62,6 +69,12 @@ static inline int room_parse(const char *group, int *num, char code[5])
    {
       k = ROOM_ADAPTER;
       n = (group[4] - '0') * 10 + (group[5] - '0');
+   }
+   else if (group[0] == 'G' && group[1] == 'S' && room_is_digit(group[2]) &&
+            room_is_digit(group[3]) && !strcmp(group + 4, ROOM_SHARE_CODE))
+   {
+      k = ROOM_SHARE;
+      n = (group[2] - '0') * 10 + (group[3] - '0');
    }
    else if (group[0] == 'G' && (group[1] == 'C' || group[1] == 'B') &&
             room_is_digit(group[2]) && room_is_digit(group[3]))
@@ -115,7 +128,9 @@ static inline const char *room_make(int kind, int num, const char *code,
    if (!out || !n)
       return "";
    num = num < 0 ? 0 : num % 100;
-   if (kind == ROOM_CABLE_GBA || kind == ROOM_CABLE_GB)
+   if (kind == ROOM_SHARE)
+      snprintf(out, n, "GS%02d" ROOM_SHARE_CODE, num);
+   else if (kind == ROOM_CABLE_GBA || kind == ROOM_CABLE_GB)
       snprintf(out, n, "G%c%02d%.4s", kind == ROOM_CABLE_GBA ? 'C' : 'B',
                num, code && strlen(code) >= 4 ? code : "GAME");
    else

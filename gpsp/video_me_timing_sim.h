@@ -61,7 +61,26 @@ static struct MeTimingSim {
   long drift;                         /* replays that left the arrays changed */
   long log_frames, log_overflow, log_entries, log_max, log_vram_on;
   unsigned long long render_ns;       /* CPU renderer's own lines, mode 2 */
+  unsigned mod_hash;                  /* MTS_MODULE: the module's own frame */
+  long mod_bad;
 } g_mts;
+
+/* MTS_MODULE=1 (tools/e2e/run_me_midframe.sh with MMF_MODULE=1): beside this
+ * model, run psp/me's renderer itself -- me_render_glue.cc and video.cc as
+ * the module builds it, compiled for the desktop -- on the same capture, and
+ * print its frame as `mod=` on the MTS line.  It must equal `vis=`.
+ * tools/e2e/me_module_twin/mtm_driver.c is the host side and says what this
+ * does and does not prove. */
+#ifndef MTS_MODULE
+#define MTS_MODULE 0
+#endif
+#if MTS_MODULE
+#include <cstddef>
+extern "C" unsigned mtm_frame(const void *vram, const void *oam, const void *pal,
+                              const void *cap, unsigned cap_bytes, unsigned log_off,
+                              const void *log, unsigned log_bytes,
+                              const unsigned char *clean, unsigned long frame);
+#endif
 
 static unsigned mts_fnv(const u16 *px)
 {
@@ -247,6 +266,22 @@ extern "C" void gpsp_visible_done_hook(void)
             memcmp(g_mts.oam160, oam_ram, sizeof(g_mts.oam160)) != 0,
             memcmp(g_mts.pal160, palette_ram_converted, sizeof(g_mts.pal160)) != 0);
   }
+#if MTS_MODULE
+  /* The module gets what the PSP's post gives it: the arrays as they are at
+   * this instant, this capture with its log, and the dirty-page map -- BEFORE
+   * the map is cleared below, as main_psp.c clears it only once the ME has
+   * copied. */
+  g_mts.mod_hash = mtm_frame(vram, oam_ram, palette_ram_converted, me_capture_buf,
+                             sizeof(me_capture_frame),
+#if ME_MIDFRAME_LOG
+                             offsetof(me_capture_frame, log_addr),
+                             (const void *)me_capture_buf->log_addr,
+                             me_capture_buf->log_n * sizeof(me_log_entry),
+#else
+                             0, NULL, 0,
+#endif
+                             vram_clean, g_mts.frame);
+#endif
   g_mts.have_vis = 1;
 #if ME_MIDFRAME_LOG
   /* The engine has "copied" the dirty pages: clear the map exactly where
@@ -306,9 +341,15 @@ extern "C" void me_timing_sim_frame_end(void)
       if (memcmp(g_mts.vram160 + p * 1024, vram + p * 1024, 1024) && pl < 150)
         pl += snprintf(vbl + pl, sizeof(vbl) - pl, "%s%d", n++ ? "," : "", p);
     fprintf(stderr, "MTS f=%lu cpu=%08x post=%08x vis=%08x bg1=%d,%d bg2=%d,%d "
-            "vram_vis=[%s] vram_vbl=[%s]\n", g_mts.frame, g_mts.cpu_hash, post,
+            "vram_vis=[%s] vram_vbl=[%s]", g_mts.frame, g_mts.cpu_hash, post,
             g_mts.vis_hash, (s16)r[10], (s16)r[11], (s16)r[12], (s16)r[13],
             g_mts.vis_pages, vbl);
+#if MTS_MODULE
+    fprintf(stderr, " mod=%08x", g_mts.mod_hash);
+    if (g_mts.mod_hash != g_mts.vis_hash)
+      g_mts.mod_bad++;
+#endif
+    fprintf(stderr, "\n");
   }
   memcpy(g_mts.vram_end, vram, sizeof(g_mts.vram_end));
 
@@ -354,6 +395,10 @@ static void mts_report(void)
   fprintf(stderr, "MTS_SUMMARY frames=%ld post_mismatch=%ld vis_mismatch=%ld\n",
           g_mts.frames, g_mts.post_bad, g_mts.vis_bad);
   fprintf(stderr, "MTS_DRIFT_TOTAL %ld\n", g_mts.drift);
+#if MTS_MODULE
+  fprintf(stderr, "MTS_MODULE frames=%ld mod_mismatch=%ld\n", g_mts.frames,
+          g_mts.mod_bad);
+#endif
 #if ME_MIDFRAME_LOG
   {
     extern unsigned long long me_log_ns;

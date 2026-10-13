@@ -61,6 +61,15 @@ typedef struct gbalink_pair_config
     * scripts whose next buttons depend on the RAM the last frame left.
     * Return 1 with *keys set, or 0 (= not known yet: a stall). */
    int    (*input)(void *user, unsigned slot, uint32_t frame, uint16_t *keys);
+   /* Progress guard (docs/GBA-LINK-MIRROR.md 22): a clock, and the longest
+    * one step() may take (microseconds; 0 or no clock = no wall-clock
+    * bound).  A step that exceeds it ends the pair with E_TIMEOUT. */
+   uint64_t (*now_us)(void);
+   uint64_t step_us_max;
+   /* TEST ONLY (gl_host --stress): nonzero seeds a generator that picks a
+    * random run horizon inside the rule's limits and pumps a random machine
+    * before every run.  Still deterministic for a given seed. */
+   uint32_t stress_seed;
 } gbalink_pair_config;
 
 typedef struct gbalink_pair_stats
@@ -90,6 +99,7 @@ typedef struct gbalink_pair
     * run() now (-1 = none), and runs made in the current step(). */
    volatile int      running;
    volatile uint32_t step_runs;
+   uint32_t stress_state;
    gbalink_pair_stats st;
 } gbalink_pair;
 
@@ -101,7 +111,9 @@ enum
    GBALINK_PAIR_E_DEADLOCK,       /* blocked with no way forward (a bug)     */
    GBALINK_PAIR_E_BUS,            /* the cable queue overflowed              */
    GBALINK_PAIR_E_STUCK,          /* runs that move neither clock (a bug)    */
-   GBALINK_PAIR_E_RUNAWAY         /* one step() far past any real frame      */
+   GBALINK_PAIR_E_RUNAWAY,        /* one step() far past any real frame      */
+   GBALINK_PAIR_E_OVERRUN,        /* a core's run made no progress / aborted */
+   GBALINK_PAIR_E_TIMEOUT         /* one step() over cfg.step_us_max         */
 };
 
 /* Progress guard limits.  Measured (AW2 battle, desktop/PPSSPP/PSP-3000): a

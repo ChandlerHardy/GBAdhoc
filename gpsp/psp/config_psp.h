@@ -7,6 +7,43 @@
 
 #include "fe_console.h"
 #include "ctl_map.h"
+
+/* REWIND LENGTH (Settings > "Rewind length"): Short = 1 MB, Medium = 2 MB,
+ * Long = 4 MB of history.  Medium is the default, as 2 MB always was (the
+ * size every test record is at).  Short is the one size that lives entirely
+ * in the volatile pool and takes nothing from the heap; Long takes 2.56 MiB
+ * of it (docs/REWIND.md 26).  The key stays `rewind_mb`, an integer of
+ * megabytes, so harness scripts and old configs keep working. */
+#define PCFG_REWIND_MB_SHORT   1
+#define PCFG_REWIND_MB_MEDIUM  2
+#define PCFG_REWIND_MB_LONG    4
+#define PCFG_REWIND_MB_DEFAULT PCFG_REWIND_MB_MEDIUM
+/* Any integer -> the nearest allowed size that is not above it (3 -> 2,
+ * 5..8 -> 4), and never below Short (0, negatives -> 1). */
+static inline int pcfg_rewind_mb_snap(long mb)
+{
+   return mb >= PCFG_REWIND_MB_LONG ? PCFG_REWIND_MB_LONG :
+          mb >= PCFG_REWIND_MB_MEDIUM ? PCFG_REWIND_MB_MEDIUM
+                                      : PCFG_REWIND_MB_SHORT;
+}
+/* Short -> Medium -> Long -> Short (dir < 0: the other way). */
+static inline int pcfg_rewind_mb_step(int mb, int dir)
+{
+   mb = pcfg_rewind_mb_snap(mb);
+   if (dir < 0)
+      return mb == PCFG_REWIND_MB_SHORT ? PCFG_REWIND_MB_LONG :
+             mb == PCFG_REWIND_MB_MEDIUM ? PCFG_REWIND_MB_SHORT
+                                         : PCFG_REWIND_MB_MEDIUM;
+   return mb == PCFG_REWIND_MB_SHORT ? PCFG_REWIND_MB_MEDIUM :
+          mb == PCFG_REWIND_MB_MEDIUM ? PCFG_REWIND_MB_LONG
+                                      : PCFG_REWIND_MB_SHORT;
+}
+static inline const char *pcfg_rewind_mb_name(int mb)
+{
+   mb = pcfg_rewind_mb_snap(mb);
+   return mb == PCFG_REWIND_MB_LONG ? "Long" :
+          mb == PCFG_REWIND_MB_MEDIUM ? "Medium" : "Short";
+}
 #include "fe_util.h"
 
 #ifdef __cplusplus
@@ -119,6 +156,31 @@ typedef struct
     * ON since 3.0.0 (the Go A/B rig, 21/21); `rom_resident = 0` pages. */
    int  rom_resident;
    int  show_fps;     /* 1 = OSD chip with emulated-frame rate (default 0) */
+#ifdef REWIND
+   /* Settings > Gameplay > Rewind (docs/REWIND.md).  rewind: 1 = record
+    * (GBA games, outside link sessions); 0 = no snapshots, no memory, and
+    * the store paths carry no page marks.  Read when a game is started.
+    * rewind_mb: megabytes of history -- one of the three named lengths
+    * (pcfg_rewind_mb_snap): 1 Short, 2 Medium (the default), 4 Long.
+    * CONFIG.INI `rewind`, `rewind_mb`. */
+   int  rewind;
+   int  rewind_mb;
+/* The toggle's default.  OFF until the owner decides (docs/REWIND.md). */
+#ifndef PCFG_REWIND_DEFAULT
+#define PCFG_REWIND_DEFAULT 0
+#endif
+#endif
+   /* 1 (default): a GBA cartridge clock shows the console's real time
+    * (rtc_clock.h).  0 = the frame-counting clock of 3.5.0 and earlier, the
+    * kill switch.  CONFIG.INI `rtc_realtime`, written only if present. */
+   int  rtc_realtime;
+   /* The thumbstick (ctl_map.h CTL_STICK_*): 0 off (default, 3.5.0's
+    * behaviour), 1 a second d-pad, 2 four bindable directions.  CONFIG.INI
+    * `stick = off | move | custom`, written only once it has been changed. */
+   int  stick;
+   /* 1 once the player has seen the Controls page's one-time note about
+    * putting Quick save / Quick load on the stick alone (`stick_warned`). */
+   int  stick_warned;
    /* GB/GBC DMG palette, a GBCORE_PALETTE_* id (gbcore.h): 0 = Auto (Super
     * Game Boy colours where the game has them, grey otherwise, default),
     * 1 Grey, 2 DMG green, 3 Pocket.  Unknown ids fall back to Auto. */
@@ -328,6 +390,12 @@ typedef struct
     * WLAN-off warning chip is NOT gated by this: hiding the reason wireless
     * is broken costs a field-debug round trip. */
    int  osd_wireless;
+   /* "Fast link" (Wireless menu; docs/GBA-LINK-UI.md): 1 = a GBA Link Cable
+    * session this console HOSTS sends two frames of buttons per packet.
+    * (Acks ride in every running cable session, Fast link or not:
+    * nd_ack_ride_us, main_psp.c.)  0 (default).  As a guest the host's value is used and
+    * this one is neither read nor rewritten. */
+   int  fast_link;
    char group[9];     /* wireless room code (adhocctl group, <= 8 chars) */
    char nick[24];     /* wireless nickname */
    int  console;      /* FE_CONSOLE_* browser/core selection; defaults to GBA */
@@ -414,6 +482,11 @@ void pcfg_load_doc(const char *ini_path, fe_ini_doc *doc);
  * nothing at all when no value changed.  A file too big to hold is left
  * untouched (config_save_refused). */
 void pcfg_save(void);
+/* GB/GBC clock saves: the local time (seconds since 1970) this console
+ * first ran a release that stamps them in UTC -- stored on the first call
+ * with a clock reading, returned unchanged ever after.  If it cannot be
+ * stored, now_local (and it is asked again next boot).  0 = no reading. */
+long pcfg_gb_rtc_utc_since(long now_local);
 /* Browser selection changes only this key. Returns -1 on persistence failure. */
 int pcfg_remember_rom(const char *name);
 /* Browser console switch (TRIANGLE): sets g_pcfg.console and writes only the

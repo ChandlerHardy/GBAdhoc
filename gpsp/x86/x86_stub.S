@@ -334,6 +334,47 @@ ext_store_eeprom16:
     movb $0, fnm(vram_clean)(%eax)
 #endif
 
+# REWIND: the rewind's own written-page map (gba_memory.h, "THE RULE"),
+# gba_rewind_clean[]: EWRAM pages at 0, VRAM pages at 264, 0 = written.
+# MARK_RW_EWRAM: eax = masked EWRAM offset, kept (the SMC check that follows
+# indexes with it); ecx and edx are free once the store is done.
+# MARK_RW_VRAM: after MARK_VRAM_PAGE, eax = page index; ecx is free.
+# REWIND_MUTANT=1 (tests only): the byte store forgets the EWRAM mark.
+#ifdef REWIND
+  #if defined(__x86_64__) || defined(__amd64__)
+    #if defined(_WIN32)
+      #define RW_MAP_PTR(r) lea fnm(gba_rewind_clean)(%rip), r
+    #else
+      #define RW_MAP_PTR(r) mov fnm(gba_rewind_clean)@GOTPCREL(%rip), r
+    #endif
+    #define MARK_RW_EWRAM()                                                    \
+      mov %eax, %ecx                                                         ;\
+      shr $10, %ecx                                                          ;\
+      RW_MAP_PTR(%rdx)                                                       ;\
+      movb $0, (%rdx, %rcx)                                                  ;
+    #define MARK_RW_VRAM()                                                     \
+      RW_MAP_PTR(%rcx)                                                       ;\
+      movb $0, 264(%rcx, %rax)                                               ;
+  #else
+    #define MARK_RW_EWRAM()                                                    \
+      mov %eax, %ecx                                                         ;\
+      shr $10, %ecx                                                          ;\
+      movb $0, fnm(gba_rewind_clean)(%ecx)                                   ;
+    #define MARK_RW_VRAM()                                                     \
+      movb $0, fnm(gba_rewind_clean)+264(%eax)                               ;
+  #endif
+#else
+  #define MARK_RW_EWRAM()
+  #define MARK_RW_VRAM()
+#endif
+#define MARK_RW_EWRAM_32() MARK_RW_EWRAM()
+#define MARK_RW_EWRAM_16() MARK_RW_EWRAM()
+#if defined(REWIND) && defined(REWIND_MUTANT) && REWIND_MUTANT == 1
+#define MARK_RW_EWRAM_8()
+#else
+#define MARK_RW_EWRAM_8()  MARK_RW_EWRAM()
+#endif
+
 # Memory write routines
 
 #define write_stubs(fname, wsize, opsuf, regfn, regfn16, addrm, dup8fn)      ;\
@@ -358,6 +399,7 @@ ext_##fname##_iwram##wsize:                                                  ;\
 ext_##fname##_ewram##wsize:                                                  ;\
   and $(0x3FFFF & addrm), %eax                               /* Addr wrap */ ;\
   mov regfn(d), EWRAM_OFF(REG_BASE, FULLREG(ax))          /* Actual write */ ;\
+  MARK_RW_EWRAM_##wsize()                 /* gba_rewind_clean[addr >> 10] = 0 */\
   smc_check_##fname(opsuf, (EWRAM_OFF+0x40000)(REG_BASE, FULLREG(ax)))       ;\
   ret                                                                        ;\
                                                                              ;\
@@ -370,6 +412,7 @@ ext_##fname##_vram##wsize:                                                   ;\
 1:                                                                           ;\
   mov regfn16(d), VRAM_OFF(REG_BASE, FULLREG(ax))         /* Actual write */ ;\
   MARK_VRAM_PAGE()                          /* vram_clean[addr >> 10] = 0 */ ;\
+  MARK_RW_VRAM()                                                              \
   ret                                                                        ;\
                                                                              ;\
 ext_##fname##_oam##wsize:                                                    ;\
@@ -408,6 +451,11 @@ ext_store_palette16b:         # entry point for 8bit write
   shl $11, %ecx               # cx <<= 11 (red component is in high bits)
   mov %dh, %cl                # bottom bits of cx = top bits of dx
   shr $2, %cl                 # move the blue component to the bottom of cl
+  and $0x1F, %cl              # ...and drop bit 15 of the value, which is not
+                              # a colour bit (convert_palette masks it too;
+                              # it used to land in green's lowest bit, so a
+                              # colour written with bit 15 set differed from
+                              # the same colour rebuilt by a state load)
   and $0x03E0, %dx            # isolate green component of dx
   shl $1, %dx                 # make green component 6bits
   or %edx, %ecx               # combine green component into ecx

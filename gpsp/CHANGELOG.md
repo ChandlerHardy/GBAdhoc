@@ -10,6 +10,22 @@ separately and are intended for upstream.
 
 ---
 
+## [4.1.0] — staged, pending owner testing
+
+- Protect previous battery images on failed full writes and failed loads; preserve
+  exact written generations and drain pending saves before GBA cable RAM handoff.
+- Correct GB/GBC timer phase, DIV/TAC edges, delayed TIMA reload and HALT clocking;
+  fix audio, SGB masking and state validation.
+- Restore rewind cartridge clock context and recover safely from restore failures.
+- Reject malformed GBA state components, EEPROM bounds and invalid sound/timer state.
+- Correct PSP worker, Media Engine, standby and USB ownership cleanup.
+- Upgrade wireless and save-share admission to protocol version 2, reject stale traffic,
+  and create PSP adhoc host groups with the SDK's explicit host API.
+- Add bounded, disabled-by-default GBA GS1/AR3 RAM cheats.
+
+Both PSPs must be updated for linking and sharing. See
+[release notes](docs/RELEASE-4.1.0.md) for validation and the publication gate.
+
 ## [0.1.0] — unreleased
 
 First release. Everything below exists and has been exercised; the "Known issues" section

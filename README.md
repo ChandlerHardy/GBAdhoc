@@ -1,6 +1,6 @@
 <!-- ============================================================================
      VERSION: the release number is written ONCE, on the "Version" line in the
-     hero block just below (4.0.0).  Every other sentence says "this release",
+     hero block just below (4.1.0).  Every other sentence says "this release",
      and the download button points at /releases/latest, so renaming the
      release is a one-line edit.
      ============================================================================ -->
@@ -15,7 +15,7 @@
 <h3 align="center">Game Boy Advance, Game Boy and Game Boy Color on your PSP,<br>and two PSPs that play together like two consoles and a link cable.</h3>
 
 <p align="center">
-  <sub><b>Version 4.0.0</b> &nbsp;·&nbsp; PSP-1000, 2000/3000 and Go &nbsp;·&nbsp; no BIOS needed &nbsp;·&nbsp; GPL-2.0</sub>
+  <sub><b>Version 4.1.0</b> &nbsp;·&nbsp; PSP-1000, 2000/3000 and Go &nbsp;·&nbsp; no BIOS needed &nbsp;·&nbsp; GPL-2.0</sub>
 </p>
 
 <p align="center">
@@ -35,14 +35,14 @@
   </picture>
   </a>
   <br>
-  <sub><b>Hold a button. Take it back.</b> Rewind is new in this release: the game runs backwards for as long as you hold, and you carry on from wherever you let go. The gameplay is real; the anime retelling is from the 4.0.0 trailer.</sub>
+  <sub><b>Hold a button. Take it back.</b> Rewind arrived in 4.0.0: the game runs backwards for as long as you hold, and you carry on from wherever you let go. The gameplay is real; the anime retelling is from the 4.0.0 trailer.</sub>
 </p>
 
 Race a friend in Mario Kart, fight them in Advance Wars, trade Pokémon across Game Boy
 generations: GBAdhoc links two PSPs the way a cable links two Game Boys, for Game Boy
-Advance games as well as Game Boy and Game Boy Color. This release adds **rewind**: hold
-a button and the game runs backwards. It also brings per-game cheats, save and save-state
-sharing between two PSPs, turbo buttons, and faster link play.
+Advance games as well as Game Boy and Game Boy Color. This release improves save
+protection, Game Boy timer accuracy, rewind clock restoration and wireless session
+validation. It also adds a bounded GBA GameShark/Action Replay cheat subset.
 
 It still runs the hard ROM hacks at full speed on a PSP-1000, because the renderer lives
 on the console's second processor, and you can still put the PSP to sleep and pick the
@@ -91,8 +91,25 @@ game up tomorrow exactly where it was.
 
 ## What's new in this release
 
-Everything below is new since 3.5.0. Each item carries a <kbd>NEW</kbd> mark so you can
-tell it from the features that were already there.
+4.1.0 focuses on reliability:
+
+- Whole-image battery writes preserve the previous usable save when replacement fails;
+  failed battery reads refuse boot instead of later writing blank or partial RAM.
+- GBA cable startup completes pending battery writes before changing session RAM.
+- GB/GBC DIV and TIMA timing, delayed reloads, HALT wakeup, audio and display fixes.
+- Rewind restores cartridge clock context and handles failed restores safely.
+- Malformed save states are rejected before they can corrupt core state.
+- Media Engine, standby and USB fixes enforce buffer and file ownership.
+- Wireless admission and save sharing reject stale sessions. **Update both PSPs to
+  4.1.0:** these transports now use protocol version 2.
+- GBA GS1/AR3 cheats support a bounded RAM-only subset; new entries start disabled.
+  See [supported cheat commands](gpsp/docs/CHEATS.md).
+
+See the [4.1.0 release notes and validation scope](gpsp/docs/RELEASE-4.1.0.md).
+
+### Features introduced in 4.0.0
+
+The features below were introduced after 3.5.0.
 
 ### <kbd>NEW</kbd> Rewind
 
@@ -197,7 +214,8 @@ during link play.
   Alpha 3 and Sonic Battle at full speed, and Kirby multiplayer a little under it.
 - <kbd>NEW</kbd> **A finished trade is written to the Memory Stick straight away,**
   instead of at the next periodic save.
-- A 4.0.0 PSP can still link with a 3.5.0 PSP, but update both: the new speed and Fast
+- Update both PSPs to 4.1.0 before linking or sharing saves. Protocol version 2 refuses
+  older transports safely. The new speed and Fast
   link need both sides.
 
 ### <kbd>NEW</kbd> Fixes

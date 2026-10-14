@@ -180,23 +180,46 @@ are recorded in `../../../audit/core/accuracy-results.txt`.
   interrupt in SGB and CGB normal/double speed; checkpoint `88cd4c8`
   interrupted after 23 iterations. `tim00_div_trigger` yields DE=0405
   in all modes; its earlier accidental pass alone did not prove edge behavior.
-  `rapid_toggle` now matches BC=FFD9 in SGB. CGB still fails that reference
-  (BC=FCD3); CGB enable-write quirks remain unmodeled. The adapted
+  `rapid_toggle` matches BC=FFD9 in SGB. The adapted native-CGB variant
+  yields BC=FCD3, but this variant changes the upstream cartridge's CGB
+  header flag from 00 to 80. That mismatch is not a confirmed failure of
+  the upstream hardware-verified ROM. The adapted
   `tima_reload`, `tima_write_reloading` and `tma_write_reloading` bodies now
   meet every original register assertion in all modes. Logs are in
   `audit/reliability/mooneye-timer.log`; the runner's
   successful exit records characterization, not all cases passing.
+- **Unmodified official ROM controls:** the publisher's
+  [31510e1 prebuilt archive](https://gekkio.fi/files/mooneye-test-suite/mts-20260714-0944-31510e1/mts-20260714-0944-31510e1.zip)
+  matches source commit `31510e12eea6286d36eea060a6adde755e1067aa` (MIT).
+  All six selected ROMs were run without byte changes, with their original
+  boot entry, reporting code and serial pass protocol: `03 05 08 0d 15 22`.
+  All six pass on both `FE_CONSOLE_GB` and `FE_CONSOLE_GBC`: **12/12 host
+  ASan/UBSan passes**. Their upstream headers have CGB flag 00 and SGB flag
+  00; CGB hardware therefore runs DMG compatibility mode (`gb_type=3`,
+  `now_gb_mode=1`). The original common harness defaults to a DMG cartridge
+  unless `CART_CGB` is defined. No hidden timer bootstrap was removed.
+  Setting flag 80 and repairing only the header checksum reproduces the
+  native-CGB `rapid_toggle` mismatch with the complete original program;
+  the other five variants pass. The native-mode variant and forced
+  double-speed adapted runs are exploratory, not the upstream verified
+  hardware-mode expectation. No timer production change follows from that
+  mismatch. This is host emulator evidence, not physical Game Boy/PSP testing.
+  Reproduction scripts are in the workspace's outer `audit/` directory:
+  `fetch_mooneye_original.py`, `run_mooneye_original.py` and
+  `reliability_jobs.py gb-timer-original`. ROM bytes remain outside the
+  tracked source and packaged PSP game. Publisher URL, source revision and
+  per-ROM SHA-256 hashes are recorded in
+  `audit/reliability/mooneye-original-manifest.json`; results are in
+  `audit/reliability/mooneye-original.log`.
 - The earlier original guest probes now return SGB white `ffff` and NR52
   `f1,f1,f0`, whose activity bits are `1,1,0`. This is host evidence;
   the earlier PSP mask-off screenshot did not provide a valid visual
   positive control and must not be cited as proof of a corrected PSP image.
 
-Integration: the shared `tools/run_gb_tests.py` still requires complete
-3.0.0 audio/state bit identity. That contract intentionally conflicts with
-these accuracy corrections. Wire this regression runner into the shared
-suite and retain parity checks for unaffected picture/battery behavior;
-do not treat skipping the historical oracle as passing it. No shared test
-runner or frontend save code was edited by this audit.
+Integration: `tools/run_gb_tests.py` now runs the accuracy and timer controls
+and retains historical picture/battery parity. Historical audio/state
+bytes intentionally differ; behavioral accuracy and restore-replay tests
+validate those changed semantics separately.
 
 ## Remaining limits and follow-up work
 
@@ -215,7 +238,10 @@ runner or frontend save code was edited by this audit.
 - State validation does not yet cover every CPU/DMA/adapter scalar or prove
   robustness against arbitrary malicious state bytes. Targeted fuzzing is
   useful next work. Direct internal restore helpers are not public APIs.
-- Timer CGB enable-write quirks and STOP/speed-switch details remain.
+- Native-CGB enable-write behavior still needs a matching hardware-mode
+  reference before further changes; the altered-header `rapid_toggle`
+  mismatch does not establish an ordinary CGB compatibility-mode defect.
+  STOP/speed-switch details remain.
   The CPU executes register accesses at whole-instruction boundaries;
   mixed instruction widths and multiple bus accesses can therefore still
   differ from hardware even though the selected adapted reload tests pass.

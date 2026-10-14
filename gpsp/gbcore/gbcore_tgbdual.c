@@ -685,7 +685,7 @@ static void rebase_clocks(void)
 {
   int base = total_clock;
   total_clock = 0;
-  snd_bef_clock -= base;
+  apu_rebase(base); /* GBAdhoc: normalized audio and CPU timeline. */
   if (seri_occer != 0x7fffffff)
     seri_occer -= base;
 }
@@ -716,6 +716,9 @@ void gbcore_set_headless(gbcore_t *core, int headless)
     if (!vframe)
       return;                 /* stays headless */
     memset(vframe, 0, VFRAME_SIZE);
+    /* Solid SGB masks suppress scanline rendering until explicitly cleared. */
+    if (now_gb_mode == 2 && sgb_mask >= 2)
+      gb_fill_vframe(sgb_mask == 3 ? sgb_palette[0] : 0);
   }
   core->headless = headless;
   gbSkip = core->skip_render || headless;
@@ -757,8 +760,7 @@ static void frame_end(gbcore_t *core)
      * register side of the APU when they were made (apu_write ->
      * snd_process); the queue only feeds the synthesiser, whose copy of
      * the state nothing in the game can read. */
-    snd_que_count = 0;
-    snd_bef_clock = total_clock;
+    apu_discard_audio();
     samples = 0;
   }
   else if (samples)
@@ -1056,6 +1058,13 @@ static void ext_save(uint8_t *p)
   memcpy(c.p, ext_mem, 16);
   c.p += 16;
   memcpy(c.p, spare_oam, 0x18);
+  c.p += 0x18;
+  /* GBAdhoc: reserve tail restores sample cadence and input edge latch. */
+  w32(&c, (uint32_t)active->audio_acc);
+  w32(&c, (uint32_t)(active->audio_acc >> 32));
+  *c.p++ = (uint8_t)active->prev_buttons;
+  *c.p++ = (uint8_t)(active->prev_buttons >> 8);
+  *c.p++ = 'A'; *c.p++ = '2';
 }
 
 static void ext_load(const uint8_t *q)
@@ -1082,6 +1091,15 @@ static void ext_load(const uint8_t *q)
   memcpy(ext_mem, c.q, 16);
   c.q += 16;
   memcpy(spare_oam, c.q, 0x18);
+  c.q += 0x18;
+  if (c.q[10] == 'A' && c.q[11] == '2') {
+    active->audio_acc = get_le32(c.q) | ((uint64_t)get_le32(c.q + 4) << 32);
+    active->audio_acc %= GB_CLOCK_HZ;
+    active->prev_buttons = (uint16_t)(c.q[8] | (c.q[9] << 8));
+  } else {
+    active->audio_acc = 0;
+    active->prev_buttons = 0;
+  }
 }
 
 size_t gbcore_state_size(gbcore_t *core)
@@ -1168,12 +1186,17 @@ int gbcore_state_load(gbcore_t *core, const void *source, size_t size)
     return -1;
   }
   if (gb_restore_state(in + STATE_HEADER, core_len) != 0)
+  {
+    if (saved_model != model) gb_model_apply(model);
     return -1;
+  }
   ext_load(in + STATE_HEADER + core_len);
   /* The sound queue belongs to the frame the state interrupted, not to the
    * one it restores; the volume latch must be re-read from NR50. */
   snd_que_count = 0;
-  snd_bef_clock = total_clock;
+  apu_restore_clock();
+  if (now_gb_mode == 2 && sgb_mask >= 2)
+    gb_fill_vframe(sgb_mask == 3 ? sgb_palette[0] : 0);
   snd_stat_upd = 1;
   rebase_clocks();
   cpu_irq_check();
@@ -1414,6 +1437,11 @@ uint64_t gbcore_sync_hash(gbcore_t *core)
 
   h = sync_bytes(h, apu_get_stat_cpu(), sizeof(struct apu_stat));
   h = sync_bytes(h, apu_get_mem(), 0x30);
+  {
+    uint8_t timing[36];
+    apu_save_cpu_timing(timing);
+    h = sync_bytes(h, timing, sizeof(timing));
+  }
 
   if (now_gb_mode == 2)
   {

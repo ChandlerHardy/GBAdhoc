@@ -23,7 +23,7 @@
 // GB orginal op_code
 
 inline void op_code_normal_case0x08(void) { writew(op_readw(),REG_SP);} //LD (mn),SP
-inline void op_code_normal_case0x10(void) { if (speed_change) { speed_change=false;speed^=1;REG_PC++;/* 1バイト読み飛ばす */ } else { halt=true;REG_PC--; cpu_irq_check(); }} //STOP(HALT?)
+inline void op_code_normal_case0x10(void) { if (speed_change) { apu_update(); /* GBAdhoc: settle old-speed APU cycles. */ speed_change=false;speed^=1;REG_PC++;/* 1バイト読み飛ばす */ } else { halt=true;REG_PC--; cpu_irq_check(); }} //STOP(HALT?)
 
 //0x2A LD A,(mn) -> LD A,(HLI) Load A from (HL) and decrement HL
 inline void op_code_normal_case0x2A(void) { REG_A=cpu_read(REG_HL);REG_HL++;} // LD A,(HLI) : 00 111 010 :state 13

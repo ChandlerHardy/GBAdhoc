@@ -4352,7 +4352,7 @@ static int screen_cheats(unsigned edges, const char *game)
          else if (e->error)
             snprintf(g_cht_note, sizeof(g_cht_note), "%s",
                      e->error == 6 /* CheatErrorGameShark */
-                        ? "GameShark / Action Replay codes cannot be used yet"
+                        ? "Choose a format: GS1:, AR3:, GS1RAW: or AR3RAW:"
                      : e->error == 7 /* CheatErrorRegion */ ||
                        e->error == FE_CHEAT_ERR_GB_REGION
                         ? "Only codes that write the game's RAM can be used"
@@ -4578,6 +4578,14 @@ static int state_delete(const char *slot1_path, unsigned slot)
       fe_evt("state_delete slot=%u rc=bad_path", slot);
       return -1;
    }
+   /* A leftover replacement backup must not resurrect a deleted slot. */
+   {
+      char old[PSP_FILE_PATH_CAP + 4];
+      snprintf(old, sizeof(old), "%s.old", st);
+      (void)sceIoRemove(old);
+      if (sceIoGetstat(old, &sst) >= 0)
+         return -1;
+   }
    /* Success is judged by the file being GONE, not by the return code:
     * PPSSPP returns 0 from sceIoRemove whenever the file existed, removed
     * or not (its case-folding retry can miss a FAT short name such as
@@ -4654,6 +4662,7 @@ static void ov_slots_stat_io(void)
       if (!g_state_base[0] ||
           psp_state_path_for_slot(path, sizeof(path), g_state_base,
                                   (unsigned)i + 1) != 0 ||
+          fe_host_state_recover(path) < 0 ||
           sceIoGetstat(path, &st) < 0)
          continue;
       g_ov_slot[i] = 1;
@@ -7212,6 +7221,7 @@ static int browser_rom_has_state(const char *rom_dir, int rom_idx)
       g_browser_state_exists[slot - 1] =
          browser_rom_state_path(rom_dir, rom_idx, (unsigned)slot,
                                 path, sizeof(path)) == 0 &&
+         fe_host_state_recover(path) >= 0 &&
          sceIoGetstat(path, &st) >= 0;
       any |= g_browser_state_exists[slot - 1];
    }

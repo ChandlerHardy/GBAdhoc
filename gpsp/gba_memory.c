@@ -138,6 +138,13 @@ static const u32 gbc_sound_wave_volume[4] = { 0, 16384, 8192, 4096 };
   render_gbc_sound();                                                         \
   gbc_sound_channel[3].frequency_step =                                       \
    psg_noise_step(dividing_ratio, frequency_shift);                           \
+  if (gbc_sound_channel[3].noise_type != ((value >> 3) & 0x01))              \
+  {                                                                           \
+    /* Width can change without retrigger. The old long-sequence position   \
+     * must fit the new table before the next sample is fetched. */         \
+    gbc_sound_channel[3].sample_index %=                                     \
+      (((value & 8) ? 126u : 32767u) << 16);                                \
+  }                                                                           \
   gbc_sound_channel[3].noise_type = (value >> 3) & 0x01;                      \
   gbc_sound_channel[3].length_status = (value >> 14) & 0x01;                  \
   if(value & 0x8000)                                                          \
@@ -1576,6 +1583,11 @@ volatile s64 gpsp_rtc_wall = 0;
  * machine. */
 int gpsp_rtc_frames_only = 0;
 static s64 rtc_last_shown;
+#ifdef REWIND
+/* External input for ONE frame, recorded beside that frame's buttons.
+ * Zero keeps deterministic frame-clock frontends unchanged. */
+static s64 rtc_rewind_time;
+#endif
 
 /* No real clock reads earlier than this (2000-01-01), so an older base can
  * only have come from the broken source above. */
@@ -1598,17 +1610,19 @@ static void rtc_init_base_time(void)
 {
   rtc_base_time = rtc_now();
   rtc_boot_time = rtc_base_time;
+  /* The monotonic floor belongs to this cartridge session, not the process.
+   * A previous ROM (or a link clock) must not lend a future date to a new one. */
+  rtc_last_shown = 0;
+#ifdef REWIND
+  rtc_rewind_time = 0;
+#endif
 }
 
 #ifdef REWIND
-/* THE CLOCK WHILE A REWIND IS RECORDING (docs/REWIND.md).  The wall clock is
- * an input the snapshots do not hold: a frame re-run for a rewind would read
- * a later second than it did the first time.  So while this is set the clock
- * is base + frames, both of which ARE in a snapshot, and the base is brought
- * up to the wall clock only at the moments a snapshot is taken on the first
- * pass (gpsp_rewind_clock_sync).  A re-run from that snapshot then computes
- * exactly what the first pass computed, and the clock is never further from
- * the console's than one snapshot interval of fast-forward. */
+/* While recording, sync once BEFORE each first-pass frame. The chosen wall
+ * second is logged with its input and reinstated before replay. Extrapolating
+ * between snapshots lets fast-forward ratchet the clock into the future;
+ * sampling again during replay makes a different machine. Do neither. */
 u32 gba_rewind_clock_frames;
 void gpsp_rewind_clock_sync(void);
 #endif
@@ -1617,13 +1631,20 @@ static time_t rtc_current_time(void)
 {
   s64 elapsed = (s64)((double)frame_counter * GBA_FRAME_SECONDS);
 #ifdef REWIND
-  if (gba_rewind_clock_frames && rtc_base_time >= RTC_PLAUSIBLE_EPOCH)
+  if (gba_rewind_clock_frames && !gpsp_rtc_frames_only &&
+      rtc_rewind_time >= RTC_PLAUSIBLE_EPOCH)
   {
-    s64 t = rtc_base_time + elapsed;
-    if (t > rtc_last_shown)
-      rtc_last_shown = t;     /* the next sync never steps behind this */
-    return (time_t)t;
+    /* A replay may legitimately show an earlier second. It must not alter
+     * the forward-only monotonic floor, including when a snapshot is made.
+     * Keep the ordinary state format's base aligned for later solo/link use. */
+    rtc_base_time = rtc_rewind_time - elapsed;
+    return (time_t)rtc_rewind_time;
   }
+  /* Zero context records a frame-clock frame. A wall source becoming
+   * available later must not change that frame when it is replayed. */
+  if (gba_rewind_clock_frames && !gpsp_rtc_frames_only &&
+      rtc_base_time >= RTC_PLAUSIBLE_EPOCH)
+    return (time_t)(rtc_base_time + elapsed);
 #endif
   /* A save state restores the base it was written with.  States made
    * while the base came from the PSP's uptime carry 1970 forever, so
@@ -1669,8 +1690,20 @@ void gpsp_rewind_clock_sync(void)
 {
   u32 hold = gba_rewind_clock_frames;
   gba_rewind_clock_frames = 0;
-  (void)rtc_current_time();   /* picks the wall clock, moves the base to it */
+  rtc_rewind_time = (!gpsp_rtc_frames_only &&
+                     gpsp_rtc_wall >= RTC_PLAUSIBLE_EPOCH)
+      ? (s64)rtc_current_time() : 0;
   gba_rewind_clock_frames = hold;
+}
+
+/* fe_rewind's per-frame external context. Applying a replay value changes
+ * neither the real clock nor its forward monotonic floor. */
+long long gpsp_rewind_clock_time(const long long *set);
+long long gpsp_rewind_clock_time(const long long *set)
+{
+  if (set)
+    rtc_rewind_time = (s64)*set;
+  return (long long)rtc_rewind_time;
 }
 #endif
 
@@ -1684,6 +1717,14 @@ void gpsp_rtc_peek(long long *shown, long long *frames_time, int *wall)
   long long t = rtc_clock_pick((long long)(rtc_base_time + elapsed),
                                (long long)gpsp_rtc_wall,
                                gpsp_rtc_frames_only, &last, &w);
+#ifdef REWIND
+  if (gba_rewind_clock_frames && !gpsp_rtc_frames_only &&
+      rtc_rewind_time >= RTC_PLAUSIBLE_EPOCH)
+  {
+    t = (long long)rtc_rewind_time;
+    w = 1;
+  }
+#endif
   if (shown) *shown = t;
   if (frames_time) *frames_time = (long long)(rtc_boot_time + elapsed);
   if (wall) *wall = w;
@@ -3249,6 +3290,10 @@ bool memory_check_savestate(const u8 *src)
   u32 flash_size, eeprom_size_val, eeprom_mode_val, eeprom_address_val;
   u32 eeprom_counter_val, rtc_state_val, rtc_write_mode_val, rtc_command_val;
   u32 rtc_status_val, rtc_data_bits_val, rtc_bit_count_val;
+  if (!bson_contains_key(src, "memory", BSON_TYPE_DOC) ||
+      !bson_contains_key(src, "backup", BSON_TYPE_DOC) ||
+      !bson_contains_key(src, "dma", BSON_TYPE_DOC))
+    return false;
   const u8 *memdoc = bson_find_key(src, "memory");
   const u8 *bakdoc = bson_find_key(src, "backup");
   const u8 *dmadoc = bson_find_key(src, "dma");
@@ -3264,6 +3309,17 @@ bool memory_check_savestate(const u8 *src)
       !bson_has_bytes(memdoc, "ioregs", sizeof(io_registers)) ||
       !bson_contains_key(memdoc, "dma-bus", BSON_TYPE_INT32))
      return false;
+
+  /* The renderer indexes a 160-line target whenever VBlank is clear.
+   * Match this core's persisted 0..227 scanline/VBlank relationship, not a
+   * stricter hardware timing model (it clears VBlank when line 228 wraps). */
+  {
+    const u8 *io = bson_find_key(memdoc, "ioregs") + 5;
+    u32 line = io[REG_VCOUNT * 2] | ((u32)io[REG_VCOUNT * 2 + 1] << 8);
+    u32 flags = io[REG_DISPSTAT * 2];
+    if (line >= 228 || (!!(flags & 1) != (line >= 160)))
+      return false;
+  }
 
   // Check backup variables
   for (i = 0; i < sizeof(vars32)/sizeof(vars32[0]); i++)
@@ -3292,7 +3348,10 @@ bool memory_check_savestate(const u8 *src)
     return false;
   if (flash_size != FLASH_SIZE_64KB && flash_size != FLASH_SIZE_128KB)
     return false;
-  if ((eeprom_mode_val == EEPROM_READ_MODE || eeprom_mode_val == EEPROM_WRITE_MODE) &&
+  if ((eeprom_mode_val == EEPROM_READ_MODE || eeprom_mode_val == EEPROM_WRITE_MODE ||
+       eeprom_mode_val == EEPROM_READ_HEADER_MODE ||
+       eeprom_mode_val == EEPROM_ADDRESS_FOOTER_MODE ||
+       eeprom_mode_val == EEPROM_WRITE_FOOTER_MODE) &&
       (eeprom_address_val > 0x1FFF8u || (eeprom_address_val & 7)))
     return false;
   switch (eeprom_mode_val)
@@ -3303,6 +3362,11 @@ bool memory_check_savestate(const u8 *src)
     case EEPROM_ADDRESS_MODE:
     case EEPROM_WRITE_ADDRESS_MODE:
       if (eeprom_counter_val > (eeprom_size_val == EEPROM_512_BYTE ? 5u : 13u))
+        return false;
+      /* Address bits accumulate in the high part of a 16-bit shift field.
+       * On completion it is converted to an eight-byte block offset. Bits
+       * above that field would survive the conversion and overrun backup. */
+      if (eeprom_address_val & ~(0xFFFFu & (0xFFFFu << (16 - eeprom_counter_val))))
         return false;
       break;
     case EEPROM_READ_MODE:
@@ -3326,9 +3390,16 @@ bool memory_check_savestate(const u8 *src)
       !bson_has_int32_array(bakdoc, "rtc-data-words", 2))
       return false;
 
+  /* Optional in older states, but present values must have the shape the
+   * reader consumes; BIN/INT32 payloads are not integer arrays. */
+  if (bson_find_key(bakdoc, "rtc-base-time") &&
+      !bson_has_int32_array(bakdoc, "rtc-base-time", 2))
+    return false;
+
   for (d = 0; d < DMA_CHAN_CNT; d++)
   {
     char tname[2] = {'0' + d, 0};
+    if (!bson_contains_key(dmadoc, tname, BSON_TYPE_DOC)) return false;
     const u8 *dmastr = bson_find_key(dmadoc, tname);
     if (!dmastr)
       return false;

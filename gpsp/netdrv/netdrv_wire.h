@@ -4,7 +4,7 @@
  *
  *   offset size field
  *   0      4    magic   'GPN1' (0x47504E31, serialized little-endian)
- *   4      1    ver     ND_WIRE_VER (1)
+ *   4      1    ver     ND_WIRE_VER (2)
  *   5      1    type    ND_T_*
  *   6      1    src     sender client_id (0-4), ND_ID_JOINING while joining
  *   7      1    dst     dest client_id (0-4), ND_ID_BCAST for broadcast,
@@ -13,12 +13,14 @@
  *   10     2    ack     cumulative ack: next seq expected FROM the addressee
  *   12     2    len     payload length (<= ND_MAX_PAYLOAD)
  *   14     2    crc     CRC16-CCITT (poly 0x1021 init 0xFFFF) over the
- *                       16-byte header with crc=0, then the payload
+ *                       24-byte header with crc=0, then the payload
+ *   16     4    src_nonce   sender instance, little-endian
+ *   20     4    dst_nonce   receiver instance (0 for discovery/ROSTER)
  *
  * All multi-byte fields little-endian on the wire (both targets are LE;
  * serialization is still explicit byte-at-a-time — no struct punning).
- * A receiver drops any frame failing: size >= 16, magic, ver, known type,
- * len <= ND_MAX_PAYLOAD, datagram size == 16 + len (EXACT), CRC. This wall
+ * A receiver drops any frame failing: size >= 24, magic, ver, known type,
+ * len <= ND_MAX_PAYLOAD, datagram size == 24 + len (EXACT), CRC. This wall
  * is what keeps garbage away from the non-tolerant core (ADR-0003).
  */
 #ifndef NETDRV_WIRE_H
@@ -32,7 +34,7 @@ extern "C" {
 #endif
 
 #define ND_WIRE_MAGIC 0x47504E31u   /* 'GPN1' */
-#define ND_WIRE_VER   1
+#define ND_WIRE_VER   2
 
 /* Frame types */
 enum
@@ -47,6 +49,8 @@ enum
    ND_T_ROSTER   = 6,   /* host -> all: roster payload, your_id = 0xFF */
    ND_T_BYE      = 7,   /* sender is leaving */
    ND_T_PING     = 8,   /* keepalive; ack field still meaningful */
+   ND_T_OFFER    = 9,   /* host -> joiner; seq|ack<<16 is a fresh challenge */
+   ND_T_CONFIRM  = 10,  /* joiner -> host; echo challenge before admission */
    ND_T__COUNT
 };
 
@@ -70,6 +74,7 @@ typedef struct nd_hdr
    uint32_t magic;
    uint8_t  ver, type, src, dst;
    uint16_t seq, ack, len, crc;
+   uint32_t src_nonce, dst_nonce;
 } nd_hdr;
 
 uint16_t nd_crc16(uint16_t crc, const void *data, size_t len);

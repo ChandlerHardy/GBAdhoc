@@ -365,15 +365,24 @@ static int h_usb_up(void)
    return 0;
 }
 
-static void h_usb_down(void)
+static int h_usb_down(void)
 {
-   sceUsbDeactivate(HANDOFF_PID);
+   int rc = sceUsbDeactivate(HANDOFF_PID);
+   if (h_usb_active && rc < 0)
+   {
+      /* A failed request has not returned ownership of the FAT volume.
+       * This note stays in RAM; no flush, command read or relaunch is safe. */
+      h_note("usb deactivate FAILED rc=0x%08X -- leaving ms0 gated", (unsigned)rc);
+      return -1;
+   }
+   h_usb_active = 0;
    sceUsbStop(PSP_USBSTOR_DRIVERNAME, 0, 0);
    sceUsbStop(PSP_USBBUS_DRIVERNAME, 0, 0);
    /* The usbstor PRXs stay loaded on purpose: they are firmware modules the
     * XMB also uses, and repeatedly unloading/reloading a kernel driver stack
     * across dozens of chained runs is a far better way to wedge a console
     * than leaving four idle modules resident. */
+   return 0;
 }
 
 void handoff_run(int exit_code, const char *exit_reason)
@@ -464,8 +473,11 @@ park:
       rc = h_usb_up();
       if (rc < 0)
       {
-         h_usb_down();
-         h_usb_active = 0;
+         if (h_usb_down() < 0)
+         {
+            sceKernelExitGame();
+            return;
+         }
          h_flush_notes();
          h_note("usb up FAILED rc=%d -- exiting normally", rc);
          return;
@@ -507,8 +519,11 @@ park:
          }
          if (h_escape_held(&esc_ms))
          {
-            h_usb_down();
-            h_usb_active = 0;
+            if (h_usb_down() < 0)
+            {
+               sceKernelExitGame();
+               return;
+            }
             h_flush_notes();
             h_note("START+SELECT held -- left the loop by request");
             return;
@@ -534,8 +549,11 @@ park:
       }
       h_note("window served (%ds)", cur_window);
 
-      h_usb_down();
-      h_usb_active = 0;
+      if (h_usb_down() < 0)
+      {
+         sceKernelExitGame();
+         return;
+      }
       h_flush_notes();    /* ours again -- commit the buffered breadcrumbs */
       h_note("usb released");
 

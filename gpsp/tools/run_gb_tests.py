@@ -17,6 +17,7 @@ UBSan, which is what caught the upstream spare_oam underflow class of bug.
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -90,9 +91,11 @@ def build_trace(t: Path, root: Path, tag: str) -> Path:
     return out
 
 
-def bit_identical(t: Path) -> None:
-    """Single-player is bit-identical to the 3.0.0 release: picture, sound,
-    save-state image and battery image, every frame, on the generated ROM
+def baseline_picture_battery(t: Path) -> None:
+    """Retain historical picture/battery parity on every generated frame.
+    Corrected APU behavior and newly serialized timing intentionally change
+    audio/state hashes; accuracy.c independently tests those semantics.
+    Also compare picture/battery on the supplied real-ROM corpus.
     and (GBADHOC_GB_ROMS) on every real one.  The baseline tree comes from
     run_host_tests.py (GBADHOC_BASELINE_DIR/gb) or from git here."""
     base = Path(os.environ.get("GBADHOC_BASELINE_DIR", "")) / "gb"
@@ -120,15 +123,18 @@ def bit_identical(t: Path) -> None:
     for args in runs:
         a = subprocess.run([str(old), *args], capture_output=True, text=True)
         b = subprocess.run([str(new), *args], capture_output=True, text=True)
-        if a.returncode or b.returncode or a.stdout != b.stdout:
-            for x, y in zip(a.stdout.splitlines(), b.stdout.splitlines()):
+        def unaffected(trace):
+            return re.sub(r" a=[0-9a-f]{16} s=[0-9a-f]{16}", "", trace)
+        old_trace, new_trace = unaffected(a.stdout), unaffected(b.stdout)
+        if a.returncode or b.returncode or old_trace != new_trace:
+            for x, y in zip(old_trace.splitlines(), new_trace.splitlines()):
                 if x != y:
                     print("release: " + x + "\ncurrent: " + y, file=sys.stderr)
                     break
-            raise SystemExit("FAIL: single-player trace differs from 3.0.0")
+            raise SystemExit("FAIL: picture/battery/serial trace differs from 3.0.0")
         lines += a.stdout.count("\n")
-    print("bit-identical to 3.0.0 (%s): %d frame records (picture, sound, "
-          "state, battery), generated ROM%s" % (
+    print("picture/battery/serial parity with 3.0.0 (%s): %d frame records, "
+          "generated ROM%s; audio/state use independent accuracy/replay oracles" % (
               GB_BASELINE[:7], lines,
               " + %d real ROMs x %s frames" % (len(roms), frames) if roms
               else "; set GBADHOC_GB_ROMS for real ones"))
@@ -166,7 +172,8 @@ def main() -> int:
              inst_a, inst_b, str(shared), "-lm"])
         run([str(t / "dual")], asan)
 
-        bit_identical(t)
+        baseline_picture_battery(t)
+        run(["python3", "gbcore/tests/run_accuracy.py", "--focused"])
 
         # The link session protocol (fe_gblink): both consoles' complete
         # stacks in one process over a simulated network, on generated

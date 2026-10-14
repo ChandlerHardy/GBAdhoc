@@ -16,6 +16,9 @@
 static me_mbox __attribute__((aligned(64))) g_mbox_storage;
 static volatile me_mbox *g_mb;          /* uncached alias, NULL = ME down */
 static SceUID g_me_modid = -1;
+/* A timeout does not cancel an ME command. Keep benchmark buffers until a
+ * successful module_stop has physically reset the second core. */
+static void *g_me_bench_retained[2];
 
 /* Watchdog state (ADR-0080: the fallback is the feature — the main-CPU
  * path is never removed, the ME merely earns frames while healthy). */
@@ -25,6 +28,11 @@ static unsigned g_me_last_beat, g_me_beat_stale;
 int me_host_up(void)
 {
    return g_mb != NULL && !g_me_dead;
+}
+
+int me_host_loaded(void)
+{
+   return g_me_modid >= 0;
 }
 
 /* 1 when the watchdog gave up on the engine this session: whatever state the
@@ -48,6 +56,10 @@ int me_host_init(const char *base_dir)
    unsigned int arg[2];
    SceUID mod;
    int st, i;
+
+   /* Never clear a mailbox that a prior, unhealthy module may still use. */
+   if (me_host_loaded())
+      return -1;
 
    memset(&g_mbox_storage, 0, sizeof(g_mbox_storage));
    sceKernelDcacheWritebackInvalidateRange(&g_mbox_storage,
@@ -96,6 +108,7 @@ int me_host_init(const char *base_dir)
          g_mb = mb;
          g_me_misses = g_me_dead = 0;
          g_me_last_beat = mb->heartbeat;
+         g_me_beat_stale = 0;
          fe_evt("me_init state=up beat=%u", mb->heartbeat);
          return 0;
       }
@@ -120,9 +133,27 @@ void me_host_shutdown(void)
 {
    if (g_me_modid >= 0)
    {
-      int st;
-      sceKernelStopModule(g_me_modid, 0, NULL, &st, NULL);
-      sceKernelUnloadModule(g_me_modid);
+      int st = -1;
+      int rc = sceKernelStopModule(g_me_modid, 0, NULL, &st, NULL);
+      if (rc < 0 || st < 0)
+      {
+         g_me_dead = 1;
+         fe_evt("me_stop failed rc=0x%08X status=0x%08X buffers_retained=1",
+                (unsigned)rc, (unsigned)st);
+         return;
+      }
+      /* module_stop holds the ME in reset: even a delayed command or dirty
+       * cache line can no longer touch these quarantined allocations. */
+      free(g_me_bench_retained[0]); g_me_bench_retained[0] = NULL;
+      free(g_me_bench_retained[1]); g_me_bench_retained[1] = NULL;
+      g_mb = NULL;
+      rc = sceKernelUnloadModule(g_me_modid);
+      if (rc < 0)
+      {
+         g_me_dead = 1;
+         fe_evt("me_unload failed rc=0x%08X", (unsigned)rc);
+         return;
+      }
       g_me_modid = -1;
    }
    g_mb = NULL;
@@ -322,8 +353,11 @@ int me_host_bench(unsigned len, unsigned iters)
             sceKernelDelayThread(200);
             if (++spins > 25000)
             {
-               fe_evt("me_bench mode=%u TIMEOUT — ME wedged, killing", mode);
+               fe_evt("me_bench mode=%u TIMEOUT buffers_retained=1", mode);
                g_me_dead = 1;
+               g_me_bench_retained[0] = src;
+               g_me_bench_retained[1] = dst;
+               src = dst = NULL;
                rc = -1;
                goto out;
             }

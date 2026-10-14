@@ -188,6 +188,7 @@ u32 update_input(void)
 
 bool input_check_savestate(const u8 *src)
 {
+  if (!bson_contains_key(src, "input", BSON_TYPE_DOC)) return false;
   const u8 *p = bson_find_key(src, "input");
   u32 value;
   static const char *const optional[] = {

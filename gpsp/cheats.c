@@ -18,6 +18,9 @@
  */
 
 #include "common.h"
+#ifdef GPSP_CHEATS
+#include "cheat_format.h"
+#endif
 
 typedef struct
 {
@@ -42,6 +45,8 @@ typedef struct
   /* Records live in one shared pool (cheat_pool): a cheat is as long as it
    * needs to be, and sixty short ones cost what sixty short ones cost. */
   cheat_rec *codes;
+  bool gs_format;              /* private normalized GS/AR record stream */
+  unsigned work;            /* worst-case reads/writes per frame */
 #else
   cheat_rec codes[MAX_CHEAT_CODES];
 #endif
@@ -84,6 +89,7 @@ u32 cheat_master_hook = 0xffffffff;
  * Reads are plain RAM reads: no I/O side effects, no ROM page faults. */
 static cheat_rec cheat_pool[CHEAT_POOL_RECORDS];
 static unsigned cheat_pool_used;
+static unsigned cheat_work_used;
 u32 cheats_active;
 u32 cheats_suspended;
 u32 cheat_ram_flushes;
@@ -378,6 +384,8 @@ void process_cheats(void)
 {
 }
 
+static void process_cheat_gs(const cheat_type *ch);
+
 /* The one place codes run (libretro.c retro_run, before the CPU).  A pure
  * function of three things: the active codes, guest work RAM, and this
  * frame's KEYINPUT -- so the same emulated frame always gets the same patch
@@ -387,12 +395,17 @@ void cheats_apply_frame(void)
    u32 i;
    u16 pad = 0x3ff ^ read_ioreg(REG_P1);
 
+   if (cheats_suspended)
+      return;
    cheat_smc_pending = 0;
    for (i = 0; i <= max_cheat && i < MAX_CHEATS; i++)
    {
       if (!cheats[i].cheat_active)
          continue;
-      process_cheat_codebreaker(&cheats[i], pad);
+      if (cheats[i].gs_format)
+         process_cheat_gs(&cheats[i]);
+      else
+         process_cheat_codebreaker(&cheats[i], pad);
    }
 #ifdef HAVE_DYNAREC
    /* A code changed bytes the dynarec has translated.  The same full RAM
@@ -435,6 +448,7 @@ void cheat_clear()
 #ifdef GPSP_CHEATS
    cheats_active = 0;
    cheat_pool_used = 0;
+   cheat_work_used = 0;
 #endif
 }
 
@@ -548,15 +562,17 @@ cheat_error cheat_parse(unsigned index, const char *code)
  * Upstream's parser replaced every non-hex character with a space and then
  * scanned "%08x %04hx" at a fixed 13-character stride, so a GameShark/AR code
  * ("XXXXXXXX YYYYYYYY") was accepted and run as two garbage CodeBreaker
- * records.  This one tokenises, and accepts exactly:
+ * records. This one tokenises, with explicit tagged families in cheats_gs.h:
  *
  *   CodeBreaker   "AAAAAAAA VVVV"  (or the 12 digits run together)
  *   raw write     "AAAAAAAA:VV" / ":VVVV" / ":VVVVVVVV" -- 8, 16, 32 bits
+ *   GS1:/AR3:     encrypted 8+8 pairs; GS1RAW:/AR3RAW: decrypted pairs
  *
  * Codes are separated by whitespace, '+', ',' or ';' (libretro .cht joins
- * lines with '+').  One cheat is all CodeBreaker or all raw.  Raw writes are
+ * lines with '+'). One cheat has one family. Colon-style raw writes are
  * compiled to CodeBreaker records (8-bit -> type 3, 16-bit -> type 8, 32-bit
- * -> two type 8), so there is one interpreter and one set of accessors.
+ * -> two type 8). Tagged GS/AR uses private normalized records; both
+ * interpreters share the same RAM-only accessors and per-frame work budget.
  *
  * Then every CodeBreaker opcode is checked against the GPSP_CHEATS rules:
  * fixed addresses in EWRAM/IWRAM, 16/32-bit accesses aligned, encrypted
@@ -573,10 +589,12 @@ const char *cheat_error_name(cheat_error e)
    case CheatErrorEncrypted:    return "encrypted CodeBreaker";
    case CheatErrorNotSupported: return "incomplete code";
    case CheatErrorSyntax:       return "not a code";
-   case CheatErrorGameShark:    return "GameShark / Action Replay";
+   case CheatErrorGameShark:    return "choose GS1: or AR3:";
    case CheatErrorRegion:       return "not a RAM code";
    case CheatErrorAlign:        return "odd address";
    case CheatErrorMixed:        return "mixed formats";
+   case CheatErrorUnsupported:  return "unsupported GS/AR code";
+   case CheatErrorWork:         return "too much work per frame";
    }
    return "?";
 }
@@ -654,8 +672,10 @@ static int cheat_in_ram(u32 address)
    return r == 0x2 || r == 0x3;
 }
 
+#include "cheats_gs.h"
+
 #define CHEAT_SLIDE_MAX 4096u
-static cheat_error cheat_validate(const cheat_type *ch)
+static cheat_error cheat_validate(cheat_type *ch)
 {
    unsigned i, len;
    for (i = 0; i < ch->cheat_count; i += len)
@@ -663,6 +683,7 @@ static cheat_error cheat_validate(const cheat_type *ch)
       u32 code = ch->codes[i].address;
       u32 address = code & 0xfffffff;
       u32 opcode = code >> 28;
+      unsigned work = 1;
       len = codebreaker_code_len(ch, i);
       if (len > ch->cheat_count - i)
          return CheatErrorNotSupported;     /* truncated slide/super payload */
@@ -699,6 +720,16 @@ static cheat_error cheat_validate(const cheat_type *ch)
             return CheatErrorNotSupported;
          break;
       }
+      switch (opcode)
+      {
+      case 0: case 1: case 13: work = 0; break;
+      case 2: case 6: case 14: work = 2; break;
+      case 4: work = ch->codes[i + 1].address & 0xFFFF; break;
+      case 5: work = (unsigned)(u16)ch->codes[i].value * 2; break;
+      }
+      if (work > CHEAT_FRAME_MAX - cheat_work_used - ch->work)
+         return CheatErrorWork;
+      ch->work += work;
    }
    return CheatNoError;
 }
@@ -712,8 +743,15 @@ static cheat_error cheat_compile(cheat_type *ch, const char *code)
    int kind = 0;   /* 1 CodeBreaker, 2 raw */
 
    ch->cheat_count = 0;
+   ch->gs_format = false;
+   ch->work = 0;
    if (!code)
       return CheatErrorSyntax;
+   while (*s && cheat_is_sep(*s)) s++;
+   {
+      unsigned used, family = cheat_family_prefix(s, (unsigned)strlen(s), &used);
+      if (family) return cheat_gs_compile(ch, s + used, family);
+   }
    while (cheat_token(&s, &t, &n))
    {
       const char *colon = (const char *)memchr(t, ':', n);
@@ -811,6 +849,7 @@ cheat_error cheat_parse(unsigned index, const char *code)
       return err;
    }
    cheat_pool_used += ch->cheat_count;
+   cheat_work_used += ch->work;
    ch->cheat_active = true;
    cheats_recount();
    return CheatNoError;

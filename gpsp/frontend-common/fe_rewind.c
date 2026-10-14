@@ -27,6 +27,7 @@ static struct
 {
    fe_rewind_config cfg;
    int       ready;
+   int       fault;          /* failed restore: no replay/play until reset */
 
    uint32_t *ref;          /* the reference image: the newest snapshot */
    uint32_t  state_bytes;  /* the spans end to end */
@@ -45,6 +46,7 @@ static struct
    uint32_t  rec_cap, rec_tail, rec_n;
 
    uint16_t *log;          /* input of frame f at log[f & log_mask] */
+   uint64_t *context;      /* optional external input, same frame/lifetime */
    uint32_t  log_mask;
 
    uint32_t  mach;         /* frame the machine is at */
@@ -320,17 +322,25 @@ static int step_back(void)
 }
 
 /* The machine := the snapshot in ref. */
-static void restore_ref(void)
+static int restore_ref(void)
 {
    uint64_t t0 = now_us();
    fe_rewind_pack();
-   rw.cfg.restore(rw.ref, rw.state_bytes);
+   if (rw.cfg.restore(rw.ref, rw.state_bytes) != 0)
+   {
+      /* A loader may have rejected or partly consumed the image. Pretending
+       * it is the reference can resume a save sequence with unrelated RAM. */
+      rw.fault = 1;
+      rw.st.anomalies++;
+      return -1;
+   }
    rw.tainted = 0;
    rw.ref_moved = 0;
    rw.mach = rw.ref_frame;
    rw.st.restores++;
    rw.tick_restores++;
    stat_add(t0, &rw.st.restore_us, &rw.st.restore_max_us, NULL);
+   return 0;
 }
 
 static int snapshot_due(void)
@@ -439,6 +449,7 @@ size_t fe_rewind_mem_bytes(const fe_rewind_config *c)
           (c->ring_mem ? 0 : align8(c->ring_bytes)) +
           align8((size_t)rec_cap_of(c) * sizeof(fe_rewind_rec)) +
           align8((size_t)pow2_up(c->max_frames) * 2) + 2 * seg_bytes(c) +
+          (c->frame_context ? (size_t)pow2_up(c->max_frames) * 8 : 0) +
           align8((size_t)c->audio_cap * 4);
 }
 
@@ -451,7 +462,8 @@ int fe_rewind_init(const fe_rewind_config *c, void *mem, size_t mem_bytes)
 
    memset(&rw, 0, sizeof(rw));
    if (!need || !mem || mem_bytes < need || !c->gather || !c->restore ||
-       !c->run || c->ring_bytes < 64 || !c->frame_pixels)
+       !c->run || c->ring_bytes < 64 || !c->frame_pixels ||
+       (!!c->frame_context != !!c->replay_context))
       return -1;
    /* Without pacing a snapshot falls every `interval` frames; a platform
     * that uses fe_rewind_hint_busy sets max_span itself. */
@@ -495,6 +507,11 @@ int fe_rewind_init(const fe_rewind_config *c, void *mem, size_t mem_bytes)
    p += align8((size_t)rw.rec_cap * sizeof(fe_rewind_rec));
    rw.log = (uint16_t *)p;  p += align8((size_t)rw.cfg.max_frames * 2);
    rw.log_mask = rw.cfg.max_frames - 1;
+   if (c->frame_context)
+   {
+      rw.context = (uint64_t *)p;
+      p += (size_t)rw.cfg.max_frames * 8;
+   }
    for (s = 0; s < 2; s++)
    {
       p = (uint8_t *)mem + align64((size_t)(p - (uint8_t *)mem));
@@ -516,6 +533,7 @@ void fe_rewind_reset(uint32_t frame)
 {
    if (!rw.ready)
       return;
+   rw.fault = 0;
    rw.have_ref = 0;
    rw.pack_pending = 0;
    rw.ref_moved = 0;
@@ -682,6 +700,9 @@ static void run_logged(rw_seg *s, int masked)
    uint64_t t0 = now_us();
    int pictured = 0;
 
+   if (rw.context)
+      rw.cfg.replay_context(rw.context[f & rw.log_mask]);
+
    if (s && s->valid && rw.mach == s->start + s->done && s->done < s->span)
    {
       uint32_t i = s->done, n = 0;
@@ -770,7 +791,7 @@ int fe_rewind_play_slot(uint16_t **pix, int16_t **aud)
    rw_seg *w;
    uint32_t i;
 
-   if (!rw.ready || !rw.have_ref || rw.mach != rw.now || rw.tainted)
+   if (!rw.ready || rw.fault || !rw.have_ref || rw.mach != rw.now || rw.tainted)
       return 0;
    snapshot_if_due();           /* a boundary a rewind stopped exactly on */
    w = seg_for(rw.mach + 1);
@@ -796,6 +817,8 @@ void fe_rewind_frame(uint32_t input, uint32_t aud_n)
       rw.mach++;
       rw.now = rw.top = rw.mach;
       rw.log[rw.mach & rw.log_mask] = (uint16_t)(input & ~FE_RW_IN_CHANGE);
+      if (rw.context)
+         rw.context[rw.mach & rw.log_mask] = rw.cfg.frame_context();
       rw.floor = rw.mach - 1;
       rw.last_change = rw.mach;
       fe_rewind_gather();
@@ -814,6 +837,8 @@ void fe_rewind_frame(uint32_t input, uint32_t aud_n)
    rw.now = rw.top = rw.mach;
    rw.gesture = 0;
    rw.log[rw.mach & rw.log_mask] = (uint16_t)(input & ~FE_RW_IN_CHANGE);
+   if (rw.context)
+      rw.context[rw.mach & rw.log_mask] = rw.cfg.frame_context();
    /* Play has gone on from here: whatever was changed in a future that was
     * abandoned stays changed (min), and so does what this frame changed. */
    if (rw.last_change > rw.mach - 1)
@@ -972,7 +997,8 @@ static void held_work(int eager)
          x->valid = 0;
          return;
       }
-      restore_ref();
+      if (restore_ref() != 0)
+         return;
    }
    /* (a tick that restored runs a frame as well only if both fit) */
    for (k = 0; k < rw.cfg.burst && x->done < x->span &&
@@ -1020,7 +1046,8 @@ static void release_work(void)
          rw.st.anomalies++;
          rw.now = rw.ref_frame;
       }
-      restore_ref();
+      if (restore_ref() != 0)
+         return;
    }
    for (k = 0; k < rw.cfg.burst && rw.mach < rw.now && (!k || tick_room(1)); k++)
    {
@@ -1043,6 +1070,9 @@ int fe_rewind_tick_step(int held, uint32_t step, fe_rewind_shown *out,
 
    if (stepped)
       *stepped = 0;
+
+   if (rw.fault)
+      return FE_RW_ERROR;
 
    if (!rw.ready || !rw.have_ref)
       return FE_RW_PLAY;               /* no history: the control does nothing */
@@ -1156,7 +1186,7 @@ counted:
             rw.st.engage_max_us = d;
       }
    }
-   return r;
+   return rw.fault ? FE_RW_ERROR : r;
 }
 
 /* ---------------------------------------------------------------- facts -- */
@@ -1167,7 +1197,8 @@ counted:
  * the rewind began at is the present: always fine. */
 int fe_rewind_mach_noland(void)
 {
-   return rw.ready && rw.have_ref && rw.mach != rw.top && noland(rw.mach);
+   return rw.fault ||
+          (rw.ready && rw.have_ref && rw.mach != rw.top && noland(rw.mach));
 }
 
 int fe_rewind_active(void)

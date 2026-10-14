@@ -43,6 +43,9 @@ int snd_que_count;
 int snd_bef_clock;
 char snd_b_lowpass;
 byte snd_mem[0x100];
+
+/* GBAdhoc: independently clocked register and synthesis state. */
+#include "apu_timing.h"
 char snd_b_enable[4];
 
 
@@ -57,51 +60,23 @@ void apu_reset()
 	snd_reset();
 }
 
+/* GBAdhoc: NR52 reports channel activity, independent of volume/panning. */
 byte apu_read(word adr)
 {
-	if (adr==0xff26)
-		return (!snd_stat.master_enable)?0x00:
-				(0x80|(((snd_stat.sq1_playing&&snd_stat.wav_vol)?1:0)|
-					((snd_stat.sq2_playing&&snd_stat.wav_vol)?2:0)|
-					((snd_stat.wav_enable&&snd_stat.wav_playing&&snd_stat.wav_vol)?4:0)|
-					((snd_stat.noi_playing&&snd_stat.noi_vol)?8:0)));
-	else
-		return snd_mem[adr-0xff10];
+	apu_update();
+	if (adr == 0xff26)
+		return 0x70 | (snd_stat.master_enable ? 0x80 : 0) |
+			(snd_stat.sq1_playing ? 1 : 0) | (snd_stat.sq2_playing ? 2 : 0) |
+			(snd_stat.wav_playing ? 4 : 0) | (snd_stat.noi_playing ? 8 : 0);
+	return snd_mem[adr - 0xff10];
 }
 
-void apu_write(word adr,byte dat,int clock)
+void apu_write(word adr, byte dat, int clock)
 {
-//	static int bef_clock=clock;
-	int bef_clock=clock;
-	static int clocks=0;
-
-	//snd_mem[adr-0xFF10]=dat;
-
-	snd_write_que[snd_que_count].adr=adr;
-	snd_write_que[snd_que_count].dat=dat;
-	snd_write_que[snd_que_count++].clock=clock;
-
-	if (snd_que_count>=SND_QUE_SIZE)
-		snd_que_count=SND_QUE_SIZE-1;
-
-	snd_process(adr,dat);
-
-	if (bef_clock>clock)
-		bef_clock=clock;
-
-	clocks+=clock-bef_clock;
-
-	while (clocks>CLOKS_PER_INTERVAL*(cpu_get_speed()?2:1)){
-		if( snd_stat.master_enable )
-			snd_update();
-		clocks-=CLOKS_PER_INTERVAL*(cpu_get_speed()?2:1);
-	}
-
-	bef_clock=clock;
-}
-
-void apu_update()
-{
+	(void)clock;
+	apu_update();
+	apu_enqueue(adr, dat);
+	snd_process(adr, dat);
 }
 
 struct apu_stat *apu_get_stat_cpu()
@@ -131,6 +106,15 @@ void snd_reset()
 {
 	snd_que_count=0;
 	snd_bef_clock=0;
+	/* GBAdhoc: reset both sequencers and register images, including reuse. */
+	memset(&cpu_timing, 0, sizeof(cpu_timing));
+	memset(&gen_timing, 0, sizeof(gen_timing));
+	apu_timer = &cpu_timing;
+	apu_cpu_clock = cpu_get_clock(); apu_time = gen_time = 0;
+	memset(snd_mem, 0, sizeof(snd_mem));
+	sq1_cur_pos = sq2_cur_pos = wav_cur_pos = noi_cur_pos = 0;
+	sq1_sample = sq2_sample = wav_index = wav_sample = noise_index = 0;
+	noi_sample = 10000;
 	memset(&snd_stat,0,sizeof(snd_stat));
 	snd_stat.sq1_playing=false;
 	snd_stat.sq2_playing=false;
@@ -149,9 +133,10 @@ void snd_reset()
 	byte gbc_init_wav[]={0x00,0xFF,0x00,0xFF,0x00,0xFF,0x00,0xFF,0x00,0xFF,0x00,0xFF,0x00,0xFF,0x00,0xFF};
 
 	if (rom_get_info()->gb_type<=2) // 初期型GB & SGB
-		memcpy(snd_mem+20,gb_init_wav,16);
+		memcpy(snd_mem+0x20,gb_init_wav,16);
 	else if (rom_get_info()->gb_type>=3) // GBC
-		memcpy(snd_mem+20,gbc_init_wav,16);
+		memcpy(snd_mem+0x20,gbc_init_wav,16);
+	memcpy(gen_mem, snd_mem, sizeof(gen_mem));
 }
 
 void snd_set_enable(int ch,char enable)
@@ -212,10 +197,24 @@ void snd_process(word adr,byte dat)
 	};
 
 
+	/* GBAdhoc: DIV reset is an ordered event in the audio queue too. */
+	if (adr == 0xff04) {
+		if (apu_timer->phase & 4096) snd_update();
+		apu_timer->phase = 0;
+		return;
+	}
+	/* Power-off leaves wave RAM writable; monochrome length loads survive. */
+	if (!snd_stat.master_enable && adr < 0xff30 && adr != 0xff26) {
+		if (now_gb_mode >= 3 || (adr != 0xff11 && adr != 0xff16 && adr != 0xff1b && adr != 0xff20))
+			return;
+		if (adr == 0xff11 || adr == 0xff16) dat &= 0x3f;
+	}
 	snd_mem[adr-0xFF10]=dat;
 
 	switch(adr){
 	case 0xFF10:
+		/* GBAdhoc: leaving negate after a subtraction disables sweep. */
+		if (apu_timer->sweep_negated && !(dat & 8)) snd_stat.sq1_playing = false;
 		snd_stat.sq1_sw_time=(dat>>4)&7;
 		snd_stat.sq1_sw_dir=(dat>>3)&1;
 		snd_stat.sq1_sw_shift=dat&7;
@@ -230,6 +229,8 @@ void snd_process(word adr,byte dat)
 		snd_stat.sq1_vol=snd_stat.sq1_init_vol;
 		snd_stat.sq1_env_dir=(dat>>3)&1;
 		snd_stat.sq1_env_speed=dat&7;
+		/* GBAdhoc: DAC enable is NRx2 bits 3-7, not current volume. */
+		if (!(dat & 0xf8)) snd_stat.sq1_playing = false;
 		break;
 	case 0xFF13:
 		snd_stat.sq1_init_freq&=0x700;
@@ -240,12 +241,20 @@ void snd_process(word adr,byte dat)
 		snd_stat.sq1_init_freq&=0xFF;
 		snd_stat.sq1_init_freq|=((dat&7)<<8);
 		snd_stat.sq1_freq=snd_stat.sq1_init_freq;
+		/* GBAdhoc: extra length clock when enabling on a non-length step. */
+		if (!snd_stat.sq1_hold && (dat & 0x40) && (apu_timer->step & 1) && snd_stat.sq1_len > 0 && --snd_stat.sq1_len == 0)
+			snd_stat.sq1_playing = false;
 		snd_stat.sq1_hold=(dat>>6)&1;
 		if (dat&0x80){
-			snd_stat.sq1_playing=true;
+			snd_stat.sq1_playing=!!(snd_mem[2] & 0xf8);
 			snd_stat.sq1_vol=snd_stat.sq1_init_vol;
-			snd_stat.sq1_len=snd_stat.sq1_init_len;
-			if ((!snd_stat.sq1_playing)||(!snd_stat.sq1_vol)) sq1_cur_pos=0;
+			apu_timer->envelope[0] = snd_stat.sq1_env_speed ? snd_stat.sq1_env_speed : 8;
+			if (!snd_stat.sq1_len) snd_stat.sq1_len = 64 - (snd_stat.sq1_hold && (apu_timer->step & 1));
+			apu_timer->sweep_shadow = snd_stat.sq1_freq;
+			apu_timer->sweep_timer = snd_stat.sq1_sw_time ? snd_stat.sq1_sw_time : 8;
+			apu_timer->sweep_enabled = !!(snd_stat.sq1_sw_time || snd_stat.sq1_sw_shift);
+			apu_timer->sweep_negated = 0;
+			if (snd_stat.sq1_sw_shift) sweep_calculate();
 		}
 		break;
 	case 0xFF16:
@@ -258,6 +267,8 @@ void snd_process(word adr,byte dat)
 		snd_stat.sq2_vol=snd_stat.sq2_init_vol;
 		snd_stat.sq2_env_dir=(dat>>3)&1;
 		snd_stat.sq2_env_speed=dat&7;
+		/* GBAdhoc: DAC enable is NRx2 bits 3-7, not current volume. */
+		if (!(dat & 0xf8)) snd_stat.sq2_playing = false;
 		break;
 	case 0xFF18:
 		snd_stat.sq2_init_freq&=0x700;
@@ -268,24 +279,26 @@ void snd_process(word adr,byte dat)
 		snd_stat.sq2_init_freq&=0xFF;
 		snd_stat.sq2_init_freq|=((dat&7)<<8);
 		snd_stat.sq2_freq=snd_stat.sq2_init_freq;
+		/* GBAdhoc: extra length clock when enabling on a non-length step. */
+		if (!snd_stat.sq2_hold && (dat & 0x40) && (apu_timer->step & 1) && snd_stat.sq2_len > 0 && --snd_stat.sq2_len == 0)
+			snd_stat.sq2_playing = false;
 		snd_stat.sq2_hold=(dat>>6)&1;
 		if (dat&0x80){
-			if ((!snd_stat.sq2_playing)||(!snd_stat.sq2_vol)) sq2_cur_pos=0;
-			snd_stat.sq2_playing=true;
+
+			snd_stat.sq2_playing=!!(snd_mem[7] & 0xf8);
 			snd_stat.sq2_vol=snd_stat.sq2_init_vol;
-			snd_stat.sq2_len=snd_stat.sq2_init_len;
+			apu_timer->envelope[1] = snd_stat.sq2_env_speed ? snd_stat.sq2_env_speed : 8;
+			if (!snd_stat.sq2_len) snd_stat.sq2_len = 64 - (snd_stat.sq2_hold && (apu_timer->step & 1));
 		}
 		break;
 	case 0xFF1A:
 		snd_stat.wav_enable=dat>>7;
+		if (!snd_stat.wav_enable) snd_stat.wav_playing = false; /* GBAdhoc: DAC off */
 		break;
 	case 0xFF1B:
 		snd_stat.wav_init_len=(256-dat);
 		snd_stat.wav_len=snd_stat.wav_init_len;
-		if ((snd_stat.wav_len&&dat)||!snd_stat.wav_hold)
-			snd_stat.wav_playing=true;
-		else
-			snd_stat.wav_playing=false;
+		/* GBAdhoc: loading a length alone never triggers a channel. */
 		break;
 	case 0xFF1C:
 		snd_stat.wav_vol=tb[(dat>>5)&3];
@@ -300,11 +313,14 @@ void snd_process(word adr,byte dat)
 	case 0xFF1E:
 		snd_stat.wav_freq&=0xFF;
 		snd_stat.wav_freq|=((dat&7)<<8);
+		/* GBAdhoc: extra length clock when enabling on a non-length step. */
+		if (!snd_stat.wav_hold && (dat & 0x40) && (apu_timer->step & 1) && snd_stat.wav_len > 0 && --snd_stat.wav_len == 0)
+			snd_stat.wav_playing = false;
 		snd_stat.wav_hold=(dat>>6)&1;
 		if (dat&0x80){
-			snd_stat.wav_len=snd_stat.wav_init_len;
-			snd_stat.wav_playing=true;
-			if (!snd_stat.wav_playing) wav_cur_pos=0;
+			if (!snd_stat.wav_len) snd_stat.wav_len = 256 - (snd_stat.wav_hold && (apu_timer->step & 1));
+			snd_stat.wav_playing=!!snd_stat.wav_enable;
+			if (apu_timer == &gen_timing) { wav_cur_pos = 0; wav_index = 0; }
 		}
 		break;
 	case 0xFF20://noi len
@@ -318,24 +334,28 @@ void snd_process(word adr,byte dat)
 		snd_stat.noi_vol=snd_stat.noi_init_vol;
 		snd_stat.noi_env_dir=(dat>>3)&1;
 		snd_stat.noi_env_speed=dat&7;
-		if (snd_stat.noi_vol==0)
-			snd_stat.noi_playing=false;
+		/* GBAdhoc: DAC enable is NRx2 bits 3-7, not current volume. */
+		if (!(dat & 0xf8)) snd_stat.noi_playing = false;
+
 		break;
 	case 0xFF22://noi freq
 		snd_stat.noi_init_freq= noi_freq_tbl[ dat ] ; //4194304*mul_t[dat&7]/div_t[dat&7]/div_t2[(dat>>4)&15]/8;
 		snd_stat.noi_freq=snd_stat.noi_init_freq;
 		snd_stat.noi_step=(dat&8)?7:15;
 
-		if ((dat>>6)==3)
-			snd_stat.noi_playing=false;
+
 		break;
 	case 0xFF23://noi kick
+		/* GBAdhoc: extra length clock when enabling on a non-length step. */
+		if (!snd_stat.noi_hold && (dat & 0x40) && (apu_timer->step & 1) && snd_stat.noi_len > 0 && --snd_stat.noi_len == 0)
+			snd_stat.noi_playing = false;
 		snd_stat.noi_hold=(dat>>6)&1;
 		if (dat&0x80){
-			snd_stat.noi_playing=true;
-			snd_stat.noi_len=snd_stat.noi_init_len;
+			snd_stat.noi_playing=!!(snd_mem[0x11] & 0xf8);
+			if (!snd_stat.noi_len) snd_stat.noi_len = 64 - (snd_stat.noi_hold && (apu_timer->step & 1));
 			snd_stat.noi_vol=snd_stat.noi_init_vol;
-			if ((!snd_stat.noi_playing)||(!snd_stat.noi_vol)) noi_cur_pos=0;
+			apu_timer->envelope[2] = snd_stat.noi_env_speed ? snd_stat.noi_env_speed : 8;
+			if (apu_timer == &gen_timing) { noi_cur_pos = 0; noise_index = 0; }
 		}
 		break;
 	case 0xFF24:
@@ -357,12 +377,27 @@ void snd_process(word adr,byte dat)
 //		voice_kind_count++;
 		break;
 	case 0xFF26:
-		snd_stat.master_enable=dat&0x80;
-
-		snd_stat.ch_on[0]=dat&1;
-		snd_stat.ch_on[1]=dat&2;
-		snd_stat.ch_on[2]=dat&4;
-		snd_stat.ch_on[3]=dat&8;
+		/* GBAdhoc: low status bits are read-only; power off clears channels. */
+		if (!(dat & 0x80)) {
+			int lens[4] = {snd_stat.sq1_len, snd_stat.sq2_len, snd_stat.wav_len, snd_stat.noi_len};
+			memset(&snd_stat, 0, sizeof(snd_stat));
+			memset(snd_mem, 0, 0x20);
+			if (now_gb_mode < 3) {
+				snd_stat.sq1_len=lens[0]; snd_stat.sq2_len=lens[1];
+				snd_stat.wav_len=lens[2]; snd_stat.noi_len=lens[3];
+			}
+		} else if (!snd_stat.master_enable) {
+			apu_timer->step = 0;
+			memset(apu_timer->envelope, 0, sizeof(apu_timer->envelope));
+			apu_timer->sweep_enabled = 0;
+			if (apu_timer == &gen_timing) {
+				sq1_cur_pos = sq2_cur_pos = wav_cur_pos = noi_cur_pos = 0;
+				sq1_sample = sq2_sample = wav_index = wav_sample = noise_index = 0;
+			}
+		}
+		snd_stat.master_enable = dat & 0x80;
+		snd_mem[0x16] = dat & 0x80;
+		snd_stat_upd = 1;
 		break;
 	}
 
@@ -385,7 +420,7 @@ static const int sq_wav_dat[4][8]={
 
 inline short snd_sq1_produce(int freq)
 {
-	static dword cur_sample=0;
+
 //	dword cur_freq;
 	short ret;
 
@@ -393,18 +428,18 @@ inline short snd_sq1_produce(int freq)
 		return 15000;
 
 	if (freq){
-		ret=sq_wav_dat[snd_stat.sq1_type][cur_sample];
+		ret=sq_wav_dat[snd_stat.sq1_type][sq1_sample];
 /*		cur_freq=((freq*8)>0x10000)?0xffff:freq*8;
 		sq1_cur_pos+=(cur_freq<<16)/44100;
 		if (sq1_cur_pos&0xffff0000){
-			cur_sample=(cur_sample+(sq1_cur_pos>>16))&7;
+			sq1_sample=(sq1_sample+(sq1_cur_pos>>16))&7;
 			sq1_cur_pos&=0xffff;
 		}*/
 		/* GBAdhoc: unsigned shift (freq<<16 overflowed int above 32767 Hz)
 		 * and the configured rate. */
 		sq1_cur_pos+=(((dword)freq)<<16)/snd_rate;		//扱いを若干変更したので、関連で変更が必要になってるかも。詳細未確認 - LCK
 		if (sq1_cur_pos&0xffffe000){
-			cur_sample=(cur_sample+(sq1_cur_pos>>13))&7;
+			sq1_sample=(sq1_sample+(sq1_cur_pos>>13))&7;
 			sq1_cur_pos&=0x1fff;
 		}
 	}
@@ -416,7 +451,7 @@ inline short snd_sq1_produce(int freq)
 
 inline short snd_sq2_produce(int freq)
 {
-	static dword cur_sample=0;
+
 //	dword cur_freq;
 	short ret;
 
@@ -424,16 +459,16 @@ inline short snd_sq2_produce(int freq)
 		return 15000;
 
 	if (freq){
-		ret=sq_wav_dat[snd_stat.sq2_type][cur_sample];
+		ret=sq_wav_dat[snd_stat.sq2_type][sq2_sample];
 /*		cur_freq=((freq*8)>0x10000)?0xffff:freq*8;
 		sq2_cur_pos+=(cur_freq<<16)/44100;
 		if (sq2_cur_pos&0xffff0000){
-			cur_sample=(cur_sample+(sq2_cur_pos>>16))&7;
+			sq2_sample=(sq2_sample+(sq2_cur_pos>>16))&7;
 			sq2_cur_pos&=0xffff;
 		}*/
 		sq2_cur_pos+=(((dword)freq)<<16)/snd_rate;
 		if (sq2_cur_pos&0xffffe000){
-			cur_sample=(cur_sample+(sq2_cur_pos>>13))&7;
+			sq2_sample=(sq2_sample+(sq2_cur_pos>>13))&7;
 			sq2_cur_pos&=0x1fff;
 		}
 	}
@@ -445,8 +480,8 @@ inline short snd_sq2_produce(int freq)
 
 inline short snd_wav_produce(int freq)
 {
-	static dword cur_pos2=0;
-	static byte cur_sample=0;	/* GBAdhoc: unused bef_sample removed */
+
+		/* GBAdhoc: unused bef_sample removed */
 	dword cur_freq;
 	short ret;
 
@@ -454,17 +489,17 @@ inline short snd_wav_produce(int freq)
 		return (snd_mem[0x20]>>4)*4000-30000;
 
 	if (freq){
-		ret=cur_sample*2500-15000;
+		ret=wav_sample*2500-15000;
 
 		cur_freq=(freq>0x10000)?0xffff:freq;
 		wav_cur_pos+=(cur_freq<<16)/snd_rate;
 		if (wav_cur_pos&0xffff0000){
 
-			cur_pos2=(cur_pos2+(wav_cur_pos>>16))&31;
-			if (cur_pos2&1)
-				cur_sample=snd_mem[0x20+cur_pos2/2]&0xf;
+			wav_index=(wav_index+(wav_cur_pos>>16))&31;
+			if (wav_index&1)
+				wav_sample=snd_mem[0x20+wav_index/2]&0xf;
 			else
-				cur_sample=snd_mem[0x20+cur_pos2/2]>>4;
+				wav_sample=snd_mem[0x20+wav_index/2]>>4;
 			wav_cur_pos&=0xffff;
 		}
 	}
@@ -478,120 +513,53 @@ inline short snd_wav_produce(int freq)
 
 inline short snd_noi_produce(int freq)
 {
-	static int cur_sample=10000;
+
 	short ret;
 	int sc;
 	if (freq){
-		ret=cur_sample;
+		ret=noi_sample;
 		noi_cur_pos+=freq;
 		sc=0;
-		static int mrand_step = 0 ;
+
 		if( snd_stat.noi_step == 7 ){
 			while(noi_cur_pos>(dword)snd_rate){
 				if(sc==0)
-					cur_sample=(_mrand7[ mrand_step & MASK_MRAND ])?12000:-10000;
+					noi_sample=(_mrand7[ noise_index & MASK_MRAND ])?12000:-10000;
 				else
-					cur_sample+=(_mrand7[ mrand_step & MASK_MRAND ])?12000:-10000;
+					noi_sample+=(_mrand7[ noise_index & MASK_MRAND ])?12000:-10000;
 				noi_cur_pos-=snd_rate;
 				sc++;
-				mrand_step++ ;
+				noise_index++ ;
 			}
 		}else{
 			while(noi_cur_pos>(dword)snd_rate){
 				if(sc==0)
-					cur_sample=(_mrand15[ mrand_step & MASK_MRAND ])?12000:-10000;
+					noi_sample=(_mrand15[ noise_index & MASK_MRAND ])?12000:-10000;
 				else
-					cur_sample+=(_mrand15[ mrand_step & MASK_MRAND ])?12000:-10000;
+					noi_sample+=(_mrand15[ noise_index & MASK_MRAND ])?12000:-10000;
 				noi_cur_pos-=snd_rate;
 				sc++;
-				mrand_step++ ;
+				noise_index++ ;
 			}
 		}
 		if(sc > 0)
-			cur_sample /= sc;
+			noi_sample /= sc;
 	}else
 		ret=0;
 	return ret;
 }
 
-void snd_update()
-{
-	//このルーチンはcpu側とサウンド生成側で共用しているので、このcounterを共用するのは多分よくないと思われ。必要時に修正のこと  - LCK
-	static int counter=0;
-
-//	if( snd_stat.master_enable ){
-		if (snd_stat.sq1_playing){//&&snd_stat.master_enable){
-			if (snd_stat.sq1_env_speed&&(counter%(4*snd_stat.sq1_env_speed)==0)){
-				snd_stat.sq1_vol+=(snd_stat.sq1_env_dir?1:-1);
-				if (snd_stat.sq1_vol<0) snd_stat.sq1_vol=0;
-				if (snd_stat.sq1_vol>15) snd_stat.sq1_vol=15;
-			}
-			if (snd_stat.sq1_sw_time&&snd_stat.sq1_sw_shift&&(counter%(2*snd_stat.sq1_sw_time)==0)){
-				if (snd_stat.sq1_sw_dir)
-					snd_stat.sq1_freq=snd_stat.sq1_freq-(snd_stat.sq1_freq>>snd_stat.sq1_sw_shift);
-				else
-					snd_stat.sq1_freq=snd_stat.sq1_freq+(snd_stat.sq1_freq>>snd_stat.sq1_sw_shift);
-			}
-			if (snd_stat.sq1_hold&&snd_stat.sq1_len){
-				snd_stat.sq1_len--;
-				if (snd_stat.sq1_len<=0){
-					snd_stat.sq1_playing=false;
-				}
-			}
-		}
-
-		if (snd_stat.sq2_playing){//&&snd_stat.master_enable){
-			if (snd_stat.sq2_env_speed&&(counter%(4*snd_stat.sq2_env_speed)==0)){
-				snd_stat.sq2_vol+=(snd_stat.sq2_env_dir?1:-1);
-				if (snd_stat.sq2_vol<0) snd_stat.sq2_vol=0;
-				if (snd_stat.sq2_vol>15) snd_stat.sq2_vol=15;
-			}
-			if (snd_stat.sq2_hold&&snd_stat.sq2_len){
-				snd_stat.sq2_len--;
-				if (snd_stat.sq2_len<=0){
-					snd_stat.sq2_playing=false;
-				}
-			}
-		}
-
-		if (snd_stat.wav_playing){//&&snd_stat.master_enable){
-			if (snd_stat.wav_hold&&snd_stat.wav_len&&(counter%128==0)){
-				snd_stat.wav_len--;
-				if (snd_stat.wav_len<=0){
-					snd_stat.wav_playing=false;
-				}
-			}
-		}
-
-		if (snd_stat.noi_playing){//&&snd_stat.master_enable){
-			if (snd_stat.noi_env_speed&&(counter%(4*snd_stat.noi_env_speed)==0)){
-				snd_stat.noi_vol+=(snd_stat.noi_env_dir?1:-1);
-				if (snd_stat.noi_vol<0) snd_stat.noi_vol=0;
-				if (snd_stat.noi_vol>15) snd_stat.noi_vol=15;
-			}
-			if (snd_stat.noi_hold&&snd_stat.noi_len){
-				snd_stat.noi_len--;
-				if (snd_stat.noi_len<=0)
-					snd_stat.noi_playing=false;
-			}
-		}
-//	}
-
-	counter++;
-}
-
 void snd_render(short *buf1, short *buf2, int sample)
 {
-	memcpy(&snd_stat_tmp,&snd_stat,sizeof(snd_stat));
-	memcpy(&snd_stat,&snd_stat_cpy,sizeof(snd_stat_cpy));
+	/* GBAdhoc: delayed writes and timer edges share one timeline. */
+	render_begin();
 
 	//static int tmp_sample=0;
 	//int bef_sample_l[5]={0,0,0,0,0}, bef_sample_r[5]={0,0,0,0,0};
 	int tmp_l,tmp_r,tmp;
-	int now_clock=cpu_get_clock();
+	int now_clock=apu_time;
 	int cur=0;
-	unsigned int update_count=0;
-	const unsigned int update_count_inc = CLOKS_PER_INTERVAL*(cpu_get_speed()+1);
+	int last_sq1 = snd_stat.sq1_freq, last_sq2 = snd_stat.sq2_freq, last_wav = snd_stat.wav_freq;
 	int sq1_freq = 131072/(2048-(snd_stat.sq1_freq&0x7FF));
 	int sq2_freq = 131072/(2048-(snd_stat.sq2_freq&0x7FF));
 	int wav_freq = (65536/(2048-(snd_stat.wav_freq&0x7FF))) << 5;
@@ -602,13 +570,20 @@ void snd_render(short *buf1, short *buf2, int sample)
 	for (i=0;i<sample;i++){
 		//now_time = snd_bef_clock + (now_clock - snd_bef_clock) * i / sample;
 
-		if ( snd_que_count>cur && (now_time>(unsigned int)snd_write_que[cur].clock) ){
-			snd_process(snd_write_que[cur].adr,snd_write_que[cur].dat);
-			cur++;
-
-			sq1_freq = 131072/(2048-(snd_stat.sq1_freq&0x7FF));
-			sq2_freq = 131072/(2048-(snd_stat.sq2_freq&0x7FF));
-			wav_freq = (65536/(2048-(snd_stat.wav_freq&0x7FF))) << 5;
+		render_until((int)now_time, &cur);
+		/* GBAdhoc: writes/sweep can change pitch; avoid three divisions
+		 * per sample when the pitch is unchanged on the PSP. */
+		if (last_sq1 != snd_stat.sq1_freq) {
+			last_sq1 = snd_stat.sq1_freq;
+			sq1_freq = 131072/(2048-(last_sq1&0x7FF));
+		}
+		if (last_sq2 != snd_stat.sq2_freq) {
+			last_sq2 = snd_stat.sq2_freq;
+			sq2_freq = 131072/(2048-(last_sq2&0x7FF));
+		}
+		if (last_wav != snd_stat.wav_freq) {
+			last_wav = snd_stat.wav_freq;
+			wav_freq = (65536/(2048-(last_wav&0x7FF))) << 5;
 		}
 
 		tmp_l=tmp_r=0;
@@ -674,10 +649,7 @@ void snd_render(short *buf1, short *buf2, int sample)
 			*/
 //			buf += 2 ;
 
-			while(update_count*update_count_inc<now_time-snd_bef_clock){
-				snd_update();
-				update_count++;
-			}
+
 		}else{
 			*buf1++ = 0;
 			*buf2++ = 0;
@@ -690,29 +662,20 @@ void snd_render(short *buf1, short *buf2, int sample)
 		now_time += time_inc;
 	}
 
-	while (snd_que_count>cur){ // 取りこぼし
-		snd_process(snd_write_que[cur].adr,snd_write_que[cur].dat);
-		cur++;
-	}
-	snd_que_count=0;
-	snd_bef_clock=now_clock;
-
-	memcpy(&snd_stat_cpy,&snd_stat,sizeof(snd_stat));
-	memcpy(&snd_stat,&snd_stat_tmp,sizeof(snd_stat));
+	render_end(&cur);
 }
 
 void snd_render_orig(short *buf,int sample)
 {
-	memcpy(&snd_stat_tmp,&snd_stat,sizeof(snd_stat));
-	memcpy(&snd_stat,&snd_stat_cpy,sizeof(snd_stat_cpy));
+	/* GBAdhoc: delayed writes and timer edges share one timeline. */
+	render_begin();
 
 	//static int tmp_sample=0;
 	//int bef_sample_l[5]={0,0,0,0,0}, bef_sample_r[5]={0,0,0,0,0};
 	int tmp_l,tmp_r,tmp;
-	int now_clock=cpu_get_clock();
+	int now_clock=apu_time;
 	int cur=0;
-	unsigned int update_count=0;
-	const unsigned int update_count_inc = CLOKS_PER_INTERVAL*(cpu_get_speed()+1);
+	int last_sq1 = snd_stat.sq1_freq, last_sq2 = snd_stat.sq2_freq, last_wav = snd_stat.wav_freq;
 	int sq1_freq = 131072/(2048-(snd_stat.sq1_freq&0x7FF));
 	int sq2_freq = 131072/(2048-(snd_stat.sq2_freq&0x7FF));
 	int wav_freq = (65536/(2048-(snd_stat.wav_freq&0x7FF))) << 5;
@@ -724,13 +687,20 @@ void snd_render_orig(short *buf,int sample)
 	for (i=0;i<sample;i++){
 		//now_time = snd_bef_clock + (now_clock - snd_bef_clock) * i / sample;
 
-		if ( snd_que_count>cur && (now_time>(unsigned int)snd_write_que[cur].clock) ){
-			snd_process(snd_write_que[cur].adr,snd_write_que[cur].dat);
-			cur++;
-
-			sq1_freq = 131072/(2048-(snd_stat.sq1_freq&0x7FF));
-			sq2_freq = 131072/(2048-(snd_stat.sq2_freq&0x7FF));
-			wav_freq = (65536/(2048-(snd_stat.wav_freq&0x7FF))) << 5;
+		render_until((int)now_time, &cur);
+		/* GBAdhoc: writes/sweep can change pitch; avoid three divisions
+		 * per sample when the pitch is unchanged on the PSP. */
+		if (last_sq1 != snd_stat.sq1_freq) {
+			last_sq1 = snd_stat.sq1_freq;
+			sq1_freq = 131072/(2048-(last_sq1&0x7FF));
+		}
+		if (last_sq2 != snd_stat.sq2_freq) {
+			last_sq2 = snd_stat.sq2_freq;
+			sq2_freq = 131072/(2048-(last_sq2&0x7FF));
+		}
+		if (last_wav != snd_stat.wav_freq) {
+			last_wav = snd_stat.wav_freq;
+			wav_freq = (65536/(2048-(last_wav&0x7FF))) << 5;
 		}
 
 		tmp_l=tmp_r=0;
@@ -769,11 +739,8 @@ void snd_render_orig(short *buf,int sample)
 			/* GBAdhoc: MasterBoy scaled by its menu volume setting; the gain
 			 * here is fixed (TGB_SND_GAIN, tgb_port.h) and the result is
 			 * saturated -- a wrapped int16 is a full-scale click. */
-			if (snd_stat_upd)		{
-				curVolume0 = snd_stat.master_vol[0] * TGB_SND_GAIN;
-				curVolume1 = snd_stat.master_vol[1] * TGB_SND_GAIN;
-				snd_stat_upd = 0;
-			}
+			curVolume0 = snd_stat.master_vol[0] * TGB_SND_GAIN;
+			curVolume1 = snd_stat.master_vol[1] * TGB_SND_GAIN;
 
 			{
 				int l = (tmp_l * (int)curVolume0) >> 8;
@@ -803,10 +770,7 @@ void snd_render_orig(short *buf,int sample)
 			*((unsigned long*)buf) = (tmp_r & 0x0000FFFF) | ((tmp_l & 0x0000FFFF) << 16) ;
 			*/
 
-			while(update_count*update_count_inc<now_time-snd_bef_clock){
-				snd_update();
-				update_count++;
-			}
+
 		}else{
 			buf[0] = buf[1] = 0;	/* GBAdhoc: was an unsigned long store */
 			buf+=2;
@@ -815,15 +779,7 @@ void snd_render_orig(short *buf,int sample)
 		now_time += time_inc;
 	}
 
-	while (snd_que_count>cur){ // 取りこぼし
-		snd_process(snd_write_que[cur].adr,snd_write_que[cur].dat);
-		cur++;
-	}
-	snd_que_count=0;
-	snd_bef_clock=now_clock;
-
-	memcpy(&snd_stat_cpy,&snd_stat,sizeof(snd_stat));
-	memcpy(&snd_stat,&snd_stat_tmp,sizeof(snd_stat));
+	render_end(&cur);
 }
 
 void snd_set_lowpass(char lowpass){ snd_b_lowpass=lowpass; };

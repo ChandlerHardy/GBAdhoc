@@ -9,6 +9,7 @@
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
+#include <sys/stat.h>
 
 #include "../frontend-common/fe_host.h"
 #include "../frontend-common/netpacket_host.h"
@@ -321,10 +322,51 @@ static int run_old_save_import(unsigned trailer, int future)
    return 0;
 }
 
+/* Exercise boot error propagation with the real GB core. A directory at
+ * the battery path deterministically produces a stdio read error on Linux. */
+static int run_battery_load_failure(void)
+{
+   uint8_t rom[0x8000], original[RTC_RAM];
+   char dir[] = "/tmp/gbadhoc-load-failure-XXXXXX";
+   char rom_path[160], save_path[160];
+   stats_t stats = {0};
+   fe_host_config cfg;
+   struct stat st;
+   CHECK(mkdtemp(dir));
+   snprintf(rom_path, sizeof(rom_path), "%s/game.gbc", dir);
+   snprintf(save_path, sizeof(save_path), "%s/game.sav", dir);
+   make_rom_typed(rom, 1, 0x13, 3); /* MBC3+RAM+BATTERY, no RTC trailer */
+   CHECK(write_file(rom_path, rom, sizeof(rom)) == 0);
+   CHECK(mkdir(save_path, 0700) == 0); /* fopen succeeds, fread reports EISDIR */
+   memset(&cfg, 0, sizeof(cfg));
+   cfg.console = FE_CONSOLE_GBC;
+   cfg.rom_path = rom_path;
+   cfg.save_path = save_path;
+   cfg.video_frame = video;
+   cfg.audio_frames = audio;
+   cfg.input_bitmask = input;
+   cfg.time_us = time_us;
+   active_stats = &stats;
+   active_console_name = "GBC";
+   CHECK(fe_host_boot(&cfg) < 0);
+   CHECK(fe_host_sram_flush(1) < 0);
+   fe_host_shutdown();
+   CHECK(stat(save_path, &st) == 0 && S_ISDIR(st.st_mode));
+   CHECK(rmdir(save_path) == 0);
+   memset(original, 0x62, sizeof(original));
+   CHECK(write_file(save_path, original, sizeof(original)) == 0);
+   CHECK(fe_host_boot(&cfg) == 0);
+   CHECK(fe_host_sram_flush(1) == 1);
+   fe_host_shutdown();
+   CHECK(file_size(save_path) == (long)sizeof(original));
+   CHECK(unlink(save_path) == 0 && unlink(rom_path) == 0 && rmdir(dir) == 0);
+   puts("frontend battery read error: boot refused, cleanup safe, next boot saves normally");
+   return 0;
+}
+
 /* Save states: a DMG ROM that rewrites BGP as fast as it can, so every
- * frame's image depends on exact CPU timing.  Frames after a load must be
- * bit-identical to the frames after the save; a damaged image or one for
- * another cartridge must be refused without disturbing the game. */
+ * frame's image depends on exact CPU timing. Frames after a load must be
+ * bit-identical to the frames after the save; damaged images are refused. */
 static int run_state_roundtrip(void)
 {
    static uint8_t rom[0x8000], blob[512 * 1024];
@@ -446,5 +488,5 @@ int main(void)
    return run_one(FE_CONSOLE_GB, 0) || run_one(FE_CONSOLE_GBC, 1) ||
           run_rtc_save() || run_old_save_import(RTC_TRAILER, 0) ||
           run_old_save_import(44, 0) || run_old_save_import(RTC_TRAILER, 1) ||
-          run_state_roundtrip();
+          run_state_roundtrip() || run_battery_load_failure();
 }

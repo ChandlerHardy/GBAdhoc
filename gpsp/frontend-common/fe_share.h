@@ -255,6 +255,7 @@ typedef struct
    uint32_t obj_size, obj_crc;
    /* the pending window */
    uint16_t req;
+   int have_req;                 /* request watermark within this session */
    uint32_t win_first, win_mask;
    /* what the waiting screen shows */
    uint32_t sent_chunks;          /* of the open object, counted once each */

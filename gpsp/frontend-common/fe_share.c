@@ -687,6 +687,7 @@ void fe_share_server_rx(fe_share_server *s, const void *buf, size_t len,
           * repeated HELLO (its WELCOME was lost, or the radio delivered it
           * twice) carries the same nonce and keeps the session it has. */
          srv_close_obj(s);
+         s->have_req = 0;
          s->session = s->session_seed++;
          if (!s->session)
             s->session = s->session_seed++;
@@ -731,14 +732,19 @@ void fe_share_server_rx(fe_share_server *s, const void *buf, size_t len,
          break;
       o = get_obj(b);
       req = get16(b + 4);
-      if (s->have_obj && obj_eq(o, s->obj))
+      if (s->have_req && (int16_t)(req - s->req) < 0)
+         break;                 /* delayed STAT from an earlier fetch */
+      if (s->have_obj && req == s->req && !obj_eq(o, s->obj))
+         break;                 /* one request identifies one object */
+      if (s->have_obj && req == s->req && obj_eq(o, s->obj))
          st = ST_OK;                       /* a repeated STAT: same answer */
       else
          st = srv_open(s, o);
-      s->req = (uint16_t)req;
       srv_info(s, o, req, st);
       if (st == ST_BAD)
          break;
+      s->req = (uint16_t)req;
+      s->have_req = 1;
       goto good;
    }
    case T_GET:
@@ -752,6 +758,8 @@ void fe_share_server_rx(fe_share_server *s, const void *buf, size_t len,
       req = get16(b + 4);
       first = get32(b + 6);
       mask = get32(b + 10);
+      if (!s->have_req || req != s->req)
+         break;                 /* old GET must not replace a newer window */
       if (!s->have_obj || !obj_eq(o, s->obj))
       {
          if (!fe_share_obj_valid(s->entries, s->n, o))

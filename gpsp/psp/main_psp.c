@@ -523,11 +523,17 @@ static int io_thread(SceSize args, void *argp)
    {
       SceUInt tmo = IO_WAIT_US;
       sceKernelWaitSema(g_io_sema, 1, &tmo);
-      fe_evt_service();
-      fe_host_sram_service_io();
+      if (g_pcfg.log_thread)
+         fe_evt_service();
+      if (g_pcfg.sram_thread)
+         fe_host_sram_service_io();
    }
-   fe_host_sram_service_io();   /* last pass before we go away */
-   fe_evt_service();
+   /* The other service can still belong to the main thread. A logging-only
+    * worker must never become a second consumer of the SRAM block queue. */
+   if (g_pcfg.sram_thread)
+      fe_host_sram_service_io();   /* last pass before we go away */
+   if (g_pcfg.log_thread)
+      fe_evt_service();
    return 0;
 }
 
@@ -2046,7 +2052,7 @@ static int power_cb(int unknown, int pwrflags, void *common)
          if (g_pwr_parked)
          {
             t0 = (unsigned)sceKernelGetSystemTimeLow();
-            if (me_host_up())
+            if (me_host_loaded())
                while (!(idle = me_host_idle()) &&
                       (unsigned)sceKernelGetSystemTimeLow() - t0 < 50000u)
                   sceKernelDelayThread(1000);
@@ -2750,13 +2756,23 @@ static const uint16_t *me_rend_present_src(unsigned *pitch)
  * whether there was anything to release, because the standby ladder logs the
  * rung only when it actually descends one.
  *
- * ALWAYS safe to call and never optional at standby: the OS owns the 4 MB pool
+ * Safe after the ME has stopped or acknowledged its cache flush. The OS owns
+ * the 4 MB pool
  * at 0x08400000 and may re-hand it while we sleep, so a resume that skipped
  * re-locking would rebuild onto a partition we no longer held -- which is a
  * plausible way to reset the machine, and the machine did reset.  The full
  * history is at the call site in me_standby_down(). */
 static int me_rend_release_vmem(void)
 {
+   /* Disabling rendering (including a watchdog fallback) does not stop an
+    * in-flight job or drop dirty work-cache lines. Do not return that memory
+    * to the OS until the engine has relinquished it. Normally standby >= 2
+    * has already unloaded the module, so no extra command is needed. */
+   if (g_mer_vmem && me_host_loaded() && me_host_sync(50000u) != 0)
+   {
+      fe_evt("me_rend release_deferred reason=me_sync");
+      return -1;
+   }
 #ifdef REWIND
    /* The other tenant first: after this the rewind holds no pointer into
     * the pool (its history is gone; it starts again after the wake). */
@@ -2963,7 +2979,13 @@ static void me_standby_down(void)
     * So releasing is the safe half and re-locking on wake is mandatory.  What
     * remains genuinely questionable is unloading the module, which is what the
     * ladder is now for. */
-   if (me_rend_release_vmem())
+   int release_result = me_rend_release_vmem();
+   if (release_result < 0)
+   {
+      me_standby_step("vmem_retained");
+      return;
+   }
+   if (release_result > 0)
       me_standby_step("vmem_released");
    /* The audio ring still holds sound from before the sleep, and the audio
     * thread plays it the moment the machine comes back -- ~20 ms of the game
@@ -3059,7 +3081,7 @@ static int mer_work_heap_free(void)
 {
    if (!g_mer_work)
       return 0;
-   if (me_host_up() && me_host_sync(50000u) != 0)
+   if (me_host_loaded() && me_host_sync(50000u) != 0)
       return -1;
    free(g_mer_work);
    g_mer_work = NULL;
@@ -3076,7 +3098,8 @@ static void me_rend_suspend(void)
    if (g_me_rend)
       me_rend_teardown("np_start");
    /* Wait out any in-flight ME job before freeing the buffers under it. */
-   idle = !me_host_up();
+   /* A watchdog timeout disables posting; it does not stop the second core. */
+   idle = !me_host_loaded();
    if (!idle)
    {
       unsigned t0 = (unsigned)sceKernelGetSystemTimeLow();
@@ -10094,7 +10117,7 @@ static void psp_rewind_reset_said(void)
    unsigned n = fe_host_rewind_resets();
    if (n != seen)
    {
-      osd_toast("Slept during a rewind: game restarted from its save");
+      osd_toast("Rewind interrupted: game restarted from its save");
       ctl_turbo_stop(&g_turbo);   /* a restarted game has no auto-fire */
    }
    seen = n;
@@ -14724,8 +14747,11 @@ session_top:
    me_rend_teardown("exit");
    me_video_teardown("exit", 1);
    me_host_shutdown();
-   free(g_me_stage[0]);   g_me_stage[0] = NULL;
-   free(g_me_stage[1]);   g_me_stage[1] = NULL;
+   if (!me_host_loaded())
+   {
+      free(g_me_stage[0]);   g_me_stage[0] = NULL;
+      free(g_me_stage[1]);   g_me_stage[1] = NULL;
+   }
    ui_return_tick();   /* the hold's ring keeps moving (no-op otherwise) */
    net_teardown();
    mgift_stop(1);      /* drops the AP association and unloads the net modules */

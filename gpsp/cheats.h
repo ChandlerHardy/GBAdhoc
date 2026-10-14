@@ -27,6 +27,7 @@
  * reported per cheat (CheatErrorTooBig / CheatErrorTooMany), never silent. */
 #define MAX_CHEATS          64
 #define CHEAT_POOL_RECORDS  1024
+#define CHEAT_FRAME_MAX     4096 /* total worst-case RAM reads/writes */
 #else
 #define MAX_CHEATS       20
 #endif
@@ -41,11 +42,13 @@ typedef enum {
 #ifdef GPSP_CHEATS
    /* GPSP_CHEATS only (docs/CHEATS.md section 3): the strict parser names
     * WHY a code was refused, so the menu can say it. */
-   ,CheatErrorSyntax,        /* not CodeBreaker, not raw, not GS/AR either */
-   CheatErrorGameShark,      /* 8+8 digits: GameShark v1/v2 or AR v3      */
+   ,CheatErrorSyntax,        /* malformed code                            */
+   CheatErrorGameShark,      /* bare 8+8 digits: explicit family needed   */
    CheatErrorRegion,         /* writes or reads outside EWRAM/IWRAM       */
    CheatErrorAlign,          /* a 16/32-bit access at an odd address      */
-   CheatErrorMixed           /* raw and CodeBreaker lines in one cheat    */
+   CheatErrorMixed,          /* more than one format in one entry         */
+   CheatErrorUnsupported,    /* GS/AR opcode outside the RAM-only subset  */
+   CheatErrorWork            /* aggregate per-frame memory access budget  */
 #endif
 } cheat_error;
 

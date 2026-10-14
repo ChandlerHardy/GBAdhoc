@@ -52,6 +52,14 @@ extern int tgb_cgb_lcd;
 
 /* --- adapter callbacks --------------------------------------------------- */
 
+/* GBAdhoc: deterministic APU timing and compatible state extension. */
+void apu_div_reset(void);
+void apu_rebase(int cpu_base);
+void apu_restore_clock(void);
+void apu_discard_audio(void);
+void apu_save_cpu_timing(byte *out); /* 36 bytes */
+void apu_save_timing(byte *out);     /* 256 reserved bytes */
+void apu_load_timing(const byte *in);
 void gbe_init(void);
 void gbe_reset(void);
 /* MBC3 clock registers 8..12 (seconds, minutes, hours, day low, day high

@@ -10,9 +10,9 @@ so the whole local diff is one command away:
 git diff 8f84303 -- gbcore/tgbdual
 ```
 
-Every changed line in the sources carries a `GBAdhoc:` comment. `tgb_port.h`,
-`tgb_shared.c`, `README.md` and this file are new; `cheat.c` is unchanged and
-not built.
+Local changes carry `GBAdhoc:` comments at the affected blocks. `tgb_port.h`,
+`tgb_shared.c`, `apu_timing.h`, `state_validate.h`, `README.md` and this file
+are new; `cheat.c` is unchanged and not built.
 
 ## Import normalisation (no code change)
 
@@ -98,23 +98,42 @@ that:
 | `_mrand_table.h` | The noise tables are `const` and named `tgbshared_mrand7/15`, defined once by the new `tgb_shared.c` outside the per-instance link: 64 KiB the second machine does not duplicate. |
 | `tgb_port.h` | Prototypes for `tgb_port_serial_complete` and `cpu_seri_send`. |
 
-Headless (`gbcore_set_headless`) needs nothing else in the core: every
-`lcd_render` call and the LCD-off fill are already under `gbSkip`, and the
-synthesiser (`snd_render_orig`) works on its own copy of the APU state,
-swapped in and out, so skipping it leaves every register the game can read
-unchanged. `snd_update`'s shared counter (the comment by LCK) would have
-coupled the two, but its register-side caller in `apu_write` never runs:
-`clocks += clock - bef_clock` adds zero, because `bef_clock` is set from
-`clock` on entry. `gbcore/tests/dual.c` checks the outcome on six real
-cartridges: a headless machine's sync hash equals the drawn one's every frame.
+Headless (`gbcore_set_headless`) suppresses scanline and sample production,
+but it still advances the CPU-side APU sequencer. `apu_timing.h` gives CPU
+and delayed audio rendering independent timing state and the same transition
+rules; audio generation can never mutate the register state read by the game.
+Frame-end discards a headless queue and copies current CPU APU state into the
+synthesizer, so later audible use does not replay old register writes.
+`gbcore/tests/accuracy.c` checks frame hashes and exact audio state replay;
+`gbcore/tests/dual.c` checks independent and headless instances.
 
-`gb_reset` does not clear everything a game can read -- the sound registers
-NR10-NR51 in `snd_mem`, `_ff6c`/`_ff72`-`_ff75`, `ext_mem` -- nor the
-synthesiser's phases, so a second game in the same process started from the
-first one's leftovers (measured: the sync hash differs at frame 0).
-Single-player is left exactly as it was; a link session instead starts each
-machine with `gbcore_power_on`, which restores the instance's whole `.data`
-and clears its `.bss` (`../gbcore_instance.ld` marks them).
+APU reuse now clears registers, timing and oscillator history in `snd_reset`.
+`gb_reset` still does not promise a complete process-image reset of every
+other core global. A link session starts each machine with `gbcore_power_on`,
+which restores the instance's whole `.data` and clears its `.bss`
+(`../gbcore_instance.ld` marks them).
+
+## Reliability review corrections (2026-10-13)
+
+- `gb_fill_vframe` converts the supplied BGR555 colour to the configured
+  RGB565 layout, fills the guard area and tolerates a headless NULL buffer.
+  Solid SGB masks are reapplied after state load and buffer reallocation.
+- NR52 reflects the four channel-active flags regardless of volume. CPU-side
+  length, envelope and sweep timers run without sound I/O or audio output,
+  at the same normalized rate on CGB double speed. DIV reset, DAC gating,
+  master power and length reload are shared by both APU consumers.
+- The old 256 reserved core-state bytes preserve sequencer/oscillator state.
+  The CGB restore path now consumes the palette-format marker before them.
+  The adapter's reserved extension tail preserves sample cadence and input
+  edge state. State version/length remain unchanged; old zero extensions load.
+- State bank pointers, APU indices/ranges and SGB parser/palette indices are
+  validated before memory is changed. Failed model-switch restore puts the
+  previous model back. This is not comprehensive validation of every scalar.
+- SGB packet count zero is rejected before it can overrun the seven-packet
+  buffer. ATTR_CHR counts characters instead of four-character groups.
+
+Reproduction, compatibility limits and remaining review findings are in
+`../../docs/audit/gb-core.md`.
 
 ## Volume
 

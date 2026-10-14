@@ -29,8 +29,16 @@
 #     02025BC4:00001388
 #
 # Only codes that write the game's RAM (addresses 02...... and 03......) can
-# be used.  GameShark / Action Replay codes (8 + 8 digits), encrypted
-# CodeBreaker codes and ROM patches are listed but cannot be switched on.
+# be used.  GameShark / Action Replay RAM codes (8 + 8 digits) need one
+# explicit tag at the start of the complete cheat: GS1: for encrypted
+# v1/v2, AR3: for encrypted v3, or GS1RAW: / AR3RAW: for decrypted device
+# codes.  Choose the family from the code's source; the emulator never
+# guesses.  Supported: direct 8/16/32-bit writes, selected comparisons,
+# AR3 contiguous repeats, and per-entry cipher reseeding.  Unsupported
+# hooks/master codes, ROM patches, pointer/block/device-button commands,
+# encrypted CodeBreaker and malformed entries cannot be switched on.
+# Full supported-opcode table and examples: docs/CHEATS.md.  The total GBA
+# list is limited to 4096 worst-case RAM reads/writes per frame.
 #
 # GAME BOY / GAME BOY COLOR: GameShark codes, 8 digits starting with 01:
 #

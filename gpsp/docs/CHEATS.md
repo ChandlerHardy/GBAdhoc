@@ -10,6 +10,7 @@ remembered per game. Cheats are off in every link or wireless session.
 | Where | What |
 |---|---|
 | `cheats.c`, `cheats.h` | The core half (`GPSP_CHEATS`): the strict code parser, the RAM-only accessors, the one-per-frame apply point, the translated-code flush. |
+| `cheats_gs.h`, `cheats_gs_cipher.h`, `cheat_format.h` | Explicit GS1/AR3 family tags, bounded RAM operations, per-entry decryption/reseeding. Cipher tables retain mGBA's MPL-2.0 attribution. |
 | `libretro/libretro.c`, `main.c` | The apply point moves from vcount 228 (inside the dynarec) to the top of `retro_run`. |
 | `frontend-common/fe_cheats.c/.h` | The model: cheat files (both formats), the entry list, the `.on` state, the link lock, Game Boy codes. Pure C, no SDK, no heap, host-tested. |
 | `frontend-common/fe_host.c` | The Game Boy apply point, before `gbcore_run_frame`. |
@@ -65,7 +66,10 @@ The name is the ROM's file name, as for box art, so the folder layout under
 **The plain list.** A line that reads entirely as codes is a code line; any
 other line is the name of the next cheat. Blank lines and lines starting `#`
 or `//` are ignored (also between two code lines). `[Name]` or `"Name"` gives
-a cheat a name that would itself read as a code. Codes before any name become
+a cheat a name that would itself read as a code. A family-tagged line or a
+line starting with a recognizable eight-digit address remains a code line
+even when its value is malformed, so a bad continuation cannot silently
+become a title and leave a partial cheat usable. Codes before any name become
 "Unnamed cheat"; a name with no codes under it (a heading) is dropped. CRLF,
 a UTF-8 byte order mark and stray NUL bytes are accepted. Names are shown in
 printable ASCII (anything else becomes one `?`), because the UI font's high
@@ -90,7 +94,10 @@ people; delete the file to switch everything off.
 |---|---|---|
 | CodeBreaker, 8 + 4 digits (or the 12 run together) | `82025BC4 423F` | **Supported.** Types below. |
 | Raw write `ADDRESS:VALUE`, value 2 / 4 / 8 digits | `02025BC4:000F423F` | **Supported.** Compiled to CodeBreaker 8-bit / 16-bit writes. |
-| GameShark / Action Replay v1-v3, 8 + 8 digits | `D8BAE4D9 4864DCE5` | **Not supported**, listed greyed with the reason. They are encrypted, most need a master-code hook and many are ROM patches. |
+| GameShark / Action Replay v1/v2, explicit `GS1:` | `GS1: DF4FF124 9EB1FD0E` | **Supported RAM subset**, encrypted. |
+| Action Replay v3, explicit `AR3:` | `AR3: 00AE5A50 2CA38934` | **Supported RAM subset**, encrypted. |
+| Decrypted GS1 or AR3 | `GS1RAW: 02000010 000000AB` / `AR3RAW: 00200010 000000AB` | **Supported RAM subset**, using that family's opcode/address encoding. |
+| Bare 8 + 8 digits | `D8BAE4D9 4864DCE5` | **Needs a family tag**; shown as "choose GS1: or AR3:". Nothing guesses the format. |
 | Encrypted CodeBreaker (a type 9 seed line) | `9E6AC862 823C` | **Not supported**, greyed. |
 | Anything that touches ROM, I/O, VRAM, palette, OAM or save memory | `88000000 1234` | **Refused**, greyed ("not a RAM code"). |
 
@@ -109,8 +116,80 @@ CodeBreaker types, all through the RAM-only accessors of section 5:
 | E | 16 / 32-bit add | |
 
 A multi-line code is simply consecutive code lines under one name; separators
-inside a line may be spaces, `+`, `,` or `;`. One cheat is all CodeBreaker or
-all raw writes.
+inside a line may be spaces, `+`, `,` or `;`. One cheat uses one format:
+CodeBreaker, colon-style raw writes, GS1, GS1RAW, AR3, or AR3RAW.
+
+#### GameShark / Action Replay format selection
+
+Place **one tag at the beginning of the complete entry**, followed by pairs
+of eight hex digits (or each pair's 16 digits together). Tags are case
+insensitive and can be on a line of their own. They also work in a libretro
+`cheatN_code` value. Tags are part of the `.on` identity: changing the family
+does not inherit a previous enabled choice.
+
+```
+[Synthetic GS1 RAM example]
+GS1RAW: 02000010 000000AB
+12000012 0000CDEF
+22000014 12345678
+```
+
+Those examples write AB, CDEF, and 12345678 at EWRAM offsets 10, 12, and 14;
+they are format demonstrations, not cheats for a particular game. An
+equivalent encrypted v1/v2 entry is:
+
+```
+GS1: DF4FF124 9EB1FD0E+93B16540 389E4302+DD4EC3B1 CBA7D882
+```
+
+`GS1RAW` and `AR3RAW` mean **decrypted device instructions**, which differ
+from `ADDRESS:VALUE` raw writes. A plain `GS1:` or `AR3:` tag always decrypts;
+it never falls back to treating a failed decryption as another format.
+
+| Family | Supported operations |
+|---|---|
+| GS1 / GS1RAW (v1/v2) | Top-nibble 0, 1, 2: 8-, 16-, 32-bit assignment. D: 16-bit equal, not equal, less-or-equal, greater-or-equal tests controlling the next complete operation. |
+| AR3 / AR3RAW (v3) | Direct 8-, 16-, 32-bit assignments. For 8/16-bit assignments, the upper value bits encode a contiguous repeat count plus one. Equal, not equal, unsigned less/greater, and bitwise-AND tests at all three widths can control the next one or two complete operations. |
+| Both | `DEADFACE 0000ssss` cipher reseed metadata, including reseeds encrypted with the current key. The subsequent lines use the new seeds. |
+
+AR3 reconstructs the guest address as `(op1 & 0x000FFFFF) |
+((op1 << 4) & 0x0F000000)`. Its opcode contains the access width, condition,
+and action; the first word is not itself a guest address. The repeat count
+is `(op2 >> 8) + 1` for byte writes or `(op2 >> 16) + 1` for halfword writes;
+the low 8/16 bits are the repeated value. A fill is one complete operation
+when skipped by a condition. Conditional targets must be present in full;
+metadata does not count as a target operation.
+
+Every entry starts from that family's standard four cipher seeds. Reseeds
+never carry into another entry, preview/check, reload, or game. In decrypted
+entries they are validated as metadata; they do not change the already
+decrypted following words. A metadata-only entry cannot be activated.
+
+**Rejected in full:** hooks/master codes, ROM patches, GS assignment lists,
+device-button codes, pointer writes, AR addition, signed AR comparisons,
+block/else/disable commands, special multi-line fills, ID records, invalid
+widths/reserved bits, unknown commands, missing conditional targets, and
+mixed families. These are deliberately a subset of the device formats.
+Do not remove a rejected master/hook line and assume a game cheat will
+still behave correctly. All fixed reads and writes must be aligned in
+EWRAM/IWRAM; repeats must stay in the same RAM region. Oversized narrow
+values are rejected instead of silently truncated, except the documented
+AR3 repeat bits. No supported operation touches ROM, save memory or I/O.
+
+The format references are mGBA's
+[GameShark decoder](https://github.com/mgba-emu/mgba/blob/143adf5aa2a60c6036810b0cd72445e13d74b0e6/src/gba/cheats/gameshark.c),
+[Action Replay decoder](https://github.com/mgba-emu/mgba/blob/143adf5aa2a60c6036810b0cd72445e13d74b0e6/src/gba/cheats/parv3.c),
+and [opcode definitions](https://github.com/mgba-emu/mgba/blob/143adf5aa2a60c6036810b0cd72445e13d74b0e6/include/mgba/internal/gba/cheats.h).
+The copied cipher/seed tables are isolated in `cheats_gs_cipher.h`, retaining
+Jeffrey Pfau's 2013-2015 copyright and MPL-2.0 notice. The upstream snapshot
+is commit `143adf5aa2a60c6036810b0cd72445e13d74b0e6` (2026-10-08), retrieved
+and checked against the reference decoder files on 2026-10-13. The complete
+license is included in `licenses/LICENSE.mgba-MPL-2.0`. Keep that notice and
+license with distributions and make the modified header's source available
+alongside the emulator source. The adaptation changes types/names to gpSP's,
+keeps the TEA decryption and reseed arithmetic, and omits upstream allocation
+and execution paths. No heuristics or general-purpose mGBA memory handlers
+are imported.
 
 Verified by execution, not assumed: every type in the table and the raw
 writes in the host test; type 8 and the raw write end to end in PPSSPP
@@ -164,9 +243,19 @@ gave its place to `Right: cheats` because the row was full.
 - **Nothing in a file switches a cheat on.** A list always loads all off.
 - **Bounded everywhere.** The file is read into a 32 KB static buffer; 256
   entries are listed; 64 cheats can be on at once, sharing a pool of 1024
-  code records; 256 Game Boy writes. Every limit that is hit is reported on
+  code records; 256 Game Boy writes. All GBA formats together also share a
+  **4096 RAM-access budget per frame**, charged for the worst case during
+  parsing (including conditional reads, every repeated/slide/super write,
+  and both accesses of a read-modify-write). Exceeding it refuses the whole
+  entry with "too much work per frame". This closes the old CodeBreaker
+  case where many individually bounded slides could multiply into millions
+  of writes per frame. Every limit that is hit is reported on
   screen for that cheat or that file. Nothing allocates: there is no heap
   after a ROM has loaded.
+- **Whole entries only.** Decryption and validation finish before activation.
+  A rejected entry consumes no pool records or access budget and runs no
+  prefix. A rejected replacement disables the previous slot. The frontend
+  rebuilds the enabled set when it changes, releasing records and budget.
 - **Translated code.** A write that changes bytes the dynarec has translated
   (the RAM code tag is nonzero) triggers one full RAM translation flush after
   all codes have run, between frames, where it is the operation a savestate
@@ -253,6 +342,19 @@ random and well-formed-random input through every entry point. Eight
 hand-made mutants of `cheats.c` (wrong mask, no region check, no alignment
 check, no same-value skip, no tag check, no suspend, pool overrun) all fail
 it.
+
+The GS1/AR3 additions extend that suite with frozen encrypted and decrypted
+vectors, both reseed tables, per-entry reset isolation, every supported
+condition and width, whole-fill conditional skips, unsupported/malformed
+transactional rejection, ambiguous bare input, record and aggregate work
+limits, tagged RAM flushes, direct-call suspension, rewind generation and
+dirty marks, tagged plain/libretro lists, family-sensitive `.on` identity,
+and tagged input in the 150,000-round fuzz run. The host suite now builds
+with `REWIND` as well as `GPSP_CHEATS` and `HAVE_DYNAREC`.
+
+GS1/AR3 behavior is verified at the host interpreter/RAM boundary. The
+historical PPSSPP results below cover CodeBreaker and colon-style raw writes;
+they do not claim new GS1/AR3 hardware or game-specific validation.
 
 PPSSPP end to end (harness build with GBA_LINK=1; stages, logs and
 screenshots in `builds/cheats-out/`), Pokemon Sapphire (USA, Rev 2) with the

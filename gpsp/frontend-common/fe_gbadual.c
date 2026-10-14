@@ -138,6 +138,7 @@ static void lg(const char *msg)
  * postpones itself (gbalink_entry_yield) and the frontend's plain retro_run
  * would never complete a frame again. */
 static int g_fault;       /* the pair's error when it stopped (survives D) */
+static void sess_clock_restore(void);
 
 int fe_gbadual_fault(void) { return g_fault; }
 
@@ -168,6 +169,7 @@ static void gbadual_stop(const char *why)
    if (D.active)
       gbalink_pair_end(&D.pair);
    D.active = 0;
+   sess_clock_restore();
 }
 
 /* B asks the frontend what A asks (system directory, options, log), but
@@ -576,13 +578,11 @@ static int sess_input(void *user, unsigned slot, uint32_t frame,
           D.sess_input(D.sess_input_user, (int)slot, frame, keys) ? 1 : 0;
 }
 
-/* Load one machine: its state, then its battery image (the state does not
- * carry the cartridge RAM). */
-static int sess_load(int slot, const uint8_t *st, size_t stn,
-                     const uint8_t *sv, size_t svn)
+/* Battery RAM is committed only after BOTH states have loaded. A rejected
+ * partner must not replace the player's battery image during failed setup. */
+static int sess_load(int slot, const uint8_t *st, size_t stn)
 {
    int a = slot == D.local_slot;
-   void *sram = slot_sram(slot);
    size_t want = a ? retro_serialize_size() : gbab_retro_serialize_size();
    char msg[160];
    if (!st || stn != want ||
@@ -594,8 +594,6 @@ static int sess_load(int slot, const uint8_t *st, size_t stn,
       lg(msg);
       return -1;
    }
-   if (sram && sv && svn)
-      memcpy(sram, sv, svn < 0x20000 ? svn : 0x20000);
    return 0;
 }
 
@@ -613,8 +611,21 @@ extern time_t (*gbab_gpsp_wallclock)(void) GBAD_WEAK;
 extern int gpsp_rtc_frames_only;
 static time_t sess_clock_seed;
 static time_t (*sess_saved_wallclock)(void);
+static time_t (*sess_saved_b_wallclock)(void);
+static int sess_saved_frames_only;
 static int sess_clock_on;
 static time_t sess_clock(void) { return sess_clock_seed; }
+
+static void sess_clock_restore(void)
+{
+   if (!sess_clock_on)
+      return;
+   gpsp_wallclock = sess_saved_wallclock;
+   gpsp_rtc_frames_only = sess_saved_frames_only;
+   if (&gbab_gpsp_wallclock)
+      gbab_gpsp_wallclock = sess_saved_b_wallclock;
+   sess_clock_on = 0;
+}
 
 static int m_start(void *user, int local_slot, unsigned batch,
                    int64_t clock_seed,
@@ -628,6 +639,12 @@ static int m_start(void *user, int local_slot, unsigned batch,
    (void)user;
    if (!D.loaded || D.failed)
       return -1;
+   /* Reject obvious payload errors before changing either core or clock. */
+   for (slot = 0; slot < 2; slot++)
+      if (!state[slot] || state_n[slot] != (slot == !!local_slot
+             ? retro_serialize_size() : gbab_retro_serialize_size()) ||
+          save_n[slot] > 0x20000 || (save_n[slot] && !save[slot]))
+         return -1;
    if (D.active)
       gbalink_pair_end(&D.pair);
    D.active = 0;
@@ -636,17 +653,34 @@ static int m_start(void *user, int local_slot, unsigned batch,
    gbab_platform_cache_paranoid = platform_cache_paranoid;
 #endif
    if (!sess_clock_on)
+   {
       sess_saved_wallclock = gpsp_wallclock;
+      sess_saved_frames_only = gpsp_rtc_frames_only;
+      sess_saved_b_wallclock = &gbab_gpsp_wallclock ? gbab_gpsp_wallclock : NULL;
+   }
    sess_clock_seed = (time_t)clock_seed;
    sess_clock_on = 1;
    gpsp_wallclock = sess_clock;
    gpsp_rtc_frames_only = 1;
    if (&gbab_gpsp_wallclock)
       gbab_gpsp_wallclock = sess_clock;
+   /* The partner is disposable. Validate/load it before touching the local
+    * machine, independent of which network slot the player occupies. */
    for (slot = 0; slot < 2; slot++)
-      if (sess_load(slot, state[slot], state_n[slot], save[slot],
-                    save_n[slot]) != 0)
+   {
+      int at = D.local_slot ^ (slot == 0);
+      if (sess_load(at, state[at], state_n[at]) != 0)
+      {
+         sess_clock_restore();
          return -1;
+      }
+   }
+   for (slot = 0; slot < 2; slot++)
+   {
+      void *sram = slot_sram(slot);
+      if (sram && save_n[slot])
+         memcpy(sram, save[slot], save_n[slot]);
+   }
    memset(&pc, 0, sizeof(pc));
    /* CONFIG's batch: the lookahead in scanlines (the host decides). */
    pc.lookahead = batch ? (uint64_t)batch * 1232u : 0;
@@ -847,14 +881,7 @@ static void m_stop(void *user)
    D.active = 0;
    D.sess_hook = NULL;
    D.sess_input = NULL;
-   if (sess_clock_on)
-   {
-      gpsp_wallclock = sess_saved_wallclock;
-      gpsp_rtc_frames_only = 0;
-      if (&gbab_gpsp_wallclock)
-         gbab_gpsp_wallclock = NULL;
-      sess_clock_on = 0;
-   }
+   sess_clock_restore();
 }
 
 static fe_gblink_machines gbadual_m;
@@ -1019,6 +1046,7 @@ void fe_gbadual_unload(void)
 
 void fe_gbadual_close(void)
 {
+   sess_clock_restore();
    gamepak_evict_hook = NULL;
    if (D.active)
       gbalink_pair_end(&D.pair);

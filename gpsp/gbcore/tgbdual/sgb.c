@@ -589,13 +589,15 @@ void sgb_attribute_character()
 				if(startH == 20)
 					break;
 			}
+			/* GBAdhoc: count characters, including partial final bytes. */
+			if (--n_datasets == 0) break;
 			if(s)
 				s -= 2;
 			else
 			{
 				s = 6;
 				v = *fromAddress++;
-				n_datasets--;
+
 			}
 		}
 	} else
@@ -613,13 +615,15 @@ void sgb_attribute_character()
 					break;
 			}
 
+			/* GBAdhoc: count characters, including partial final bytes. */
+			if (--n_datasets == 0) break;
 			if(s)
 				s -= 2;
 			else
 			{
 				s = 6;
 				v = *fromAddress++;
-				n_datasets--;
+
 			}
 		}
 	}
@@ -981,6 +985,14 @@ void sgb_transfer(byte bdata)
 				 sgb_index = 0;
 				 ++packets_received;
 				 cycles_SGB = 0;
+				 /* GBAdhoc: packet count zero is invalid; never grow past
+				  * the seven-packet buffer on an incomplete command. */
+				 if (!(sgb_buffer[0] & 7) || packets_received > 7) {
+					 packets_received = 0;
+					 sgb_state = SGB_NONE;
+					 memset(sgb_buffer, 0, sizeof(sgb_buffer));
+					 break;
+				 }
 				 if(packets_received == (sgb_buffer[0] & 7))
 				 {
 					 sgb_execute_command();
@@ -992,6 +1004,13 @@ void sgb_transfer(byte bdata)
 			 {
 				 if(bits_received < 128)
 				 {
+					 /* GBAdhoc: defensive guard for restored/aborted cursors. */
+					 if ((unsigned)packets_received >= 7 || (unsigned)sgb_index >= 16) {
+						 packets_received = bits_received = sgb_index = 0;
+						 sgb_state = SGB_NONE;
+						 cycles_SGB = 0;
+						 break;
+					 }
 					 sgb_buffer[packets_received * 16 + sgb_index] >>= 1;
 					 sgb_buffer[packets_received * 16 + sgb_index] |= bit_received;
 					 bits_received++;

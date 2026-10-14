@@ -284,6 +284,35 @@ static int lp_mark(int n)
 }
 #endif
 
+/* Structural BSON validation does not interpret opaque binary payloads.
+ * Require document tags before component checks descend through untyped
+ * legacy lookup helpers. This preflight is outside the trusted light path. */
+static bool state_document_types(const u8 *src)
+{
+  static const char *const roots[] = {
+    "cpu", "input", "emu", "timers", "memory", "backup", "dma", "sound"
+  };
+  const u8 *timers, *dma_doc, *sound;
+  unsigned i;
+  for (i = 0; i < sizeof(roots) / sizeof(roots[0]); i++)
+    if (!bson_contains_key(src, roots[i], BSON_TYPE_DOC)) return false;
+  timers = bson_find_key(src, "timers");
+  dma_doc = bson_find_key(src, "dma");
+  sound = bson_find_key(src, "sound");
+  for (i = 0; i < 4; i++) {
+    char key[2] = {'0' + i, 0};
+    char channel[4] = {'g', 's', '0' + i, 0};
+    if (!bson_contains_key(timers, key, BSON_TYPE_DOC) ||
+        !bson_contains_key(dma_doc, key, BSON_TYPE_DOC) ||
+        !bson_contains_key(sound, channel, BSON_TYPE_DOC)) return false;
+    if (i < 2) {
+      channel[0] = 'd';
+      if (!bson_contains_key(sound, channel, BSON_TYPE_DOC)) return false;
+    }
+  }
+  return true;
+}
+
 bool gba_load_state(const void* src)
 {
   u32 i, tmp, docsize;
@@ -303,6 +332,10 @@ bool gba_load_state(const void* src)
   {
   if (!bson_validate_document(srcptr, GBA_STATE_MEM_SIZE, 0, false))
     return false;
+
+  if (!bson_contains_key(srcptr, "info-magic", BSON_TYPE_INT32) ||
+      !bson_contains_key(srcptr, "info-version", BSON_TYPE_INT32) ||
+      !state_document_types(srcptr)) return false;
 
   if (!bson_read_int32(srcptr, "info-magic", &tmp) || tmp != GBA_STATE_MAGIC)
     return false;

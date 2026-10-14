@@ -380,7 +380,7 @@ static void test_wire(void)
    h.type = ND_T_DATA; h.src = 1; h.dst = 0;
    h.seq = 0xBEEF; h.ack = 0x1234; h.len = 560;
    sz = nd_wire_build(frame, &h, payload);
-   CHECK(sz == 576, "sz=%zu", sz);
+   CHECK(sz == ND_HDR_SIZE + ND_MAX_PAYLOAD, "sz=%zu", sz);
    CHECK(nd_wire_parse(frame, sz, &ph, &pp, &reason) == 0, "reason=%d", reason);
    CHECK(ph.seq == 0xBEEF && ph.ack == 0x1234 && ph.len == 560, "fields");
    CHECK(memcmp(pp, payload, 560) == 0, "payload");
@@ -568,6 +568,7 @@ static void test_ack_range(void)
    h.src = 1;
    h.dst = 0;
    h.ack = 5; /* Only two payloads are outstanding. */
+   h.src_nonce = 0xB2; h.dst_nonce = 0xA1;
    frame_len = nd_wire_build(frame, &h, NULL);
    sim_deposit(&s, 0, s.node[1].mac, frame, frame_len, 0);
    s.now += 1000;
@@ -1178,7 +1179,8 @@ static void test_roster_churn(void)
             cycle, netdrv_peer_count(nd[0]));
       netdrv_leave(nd[2]);
       netdrv_leave(nd[3]);
-      sim_run(&s, nd, 4, 2000);
+      /* BYE is best effort; under loss the dead-peer timeout removes it. */
+      sim_run(&s, nd, 4, 10000);
       CHECK(netdrv_peer_count(nd[0]) == 1, "cycle %d: back to 1 peer (%d)",
             cycle, netdrv_peer_count(nd[0]));
       CHECK(netdrv_active(nd[1]), "cycle %d: resident survived churn", cycle);

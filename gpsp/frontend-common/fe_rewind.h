@@ -126,6 +126,13 @@ typedef struct fe_rewind_config
     * A frame whose picture could not be produced (a renderer that was busy,
     * a frame fast-forward did not draw) ORs FE_RW_NOPIC into *aud_n. */
    void (*run)(uint32_t input, uint16_t *pix, int16_t *aud, uint32_t *aud_n);
+   /* Optional external input (e.g. a sampled cartridge clock). Capture the
+    * value used by the normally-run frame; restore it before every replay.
+    * Both callbacks or neither. Its ring has exactly the input log's life,
+    * so forks, wraps and barriers cannot resurrect an abandoned value.
+    * Costs eight bytes per max_frames entry only when enabled. */
+   uint64_t (*frame_context)(void);
+   void (*replay_context)(uint64_t value);
    /* Optional: the reference image was changed in [off, off + bytes) by a
     * step back, without the machine following yet.  For a restore that
     * copies only what can differ. */
@@ -198,6 +205,7 @@ typedef struct fe_rewind_stats
 } fe_rewind_stats;
 
 /* fe_rewind_tick results */
+#define FE_RW_ERROR (-1) /* restore failed: machine untrusted; reset required */
 #define FE_RW_PLAY  2   /* not rewinding: run a normal frame now */
 #define FE_RW_SHOW  1   /* *out is the frame to present */
 #define FE_RW_HOLD  0   /* present nothing new this tick */

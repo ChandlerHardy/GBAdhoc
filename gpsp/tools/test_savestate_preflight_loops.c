@@ -9,7 +9,6 @@
 #include "../sound.h"
 
 static u8 state[GBA_STATE_MEM_SIZE];
-static u8 *write_ptr;
 static unsigned component_reads;
 
 static void put_u32(u8 *p, u32 value)
@@ -20,225 +19,55 @@ static void put_u32(u8 *p, u32 value)
   p[3] = (u8)(value >> 24);
 }
 
-static void put_cstring(const char *s)
+/* Actual input/main/memory/sound writers provide a valid BSON tree and
+ * legal defaults. CPU execution is outside this test; only its writer/check
+ * are stubbed. Readers are instrumented below to prove preflight atomicity. */
+static void hide_key(const u8 *doc, const char *key)
 {
-  size_t len = strlen(s) + 1;
-  memcpy(write_ptr, s, len);
-  write_ptr += len;
+  u8 *p = (u8 *)bson_find_key(doc, key);
+  assert(p); p[-(int)strlen(key)-1] = '!';
 }
-
-static u8 *begin_doc(u8 *p, const char *name)
-{
-  *p++ = BSON_TYPE_DOC;
-  write_ptr = p;
-  put_cstring(name);
-  p = write_ptr;
-  put_u32(p, 0);
-  write_ptr = p + 4;
-  return p;
-}
-
-static u8 *end_doc(u8 *header)
-{
-  *write_ptr++ = 0;
-  put_u32(header, (u32)(write_ptr - header));
-  return write_ptr;
-}
-
-static void put_int(const char *name, u32 value)
-{
-  *write_ptr++ = BSON_TYPE_INT32;
-  put_cstring(name);
-  put_u32(write_ptr, value);
-  write_ptr += 4;
-}
-
-static void put_bin(const char *name, unsigned size)
-{
-  *write_ptr++ = BSON_TYPE_BIN;
-  put_cstring(name);
-  put_u32(write_ptr, size);
-  write_ptr += 4;
-  *write_ptr++ = 0;
-  memset(write_ptr, 0, size);
-  write_ptr += size;
-}
-
-static void put_array2(const char *name)
-{
-  *write_ptr++ = BSON_TYPE_ARR;
-  put_cstring(name);
-  put_u32(write_ptr, 21);
-  write_ptr += 4;
-  put_int("0", 0);
-  put_int("1", 0);
-  *write_ptr++ = 0;
-}
-
-static void put_input_doc(void)
-{
-  u8 *hdr = begin_doc(write_ptr, "input");
-  put_int("prevkey", 0);
-  put_int("turbo-a", 0);
-  put_int("turbo-b", 0);
-  put_int("gbp-frames", 0);
-  put_int("gbp-sent", 0);
-  write_ptr = end_doc(hdr);
-}
-
-static void put_main_docs(void)
-{
-  unsigned i;
-  u8 *hdr = begin_doc(write_ptr, "emu");
-  put_int("cpu-ticks", 0);
-  put_int("exec-cycles", 0);
-  put_int("video-count", 0);
-  put_int("sleep-cycles", 0);
-  write_ptr = end_doc(hdr);
-
-  hdr = begin_doc(write_ptr, "timers");
-  for (i = 0; i < 4; i++)
-  {
-    char name[2] = { (char)('0' + i), 0 };
-    u8 *timer_hdr = begin_doc(write_ptr, name);
-    put_int("count", 0);
-    put_int("reload", 0x10000);
-    put_int("prescale", 0);
-    put_int("freq-step", 0);
-    put_int("dsc", i == 0 ? TIMER_DS_CHANNEL_BOTH : TIMER_DS_CHANNEL_NONE);
-    put_int("irq", 0);
-    put_int("status", TIMER_INACTIVE);
-    write_ptr = end_doc(timer_hdr);
-  }
-  write_ptr = end_doc(hdr);
-}
-
-static void put_memory_doc(void)
-{
-  u8 *hdr = begin_doc(write_ptr, "memory");
-  put_bin("iwram", 0x8000);
-  put_bin("ewram", 0x40000);
-  put_bin("vram", 1024 * 96);
-  put_bin("oamram", 0x400);
-  put_bin("palram", 0x400);
-  put_bin("ioregs", 0x400);
-  put_int("dma-bus", 0);
-  write_ptr = end_doc(hdr);
-}
-
-static const char *const backup_ints[] = {
-  "backup-type", "flash-mode", "flash-cmd-pos", "flash-bank-num",
-  "flash-dev-id", "flash-size", "eeprom-size", "eeprom-mode",
-  "eeprom-addr", "eeprom-counter", "rtc-state", "rtc-write-mode",
-  "rtc-cmd", "rtc-status", "rtc-data-bit-cnt", "rtc-bit-cnt"
-};
-
-static void put_backup_doc(void)
-{
-  unsigned i;
-  static const u32 valid_values[] = {
-    BACKUP_UNKN, 0, 0, 0, FLASH_DEVICE_MACRONIX_64KB, FLASH_SIZE_64KB,
-    EEPROM_512_BYTE, EEPROM_BASE_MODE, 0, 0, 0, 0, 0, 0, 0, 0
-  };
-  u8 *hdr = begin_doc(write_ptr, "backup");
-  for (i = 0; i < sizeof(backup_ints) / sizeof(backup_ints[0]); i++)
-    put_int(backup_ints[i], valid_values[i]);
-  put_bin("gpio-regs", 3);
-  put_array2("rtc-data-words");
-  write_ptr = end_doc(hdr);
-}
-
-static const char *const dma_ints[] = {
-  "src-addr", "dst-addr", "src-dir", "dst-dir", "len", "size",
-  "repeat", "start", "dsc", "irq"
-};
-
-static void put_dma_doc(int bad_channel, int bad_field)
-{
-  int d;
-  unsigned v;
-  u8 *hdr = begin_doc(write_ptr, "dma");
-  for (d = 0; d < DMA_CHAN_CNT; d++)
-  {
-    char name[2] = { (char)('0' + d), 0 };
-    u8 *dhdr = begin_doc(write_ptr, name);
-    for (v = 0; v < sizeof(dma_ints) / sizeof(dma_ints[0]); v++)
-      if (!(d == bad_channel && v == 9))
-        put_int(dma_ints[v], d == 0 && v == (unsigned)bad_field ? 0xffffffffu : 0);
-    write_ptr = end_doc(dhdr);
-  }
-  write_ptr = end_doc(hdr);
-}
-
-static const char *const sound_ints[] = {
-  "on", "buf-base", "gbc-buf-idx", "gbc-last-cpu-ticks",
-  "gbc-partial-ticks", "gbc-ms-vol-left", "gbc-ms-vol-right", "gbc-ms-vol"
-};
-static const char *const ds_ints[] = {
-  "status", "volume", "fifo-base", "fifo-top", "fifo-frac", "buf-idx"
-};
-static const char *const gs_ints[] = {
-  "status", "rate", "freq-step", "sample-idx", "tick-cnt", "volume",
-  "active", "enable", "env-vol0", "env-vol", "env-dir", "env-status",
-  "env-ticks0", "env-ticks", "sweep-status", "sweep-dir", "sweep-ticks0",
-  "sweep-ticks", "sweep-shift", "wav-type", "wav-bank", "wav-vol",
-  "len-status", "len-ticks", "noise-type", "sample-tbl"
-};
-
-static void put_channel(const char *name, const char *const *keys,
-                        unsigned count, int omit_last)
-{
-  unsigned i;
-  u8 *hdr = begin_doc(write_ptr, name);
-  for (i = 0; i < count; i++)
-    if (!(omit_last && i == count - 1))
-      put_int(keys[i], 0);
-  if (name[0] == 'd')
-    put_bin("fifo-bytes", 32);
-  write_ptr = end_doc(hdr);
-}
-
-static void put_sound_doc(int bad_ds, int bad_gs)
-{
-  unsigned i;
-  char name[4];
-  u8 *hdr = begin_doc(write_ptr, "sound");
-  for (i = 0; i < sizeof(sound_ints) / sizeof(sound_ints[0]); i++)
-    put_int(sound_ints[i], 0);
-  put_bin("wav-samples", 64);
-  for (i = 0; i < 2; i++)
-  {
-    snprintf(name, sizeof(name), "ds%u", i);
-    put_channel(name, ds_ints, sizeof(ds_ints) / sizeof(ds_ints[0]),
-                (int)i == bad_ds);
-  }
-  for (i = 0; i < 4; i++)
-  {
-    snprintf(name, sizeof(name), "gs%u", i);
-    put_channel(name, gs_ints, sizeof(gs_ints) / sizeof(gs_ints[0]),
-                (int)i == bad_gs);
-  }
-  write_ptr = end_doc(hdr);
-}
-
 static void make_state(int bad_dma, int bad_ds, int bad_gs, int bad_dma_field)
 {
+  static const char *const fields[] = {
+    "src-addr", "dst-addr", "src-dir", "dst-dir", "len", "size",
+    "repeat", "start", "dsc", "irq"
+  };
+  char key[4];
+  const u8 *doc;
+  extern u32 flash_bank_cnt;
+  init_main(); init_sound();
+  flash_bank_cnt = FLASH_SIZE_64KB; /* load_gamepak default */
   memset(state, 0, sizeof(state));
-  put_u32(state, GBA_STATE_MEM_SIZE);
-  write_ptr = state + 4;
-  put_int("info-magic", GBA_STATE_MAGIC);
-  put_int("info-version", GBA_STATE_VERSION);
-  put_main_docs();
-  put_input_doc();
-  put_memory_doc();
-  put_backup_doc();
-  put_dma_doc(bad_dma, bad_dma_field);
-  put_sound_doc(bad_ds, bad_gs);
-  *write_ptr = 0;
+  gba_save_state(state);
+  /* An accepted positive control must precede every negative mutation. */
+  component_reads = 0;
+  assert(gba_load_state(state)); assert(component_reads == 5);
+  if (bad_dma >= 0) {
+    key[0] = '0' + bad_dma; key[1] = 0;
+    doc = bson_find_key(bson_find_key(state, "dma"), key);
+    hide_key(doc, "irq");
+  }
+  if (bad_ds >= 0 || bad_gs >= 0) {
+    key[0] = bad_ds >= 0 ? 'd' : 'g'; key[1] = 's';
+    key[2] = '0' + (bad_ds >= 0 ? bad_ds : bad_gs); key[3] = 0;
+    doc = bson_find_key(bson_find_key(state, "sound"), key);
+    hide_key(doc, bad_ds >= 0 ? "buf-idx" : "sample-tbl");
+  }
+  if (bad_dma_field >= 0) {
+    doc = bson_find_key(bson_find_key(state, "dma"), "0");
+    put_u32((u8 *)bson_find_key(doc, fields[bad_dma_field]), 0xffffffffu);
+  }
 }
 
 /* These components are irrelevant to the malformed later-channel cases;
  * counting their read paths proves gba_load_state rejects before mutation. */
+unsigned cpu_write_savestate(u8 *dst) {
+  u8 *start = dst, *header;
+  bson_start_document(dst, "cpu", header);
+  bson_finish_document(dst, header);
+  return (unsigned)(dst-start);
+}
 bool cpu_check_savestate(const u8 *src) { (void)src; return true; }
 bool cpu_read_savestate(const u8 *src) { (void)src; component_reads++; return true; }
 bool input_read_savestate(const u8 *src) { (void)src; component_reads++; return true; }
@@ -246,8 +75,10 @@ bool main_read_savestate(const u8 *src) { (void)src; component_reads++; return t
 bool memory_read_savestate(const u8 *src) { (void)src; component_reads++; return true; }
 bool sound_read_savestate(const u8 *src) { (void)src; component_reads++; return true; }
 
-u16 palette_ram[512];
-u16 palette_ram_converted[512];
+u16 palette_ram[512], palette_ram_converted[512], io_registers[512], oam_ram[512];
+u8 vram[1024 * 96];
+u8 ewram[1024 * 256 * 2], iwram[1024 * 32 * 2];
+u32 serial_get_irq_cycles(void) { return 0; }
 u32 instruction_count;
 u32 reg[64];
 u32 gbp_get_state(void) { return 0; }
@@ -409,7 +240,88 @@ static int rejects_memory_bin_size(void)
   return 0;
 }
 
-int main(void)
+/* Re-tag a document as an opaque binary element of identical total size.
+ * Structural BSON remains valid: 4-byte binary size + subtype + data ==
+ * the original document span. Untyped component lookups used to descend
+ * into this binary body as though it had been recursively validated. */
+static void binary_document(const u8 *parent, const char *key)
+{
+  u8 *value = (u8 *)bson_find_key(parent, key);
+  assert(value); value[-(int)strlen(key)-2] = BSON_TYPE_BIN;
+  put_u32(value, bson_read_u32(value)-5);
+}
+static void expect_preflight_rejection(void)
+{
+  component_reads = 0;
+#ifdef EXPECT_UNSAFE_TYPES
+  assert(gba_load_state(state)); assert(component_reads == 5);
+#else
+  assert(!gba_load_state(state)); assert(component_reads == 0);
+#endif
+}
+static void document_types(void)
+{
+  static const char *const roots[] = {
+    "cpu", "input", "emu", "timers", "memory", "backup", "dma", "sound"
+  };
+  unsigned i;
+  for(i=0;i<sizeof(roots)/sizeof(roots[0]);i++) {
+    make_state(-1,-1,-1,-1);binary_document(state,roots[i]);
+    expect_preflight_rejection();
+  }
+  for(i=0;i<4;i++) {
+    char key[2]={'0'+i,0}, channel[4]={'g','s','0'+i,0};
+    make_state(-1,-1,-1,-1);binary_document(bson_find_key(state,"timers"),key);expect_preflight_rejection();
+    make_state(-1,-1,-1,-1);binary_document(bson_find_key(state,"dma"),key);expect_preflight_rejection();
+    make_state(-1,-1,-1,-1);binary_document(bson_find_key(state,"sound"),channel);expect_preflight_rejection();
+    if(i<2){channel[0]='d';make_state(-1,-1,-1,-1);binary_document(bson_find_key(state,"sound"),channel);expect_preflight_rejection();}
+  }
+#ifdef EXPECT_UNSAFE_TYPES
+  puts("BASELINE accepts all 22 opaque binary component/channel documents");
+#else
+  puts("PASS 22 opaque binary component/channel documents rejected before reads");
+#endif
+}
+static void optional_types(void)
+{
+  static const char *const keys[]={"frame-count","serial-irq-cycles","rand-state","gbp-state"};
+  unsigned i;
+  for(i=0;i<4;i++) {
+    u8 *parent,*value,*padding;u32 padsize;
+    make_state(-1,-1,-1,-1);
+    parent=(u8 *)bson_find_key(state,"emu");value=(u8 *)bson_find_key(parent,keys[i]);
+    padding=(u8 *)bson_find_key(state,"zpadding");padsize=bson_read_u32(padding);
+    /* Replace the four-byte scalar with a five-byte empty BIN. Grow its
+     * parent by one and shrink the writer's padding by one, keeping the
+     * fixed outer size and every later field correctly framed. */
+    memmove(value+5,value+4,(size_t)(state+sizeof(state)-1-(value+5)));
+    value[-(int)strlen(keys[i])-2]=BSON_TYPE_BIN;put_u32(value,0);value[4]=0;
+    put_u32(parent,bson_read_u32(parent)+1);put_u32(padding+1,padsize-1);
+    expect_preflight_rejection();
+  }
+  make_state(-1,-1,-1,-1);
+  {
+    u8 *v=(u8 *)bson_find_key(bson_find_key(state,"backup"),"rtc-base-time");
+    v[-(int)strlen("rtc-base-time")-2]=BSON_TYPE_DOC;
+    expect_preflight_rejection();
+  }
+#ifdef EXPECT_UNSAFE_TYPES
+  puts("BASELINE accepts wrong optional scalar/RTC array types");
+#else
+  puts("PASS wrong optional scalar/RTC array types rejected before reads");
+#endif
+  make_state(-1,-1,-1,-1);
+  for(i=0;i<4;i++)hide_key(bson_find_key(state,"emu"),keys[i]);
+  hide_key(bson_find_key(state,"backup"),"rtc-base-time");
+  hide_key(bson_find_key(state,"input"),"turbo-a");
+  hide_key(bson_find_key(state,"input"),"turbo-b");
+  hide_key(bson_find_key(state,"input"),"gbp-frames");
+  hide_key(bson_find_key(state,"input"),"gbp-sent");
+  component_reads=0;assert(gba_load_state(state));assert(component_reads==5);
+  puts("PASS legacy optional-field omissions accepted");
+}
+
+int main(int argc, char **argv)
 {
   int channel;
   int failures = 0;
@@ -417,6 +329,19 @@ int main(void)
   const u8 *timers_doc, *timer0;
   u8 *prescale_value, *status_value, *frequency_step_value;
 
+  document_types();optional_types();
+  if(argc>1 && !strcmp(argv[1],"types")) return 0;
+#ifdef REWIND
+  {
+    extern u32 gba_rewind_light_restore, gba_rewind_skip_arrays;
+    make_state(-1,-1,-1,-1);
+    gba_rewind_light_restore=1;gba_rewind_skip_arrays=1;
+    gba_save_state(state);component_reads=0;
+    assert(gba_load_state(state));assert(component_reads==5);
+    gba_rewind_light_restore=gba_rewind_skip_arrays=0;
+    puts("PASS trusted light rewind writer layout still loads");
+  }
+#endif
   make_state(-1, -1, -1, -1);
   timers_doc = bson_find_key(state, "timers");
   timer0 = bson_find_key(timers_doc, "0");
@@ -491,7 +416,12 @@ int main(void)
   failures += rejects_input_range("GBP countdown out of range", "gbp-frames", 0xFFFFFFFFu);
   failures += rejects_input_range("input key mask out of range", "prevkey", 0xFFFFFFFFu);
   failures += rejects_sound_range("direct-sound FIFO index out of range", "ds0", "fifo-base", 32);
-  failures += rejects_sound_range("direct-sound fractional field out of range", "ds1", "fifo-frac", 0x01000000u);
+  /* fifo-frac is a supported multi-sample phase, not a [0,1) fraction. */
+  make_state(-1, -1, -1, -1);
+  put_u32((u8 *)bson_find_key(bson_find_key(bson_find_key(state, "sound"), "ds1"), "fifo-frac"), 0x01000000u);
+  component_reads = 0;
+  assert(gba_load_state(state)); assert(component_reads == 5);
+  puts("PASS supported direct-sound phase accepted");
   failures += rejects_sound_range("direct-sound buffer index out of range", "ds0", "buf-idx", BUFFER_SIZE);
   failures += rejects_sound_range("direct-sound shift count out of range", "ds0", "volume", 32);
   failures += rejects_sound_range("PSG square pattern index out of range", "gs0", "sample-tbl", 4);

@@ -50,7 +50,10 @@ void gb_fill_vframe(word color)
 	 * MASK_EN packets regardless of gbSkip. */
 	if (!vframe)
 		return;
-	memset(vframe,0,VFRAME_SIZE);
+	/* GBAdhoc: SGB MASK_EN supplies BGR555, just like the palette path. */
+	color = CONVERT_COLOR15(color);
+	for (size_t i = 0; i < VFRAME_SIZE / sizeof(*vframe); i++)
+		vframe[i] = color;
 }
 
 void gb_init(void)
@@ -214,7 +217,7 @@ size_t gb_save_state(byte *buf)
 		write_state(fd, apu_get_stat_gen(),sizeof(struct apu_stat));
 
 		byte resurved[256];
-		memset(resurved,0,256);
+		apu_save_timing(resurved); /* GBAdhoc: use the existing reserved block. */
 		write_state(fd, resurved,256);//将来のために確保
 
 		// RIN拡張
@@ -300,7 +303,7 @@ size_t gb_save_state(byte *buf)
 		write_state(fd, apu_get_stat_gen(),sizeof(struct apu_stat));
 
 		byte resurved[256],reload=1;
-		memset(resurved,0,256);
+		apu_save_timing(resurved); /* GBAdhoc: use the existing reserved block. */
 //		resurved[0]=1;
 		write_state(fd, &reload,1);
 		write_state(fd, resurved,256);//将来のために確保
@@ -325,11 +328,16 @@ size_t gb_save_state(byte *buf)
 	state_left -= (len); \
 }
 
+#include "state_validate.h"
+
 int gb_restore_state(const byte *buf, size_t size)
 {
 	size_t state_left = size;
 	const int tbl_ram[]={1,1,1,4,16,8}; // 0と1は保険
 	int gb_type,dmy;
+
+	/* GBAdhoc: all validation precedes RAM and bank-pointer mutation. */
+	if (!buf || !gb_state_valid(buf, size)) return -1;
 
 	read_state(fd, &gb_type, sizeof(int));
 
@@ -375,7 +383,8 @@ int gb_restore_state(const byte *buf, size_t size)
 //		}
 
 		byte resurved[256];
-		read_state(fd, resurved, 256);//将来のために確保
+		read_state(fd, resurved, 256);
+		apu_load_timing(resurved);//将来のために確保
 
 		// RIN拡張
 		if(gb_type==2 && sgb_mode){
@@ -482,8 +491,11 @@ int gb_restore_state(const byte *buf, size_t size)
 					lcd_get_mapped_pal(i>>2)[i&3]=renderer_map_color(lcd_get_pal(i>>2)[i&3]);
 			}*/
 //		}
-		byte resurved[256];
-		read_state(fd, resurved,256);//将来のために確保
+		byte resurved[256], reload;
+		/* GBAdhoc: consume the CGB palette-format byte written by save. */
+		read_state(fd, &reload, 1);
+		read_state(fd, resurved,256);
+		apu_load_timing(resurved);//将来のために確保
 	}
 
 #ifdef CHEAT_SUPPORT

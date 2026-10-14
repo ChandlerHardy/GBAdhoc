@@ -46,7 +46,7 @@ extern "C" {
 #ifndef ND_MAX_PAYLOAD
 #define ND_MAX_PAYLOAD   560
 #endif
-#define ND_HDR_SIZE      16
+#define ND_HDR_SIZE      24
 #define ND_MAX_FRAME     (ND_HDR_SIZE + ND_MAX_PAYLOAD)
 #define ND_MAX_CLIENTS   5     /* client_ids 0..4; host is 0 */
 /* ARQ capacity (Gate-3 sizing, ADR-0010): an active RFU link runs a steady

@@ -4,6 +4,7 @@
 #include <string.h>
 
 #include "fe_cheats.h"
+#include "../cheat_format.h"
 
 /* cheats.c (core, CHEATS=1).  Plain ints: see cheats_fe_parse. */
 extern int cheats_fe_parse(unsigned slot, const char *code);
@@ -190,6 +191,17 @@ static int is_code_line(const char *a, const char *b)
 {
    unsigned ntok = 0;
    const char *p = a;
+   unsigned used;
+   /* An explicit family tag makes this a code line even if the payload is
+    * malformed. Never turn a refused tagged code into a new cheat title. */
+   if (cheat_family_prefix(a, (unsigned)(b - a), &used))
+      return 1;
+   /* Preserve a recognizable address with a malformed/truncated value as
+    * code too. Otherwise the valid prefix of an entry could be enabled
+    * after the bad continuation silently became a title. */
+   for (used = 0; a + used < b && is_hex(a[used]); used++) {}
+   if (used >= 8 && (a + used == b || is_sep(a[used]) || a[used] == ':'))
+      return 1;
    while (p < b)
    {
       const char *t;

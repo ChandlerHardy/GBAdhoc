@@ -543,7 +543,7 @@ static void cpu_io_write_02( word adr,byte dat )
 		}
 }
 static void cpu_io_write_03( word adr,byte dat ){ ; }
-static void cpu_io_write_04( word adr,byte dat ){ g_regs.DIV=0; }
+static void cpu_io_write_04( word adr,byte dat ){ apu_div_reset(); g_regs.DIV=0; div_clock=0; } /* GBAdhoc: DIV-APU falling edge */
 static void cpu_io_write_05( word adr,byte dat ){ g_regs.TIMA=dat; }
 static void cpu_io_write_06( word adr,byte dat ){ g_regs.TMA=dat; }
 static void cpu_io_write_07( word adr,byte dat )

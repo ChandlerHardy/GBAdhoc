@@ -28,6 +28,9 @@ int  me_host_init(const char *base_dir);
  * ignore failure, behave exactly as before on any model. */
 void me_host_require_sysevent(int on);
 int  me_host_up(void);
+/* Module lifetime, independent of watchdog health. A failed watchdog does
+ * not reset the ME or release its buffers. Remains true if shutdown fails. */
+int  me_host_loaded(void);
 void me_host_shutdown(void);
 /* The watchdog declared the engine dead (it fell back to the CPU). */
 int  me_host_was_dead(void);

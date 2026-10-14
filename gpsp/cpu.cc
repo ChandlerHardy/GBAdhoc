@@ -3613,14 +3613,23 @@ void init_cpu(void)
 
 bool cpu_check_savestate(const u8 *src)
 {
+  u32 saved[REG_ARCH_COUNT];
   const u8 *cpudoc = bson_find_key(src, "cpu");
   if (!cpudoc)
     return false;
 
-  return bson_contains_key(cpudoc, "bus-value", BSON_TYPE_INT32) &&
+  if (!(bson_contains_key(cpudoc, "bus-value", BSON_TYPE_INT32) &&
          bson_has_int32_array(cpudoc, "regs", REG_ARCH_COUNT) &&
          bson_has_int32_array(cpudoc, "spsr", 6) &&
-         bson_has_int32_array(cpudoc, "regmod", 7 * 7);
+         bson_has_int32_array(cpudoc, "regmod", 7 * 7) &&
+         bson_read_int32_array(cpudoc, "regs", saved, REG_ARCH_COUNT)))
+    return false;
+  /* The internal mode selects banked registers and SPSR arrays. Checking
+   * only their serialized lengths let an imported mode address past them
+   * on the next interrupt or privileged instruction. */
+  return (saved[CPU_MODE] == MODE_USER ||
+          (saved[CPU_MODE] >= MODE_SYSTEM && saved[CPU_MODE] <= MODE_UNDEFINED)) &&
+         saved[CPU_HALT_STATE] <= CPU_DMA;
 }
 
 

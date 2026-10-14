@@ -735,6 +735,12 @@ bool sound_check_savestate(const u8 *src)
   if (!bson_read_int32(snddoc, "gbc-buf-idx", &index) ||
       index >= BUFFER_SIZE || (index & 1))
     return false;
+  /* These values directly index the mixer's tables. Register writes mask
+   * them, but imported/damaged states bypass those write paths. */
+  if (!bson_read_int32(snddoc, "gbc-ms-vol-left", &index) || index > 7 ||
+      !bson_read_int32(snddoc, "gbc-ms-vol-right", &index) || index > 7 ||
+      !bson_read_int32(snddoc, "gbc-ms-vol", &index) || index > 3)
+    return false;
 
 
   for (d = 0; d < 2; d++)
@@ -782,6 +788,20 @@ bool sound_check_savestate(const u8 *src)
       return false;
     if (!bson_read_int32(sndchan, "sweep-shift", &index) || index > 7)
       return false;
+    /* Rate feeds 1/(2048-rate) when output frequency changes or a sweep
+     * advances. Wave volume must retain the mixer's signed-product bound. */
+    if (!bson_read_int32(sndchan, "rate", &index) || index > 2047 ||
+        !bson_read_int32(sndchan, "wav-vol", &index) || index > 16384)
+      return false;
+    if (g == 3)
+    {
+      u32 noise_type;
+      if (!bson_read_int32(sndchan, "noise-type", &noise_type) || noise_type > 1 ||
+          !bson_read_int32(sndchan, "sample-idx", &index) ||
+          index >= ((noise_type ? 126u : 32767u) << 16) ||
+          !bson_read_int32(sndchan, "freq-step", &index) || index > (16u << 16))
+        return false;
+    }
   }
 
   return true;

@@ -35,6 +35,10 @@
 u8 ewram[1024 * 256 * 2];
 u8 iwram[1024 * 32 * 2];
 u16 io_registers[512];
+#ifdef REWIND
+u8 gba_rewind_clean[RW_CLEAN_BYTES];
+extern u32 gba_rewind_cheat_gen;
+#endif
 int dynarec_enable = 1;
 static unsigned flushes;
 void flush_translation_cache_ram(void) { flushes++; }
@@ -362,6 +366,306 @@ static void test_core(void)
       cheat_clear();                       /* the pool comes back */
       assert(cheat_parse(1, "82000010 0001") == CheatNoError);
    }
+}
+
+/* Frozen vectors produced independently using mGBA's documented TEA keys
+ * and DEADFACE table reseeding. The public D8BAE4D9 4864DCE5 AR3 master
+ * decodes to C40005EC 00008401 and must be refused, never ignored. */
+static void test_gs_cipher(void)
+{
+   static const char *const vectors[] = {
+      "GS1: DF4FF124 9EB1FD0E+93B16540 389E4302+DD4EC3B1 CBA7D882",
+      "AR3: 00AE5A50 2CA38934+6B60C2F8 35421A85+23137AA8 E43614B1",
+      "GS1: 70BDB80D 69F37FCB+D28077B2 3E18D0B4+69104A15 CF0229DF+"
+            "B365B7AD 35A7B5E5",
+      "AR3: 9C7FE77C A5352DCA+B78EBC6F 5DA816AE+DBF4AFC2 1AB549DA+"
+            "A33AD5AE 4A9748B1"
+   };
+   unsigned i;
+   for (i = 0; i < sizeof(vectors) / sizeof(*vectors); i++)
+   {
+      reset();
+      assert(cheat_check(vectors[i]) == CheatNoError && !cheats_active);
+      assert(cheat_parse(0, vectors[i]) == CheatNoError);
+      frame();
+      assert(ewram[0x10] == 0xAB && ew16(0x12) == 0xCDEF &&
+             ew32(0x14) == 0x12345678);
+      /* A prior entry's reseed must not affect another parse/check. */
+      assert(cheat_check(vectors[i & 1]) == CheatNoError);
+      assert(cheat_parse(1, vectors[i & 1]) == CheatNoError);
+   }
+   assert(cheat_check("AR3: D8BAE4D9 4864DCE5") == CheatErrorUnsupported);
+   assert(cheat_check("D8BAE4D9 4864DCE5") == CheatErrorGameShark);
+   assert(cheat_check("GS1RAW: DEADFACE 00001234+02000010 000000AB") == CheatNoError);
+   assert(cheat_check("AR3RAW: DEADFACE 00001234+00200010 000000AB") == CheatNoError);
+   assert(cheat_check("AR3RAW: DEADFACE 00011234+00200010 000000AB") == CheatErrorUnsupported);
+   assert(cheat_check("GS1RAW: DEADFACE 00001234") == CheatErrorSyntax);
+}
+
+static void test_gs_operations(void)
+{
+   unsigned i, w, cond;
+   char code[256];
+   reset();
+   assert(cheat_parse(0, " gs1raw:02000011 000000AB;12000012 0000CDEF,"
+                         "23007FFC89ABCDEF") == CheatNoError);
+   assert(cheat_parse(1, "AR3RAW:00200020 000002CC+02200024 0001BEEF+"
+                         "04307FF8 12345678") == CheatNoError);
+   ewram[0x40000 + 0x12] = 1;
+   iwram[0x7FFF] = 1;
+   frame();
+   assert(ewram[0x11] == 0xAB && ew16(0x12) == 0xCDEF);
+   assert(ewram[0x20] == 0xCC && ewram[0x21] == 0xCC && ewram[0x22] == 0xCC);
+   assert(ewram[0x23] == 0 && ew16(0x24) == 0xBEEF && ew16(0x26) == 0xBEEF);
+   assert(readaddress32(iwram + 0x8000, 0x7FF8) == 0x12345678);
+   assert(readaddress32(iwram + 0x8000, 0x7FFC) == 0x89ABCDEF);
+   assert(flushes == 1);
+   frame();
+   assert(flushes == 1); /* unchanged tagged writes never flush twice */
+   cheats_set_suspended(1);
+   ewram[0x11] = 0;
+   cheats_apply_frame(); /* guard also works when called directly */
+   assert(ewram[0x11] == 0 && flushes == 1);
+   cheats_set_suspended(0);
+   frame();
+   assert(ewram[0x11] == 0xAB);
+
+   /* All four GS1 16-bit predicates, below/equal/above their threshold. */
+   for (cond = 0; cond < 4; cond++)
+      for (i = 6; i <= 8; i++)
+      {
+         int pass = cond == 0 ? i == 7 : cond == 1 ? i != 7 :
+                    cond == 2 ? i <= 7 : i >= 7;
+         reset();
+         address16(ewram, 0x100) = eswap16(i);
+         snprintf(code, sizeof(code), "GS1RAW:D2000100 %08X+22000200 12345678",
+                  (cond << 20) | 7);
+         assert(cheat_parse(0, code) == CheatNoError);
+         frame();
+         assert(ew32(0x200) == (pass ? 0x12345678u : 0));
+      }
+   /* AR3 equality/inequality/unsigned less/greater/bit-test, every width. */
+   for (w = 0; w < 3; w++)
+      for (cond = 1; cond <= 7; cond++)
+      {
+         if (cond == 3 || cond == 4) continue; /* unsupported signed forms */
+         for (i = 6; i <= 8; i++)
+         {
+            int pass = cond == 1 ? i == 7 : cond == 2 ? i != 7 :
+                       cond == 5 ? i < 7 : cond == 6 ? i > 7 : (i & 7) != 0;
+            reset();
+            address32(ewram, 0x100) = eswap32(i);
+            snprintf(code, sizeof(code), "AR3RAW:%08X 00000007+04200200 12345678",
+                     (cond << 27) | (w << 25) | 0x00200100u);
+            assert(cheat_parse(0, code) == CheatNoError);
+            frame();
+            assert(ew32(0x200) == (pass ? 0x12345678u : 0));
+         }
+      }
+   /* False next-two skips a whole fill including its private payload. */
+   reset();
+   assert(cheat_parse(0, "AR3RAW:4A200100 00000001+00200200 000003AA+"
+                         "04200204 12345678+00200208 000000BB") == CheatNoError);
+   frame();
+   assert(ew32(0x200) == 0 && ew32(0x204) == 0 && ewram[0x208] == 0xBB);
+   address16(ewram, 0x100) = eswap16(1);
+   frame();
+   assert(ew32(0x200) == 0xAAAAAAAAu && ew32(0x204) == 0x12345678);
+   /* Reseed metadata is not counted as a target operation. */
+   reset();
+   assert(cheat_parse(0, "GS1RAW:D2000100 00000001+DEADFACE 00001234+"
+                         "22000200 12345678") == CheatNoError);
+   frame();
+   assert(ew32(0x200) == 0);
+
+#ifdef REWIND
+   {
+      u32 generation = gba_rewind_cheat_gen;
+      assert(cheat_check("GS1RAW:02000010 00000001") == CheatNoError);
+      assert(gba_rewind_cheat_gen == generation);
+      assert(cheat_parse(1, "GS1RAW:02000010 00000001") == CheatNoError);
+      assert(gba_rewind_cheat_gen != generation);
+      generation = gba_rewind_cheat_gen;
+      cheats_set_suspended(1);
+      assert(gba_rewind_cheat_gen != generation);
+      generation = gba_rewind_cheat_gen;
+      cheats_set_suspended(1);
+      assert(gba_rewind_cheat_gen == generation);
+      cheats_set_suspended(0);
+      memset(gba_rewind_clean, 1, sizeof(gba_rewind_clean));
+      frame();
+      assert(gba_rewind_clean[RW_CLEAN_EWRAM] == 0);
+   }
+#endif
+}
+
+static void test_gs_refusals(void)
+{
+   static const struct { const char *s; cheat_error error; } bad[] = {
+      { "GS1:", CheatErrorSyntax },
+      { "GS1RAW:02000010 0000000G", CheatErrorSyntax },
+      { "GS1RAW:02000010 000000AB garbage", CheatErrorSyntax },
+      { "GS1RAW:02000010 000000AB+AR3RAW:00200010 000000AB", CheatErrorMixed },
+      { "GS1RAW:82000010 0001", CheatErrorMixed },
+      { "AR3RAW:02000010:AB", CheatErrorMixed },
+      { "GS1RAW:02000010 00000100", CheatErrorSyntax },
+      { "GS1RAW:12000010 00010000", CheatErrorSyntax },
+      { "GS1RAW:12000011 00000001", CheatErrorAlign },
+      { "GS1RAW:22000012 00000001", CheatErrorAlign },
+      { "AR3RAW:02200011 00000001", CheatErrorAlign },
+      { "AR3RAW:04200012 00000001", CheatErrorAlign },
+      { "GS1RAW:06000010 00000001", CheatErrorRegion },
+      { "GS1RAW:0E000010 00000001", CheatErrorRegion },
+      { "GS1RAW:D8000010 00000001+02000010 00000001", CheatErrorRegion },
+      { "AR3RAW:04800010 00000001", CheatErrorRegion },
+      { "AR3RAW:04E00010 00000001", CheatErrorRegion },
+      { "AR3RAW:0C400010 00000001+00200010 00000001", CheatErrorRegion },
+      { "GS1RAW:60000000 00000001", CheatErrorUnsupported },
+      { "GS1RAW:F8000000 00000001", CheatErrorUnsupported },
+      { "GS1RAW:30000002 02000010", CheatErrorUnsupported },
+      { "GS1RAW:82000010 00000001", CheatErrorUnsupported },
+      { "GS1RAW:D2000010 00400001", CheatErrorUnsupported },
+      { "GS1RAW:D2000010 00000001", CheatErrorNotSupported },
+      { "AR3RAW:4A200010 00000001+00200020 00000001", CheatErrorNotSupported },
+      { "AR3RAW:00000000 80000010", CheatErrorUnsupported },
+      { "AR3RAW:00000000 40000000", CheatErrorUnsupported },
+      { "AR3RAW:C4000000 00000001", CheatErrorUnsupported },
+      { "AR3RAW:C6000000 00000001", CheatErrorUnsupported },
+      { "AR3RAW:44200010 00000001", CheatErrorUnsupported },
+      { "AR3RAW:84200010 00000001", CheatErrorUnsupported },
+      { "AR3RAW:8A200010 00000001", CheatErrorUnsupported },
+      { "AR3RAW:CA200010 00000001", CheatErrorUnsupported },
+      { "AR3RAW:1A200010 00000001", CheatErrorUnsupported },
+      { "AR3RAW:06200010 00000001", CheatErrorUnsupported },
+      { "AR3RAW:01200010 00000001", CheatErrorUnsupported },
+      { "AR3RAW:04200010 001DC0DE", CheatErrorUnsupported },
+      { "AR3RAW:08200010 00000100+00200020 00000001", CheatErrorSyntax },
+      { "AR3RAW:00200010 00100001", CheatErrorWork }
+   };
+   unsigned i;
+   char code[256];
+   for (i = 0; i < sizeof(bad) / sizeof(*bad); i++)
+   {
+      reset();
+      assert(cheat_check(bad[i].s) == bad[i].error);
+      assert(cheat_parse(0, bad[i].s) == bad[i].error);
+      assert(cheats_active == 0);
+      frame();
+      assert(ew32(0x10) == 0 && flushes == 0);
+   }
+   /* A good first operation does not survive an unsupported tail. */
+   reset();
+   assert(cheat_parse(0, "GS1RAW:02000010 000000AB") == CheatNoError);
+   assert(cheat_parse(0, "GS1RAW:02000010 000000CD+F8000000 00000000")
+          == CheatErrorUnsupported);
+   assert(!cheats_active);
+   frame();
+   assert(ewram[0x10] == 0 && cheat_master_hook == 0xFFFFFFFFu);
+   /* Every disallowed region is rejected for every assignment width. */
+   for (i = 0; i < 16; i++)
+   {
+      if (i == 2 || i == 3) continue;
+      snprintf(code, sizeof(code), "GS1RAW:%08X 00000001", 0x20000010u | (i << 24));
+      assert(cheat_check(code) == CheatErrorRegion);
+      snprintf(code, sizeof(code), "AR3RAW:%08X 00000001", 0x04000010u | (i << 20));
+      assert(cheat_check(code) == CheatErrorRegion);
+   }
+}
+
+static void test_cheat_work_budget(void)
+{
+   reset();
+   assert(cheat_parse(0, "AR3RAW:00200000 000FFF5A") == CheatNoError);
+   assert(cheat_parse(1, "GS1RAW:02002000 00000001") == CheatErrorWork);
+   assert(cheat_parse(1, "82002000 0001") == CheatErrorWork);
+   frame();
+   assert(ewram[0] == 0x5A && ewram[4095] == 0x5A && ewram[4096] == 0);
+   reset();
+   assert(cheat_parse(0, "AR3RAW:00200000 0008005A+00202000 0008005A") == CheatErrorWork);
+   assert(!cheats_active);
+   frame();
+   assert(ewram[0] == 0);
+   assert(cheat_parse(0, "GS1RAW:02000000 00000001") == CheatNoError);
+   reset();
+   assert(cheat_parse(0, "42000000 0001+00000801 0002+42002000 0001+00000801 0002")
+          == CheatErrorWork);
+   assert(!cheats_active);
+   assert(cheat_parse(0, "42000000 0001+00001000 0002") == CheatNoError);
+   assert(cheat_parse(1, "AR3RAW:00203000 00000001") == CheatErrorWork);
+   cheat_clear();
+   assert(cheat_parse(0, "AR3RAW:00203000 00000001") == CheatNoError);
+   /* GS records compete for exactly the same bounded pool as CB. */
+   {
+      static char full[(CHEAT_POOL_RECORDS + 1) * 18 + 16];
+      char *p = full;
+      unsigned i;
+      reset();
+      p += sprintf(p, "GS1RAW:");
+      for (i = 0; i <= CHEAT_POOL_RECORDS; i++)
+         p += sprintf(p, "02000010 00000001+");
+      assert(cheat_parse(0, full) == CheatErrorTooBig && !cheats_active);
+      full[7 + CHEAT_POOL_RECORDS * 18] = '\0';
+      assert(cheat_parse(0, full) == CheatNoError);
+      assert(cheat_parse(1, "82000010 0001") == CheatErrorTooBig);
+   }
+}
+
+static void test_gs_files(void)
+{
+   static const char plain[] =
+      "[GS first]\nGS1RAW:02000010 000000AB\n12000012 0000CDEF\n"
+      "[AR next]\nar3raw:\n04200014 12345678\n"
+      "[Malformed]\nGS1RAW: garbage\n"
+      "[Bad continuation]\nAR3RAW:00200020 00000001\n00200021 WRONG\n"
+      "[Old ambiguous]\n12345678 9ABCDEF0\n";
+   static const char cht[] =
+      "cheats = 2\ncheat0_desc = \"Encrypted\"\n"
+      "cheat0_code = \"AR3:00AE5A50 2CA38934+23137AA8 E43614B1\"\n"
+      "cheat0_enable = true\ncheat1_desc = \"Bad\"\n"
+      "cheat1_code = \"GS1RAW: nonsense\"\ncheat1_enable = true\n";
+   char state[FE_CHEATS_STATE_MAX];
+   size_t n;
+   reset();
+   fe_cheats_load_text(plain, sizeof(plain) - 1, FE_CHEATS_SYS_GBA);
+   assert(fe_cheats_count() == 5 && fe_cheats_usable_count() == 2);
+   assert(fe_cheats_get(2)->error == CheatErrorSyntax);
+   assert(fe_cheats_get(3)->error == CheatErrorSyntax);
+   assert(fe_cheats_get(4)->error == CheatErrorGameShark);
+   assert(!fe_cheats_enabled_count() && !cheats_active);
+   fe_cheats_attach(1);
+   assert(fe_cheats_set(0, 1) == 0 && fe_cheats_set(1, 1) == 0);
+   assert(fe_cheats_set(2, 1) == CheatErrorSyntax);
+   assert(fe_cheats_set(3, 1) == CheatErrorSyntax);
+   frame();
+   assert(ewram[0x10] == 0xAB && ew16(0x12) == 0xCDEF && ew32(0x14) == 0x12345678);
+   assert(ewram[0x20] == 0);
+   fe_cheats_lock(1);
+   ewram[0x10] = 0;
+   frame();
+   assert(!ewram[0x10] && fe_cheats_enabled_count() == 2);
+   fe_cheats_lock(0);
+   frame();
+   assert(ewram[0x10] == 0xAB);
+   n = fe_cheats_state_serialise(state, sizeof(state));
+   assert(n < sizeof(state));
+   fe_cheats_load_text(plain, sizeof(plain) - 1, FE_CHEATS_SYS_GBA);
+   assert(!fe_cheats_enabled_count());
+   fe_cheats_state_parse(state, n);
+   assert(fe_cheats_enabled_count() == 2);
+   /* Changing the family is a changed identity, even with identical digits. */
+   {
+      static const char changed[] = "[GS first]\nAR3RAW:02000010 000000AB\n12000012 0000CDEF\n";
+      fe_cheats_load_text(changed, sizeof(changed) - 1, FE_CHEATS_SYS_GBA);
+      fe_cheats_state_parse(state, n);
+      assert(!fe_cheats_enabled_count());
+   }
+   fe_cheats_load_text(cht, sizeof(cht) - 1, FE_CHEATS_SYS_GBA);
+   assert(fe_cheats_count() == 2 && fe_cheats_usable_count() == 1);
+   assert(!fe_cheats_enabled_count() && !cheats_active);
+   assert(fe_cheats_get(1)->error == CheatErrorSyntax);
+   assert(fe_cheats_set(0, 1) == 0);
+   frame();
+   assert(ewram[0x10] == 0xAB && ew32(0x14) == 0x12345678);
 }
 
 static const char PLAIN[] =
@@ -737,13 +1041,34 @@ static void test_fuzz(void)
    reset();
    for (round = 0; round < FUZZ_ROUNDS; round++)
    {
-      unsigned len = rnd() % (sizeof(text) - 1), mode = rnd() % 4;
+      unsigned len = rnd() % (sizeof(text) - 1), mode = rnd() % 6;
       if (mode == 0)
          for (i = 0; i < len; i++)
             text[i] = (char)rnd();
       else if (mode == 1)
          for (i = 0; i < len; i++)
             text[i] = alpha[rnd() % (sizeof(alpha) - 1)];
+      else if (mode >= 4)
+      {
+         static const char *const families[] = { "GS1:", "GS1RAW:", "AR3:", "AR3RAW:" };
+         char *w = text;
+         unsigned lines = 1 + rnd() % 12;
+         w += sprintf(w, "%s", families[rnd() % 4]);
+         for (i = 0; i < lines; i++)
+         {
+            u32 a = rnd(), v = rnd();
+            if (mode == 5)
+            {
+               /* Frequent legal direct AR/GS RAM writes and bounded fills,
+                * interspersed with unsupported or non-RAM operations. */
+               a = (rnd() % 2 ? 0x00200000u : 0x02000000u) |
+                   (rnd() & 0xFCu) | ((rnd() % 3) << 25);
+               v &= 0xFF;
+            }
+            w += sprintf(w, "%08X %08X+", a, v);
+         }
+         len = (unsigned)(w - text);
+      }
       else
       {
          /* Well-formed CodeBreaker lines with random opcodes, mostly in RAM. */
@@ -825,13 +1150,19 @@ static void test_example(void)
 int main(void)
 {
    test_core();
+   test_gs_cipher();
+   test_gs_operations();
+   test_gs_refusals();
+   test_cheat_work_budget();
+   test_gs_files();
    test_example();
    test_plain();
    test_shapes();
    test_cht();
    test_gb();
    test_fuzz();
-   puts("PASS cheats: strict parser, RAM-only accessors, flush trigger, "
-        "cheat files, .on state, GB codes, fuzz");
+   puts("PASS cheats: GS1/AR3 encrypted and raw vectors, reseeds, RAM effects, "
+        "conditionals, transactional rejection, work limits, rewind, "
+        "flush trigger, link suspension, cheat files, .on state, GB, fuzz");
    return 0;
 }

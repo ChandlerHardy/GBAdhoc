@@ -369,6 +369,9 @@ const uint16_t *fe_host_last_frame(size_t *pitch_bytes);
  * while a wireless session is active — RFU state is not serialized). */
 int fe_host_state_save(const char *path);
 int fe_host_state_load(const char *path);
+/* Restore a missing slot from an interrupted .old replacement. 0 = nothing
+ * to recover, 1 = recovered, -1 = I/O/path failure. Call before UI slot stats. */
+int fe_host_state_recover(const char *path);
 
 /* GB/GBC DMG palette (GBCORE_PALETTE_* ids).  Setting it applies to the
  * running game when there is one, and to every later boot; the names are

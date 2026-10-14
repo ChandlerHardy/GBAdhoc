@@ -266,7 +266,14 @@ def suites(env: Env, baseline: Path | None):
          "-fsanitize=address,undefined -Ifrontend-common "
          "-o /tmp/t_fe_rewind tools/tests/test_fe_rewind.c "
          "frontend-common/fe_rewind.c frontend-common/fe_rewind_pack.c && "
-         "ASAN_OPTIONS=detect_leaks=0 /tmp/t_fe_rewind"),
+         "ASAN_OPTIONS=detect_leaks=0 /tmp/t_fe_rewind && "
+         "python3 tools/run_clock_reliability.py && "
+         "gcc -std=gnu99 -O1 -g -DREWIND -ffunction-sections -fdata-sections "
+         "-fsanitize=address,undefined -I. -Inetdrv -Ifrontend-common "
+         "-Ilibretro -Ilibretro/libretro-common/include "
+         "tools/tests/test_rewind_host_fault.c -Wl,--gc-sections "
+         "-o /tmp/t_rewind_host_fault && "
+         "ASAN_OPTIONS=detect_leaks=0 /tmp/t_rewind_host_fault"),
 
         ("mystery_gift", True, lambda: None,
          "python3 tools/run_mgift_tests.py"),
@@ -304,7 +311,19 @@ def suites(env: Env, baseline: Path | None):
          "-Ifrontend-common -Inetdrv -Ilibretro/libretro-common/include "
          "-o /tmp/t_sram_interrupted_write "
          "tools/test_sram_interrupted_write.c -Wl,--gc-sections && "
-         "ASAN_OPTIONS=detect_leaks=0 /tmp/t_sram_interrupted_write"),
+         "ASAN_OPTIONS=detect_leaks=0 /tmp/t_sram_interrupted_write && "
+         "gcc -std=gnu99 -O1 -g -w -fsanitize=address,undefined "
+         "-ffunction-sections -fdata-sections -Ilibretro "
+         "-Ilibretro/libretro-common/include -Ifrontend-common -Inetdrv "
+         "tools/tests/test_review_persistence.c -Wl,--gc-sections "
+         "-o /tmp/t_review_persistence && "
+         "ASAN_OPTIONS=detect_leaks=1 /tmp/t_review_persistence && "
+         "gcc -std=gnu99 -O1 -g -w -fsanitize=address,undefined "
+         "-ffunction-sections -fdata-sections -Ilibretro "
+         "-Ilibretro/libretro-common/include -Ifrontend-common -Inetdrv "
+         "tools/tests/test_battery_persistence.c -Wl,--gc-sections "
+         "-o /tmp/t_battery_persistence && "
+         "ASAN_OPTIONS=detect_leaks=1 /tmp/t_battery_persistence"),
 
         # FF durability nudge: a battery save made during fast-forward is
         # persisted without waiting for FF to end; zero yields when nothing
@@ -385,7 +404,7 @@ def suites(env: Env, baseline: Path | None):
          "gcc -std=gnu99 -O1 -g -Wall -Wextra -Werror "
          "-Wno-old-style-declaration -Wno-unused-parameter "
          "-fsanitize=address,undefined -ffunction-sections -fdata-sections "
-         "-DGPSP_CHEATS=1 -DHAVE_DYNAREC -DINLINE=inline "
+         "-DGPSP_CHEATS=1 -DHAVE_DYNAREC -DREWIND -DINLINE=inline "
          "-Ilibretro/libretro-common/include -Ifrontend-common "
          "-o /tmp/t_fe_cheats tools/test_fe_cheats.c cheats.c "
          "frontend-common/fe_cheats.c -Wl,--gc-sections && "
@@ -489,7 +508,8 @@ def suites(env: Env, baseline: Path | None):
           "gcc -std=gnu99 -w -DGPSP_PLAYABLE -DUSE_PSP_RGB565_FORMAT "
           "-ffunction-sections -fdata-sections "
           "-I%s -Ifrontend-common -Ipsp tools/test_video_geometry.c "
-          "-Wl,--gc-sections -o /tmp/t_vgeo565 && /tmp/t_vgeo565")
+          "-Wl,--gc-sections -o /tmp/t_vgeo565 && /tmp/t_vgeo565 && "
+          "python3 tools/tests/test_psp_runtime.py")
          % (sdk, sdk, sdk)),
 
         ("perf_loop", False, lambda: None,
@@ -505,7 +525,18 @@ def suites(env: Env, baseline: Path | None):
         # aggregate gate as the emulator-side RFU tests.
         ("netdrv", True,
          lambda: None if (env.wsl or have("make")) else "make not found",
-         "make -C netdrv test"),
+         ("make -C netdrv test && "
+          "gcc -std=gnu99 -O1 -g -Wall -Wextra -fsanitize=address,undefined "
+          "-Inetdrv tools/tests/test_review_network.c netdrv/netdrv.c "
+          "-o /tmp/t_review_network && "
+          "ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=halt_on_error=1 "
+          "/tmp/t_review_network && "
+          "gcc -std=gnu99 -O1 -g -Wall -Wextra -fsanitize=address,undefined "
+          "-DND_MAX_PAYLOAD=144 -DND_TXQ_CAP=384 -Inetdrv "
+          "tools/tests/test_review_network.c netdrv/netdrv.c "
+          "-o /tmp/t_review_network_psp && "
+          "ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=halt_on_error=1 "
+          "/tmp/t_review_network_psp")),
 
         ("sound_timer_step", True, lambda: None,
          ("gcc -std=gnu99 -Wall -Wextra -Wno-old-style-declaration "

@@ -71,6 +71,8 @@ size_t nd_wire_build(uint8_t *out, const nd_hdr *h, const void *payload)
    put16(out + 10, h->ack);
    put16(out + 12, h->len);
    put16(out + 14, 0);
+   put32(out + 16, h->src_nonce);
+   put32(out + 20, h->dst_nonce);
    if (h->len)
       memcpy(out + ND_HDR_SIZE, payload, h->len);
    crc = nd_crc16(0xFFFF, out, ND_HDR_SIZE + h->len);
@@ -102,6 +104,8 @@ int nd_wire_parse(const uint8_t *buf, size_t sz, nd_hdr *h,
       h->ack   = get16(buf + 10);
       h->len   = get16(buf + 12);
       h->crc   = get16(buf + 14);
+      h->src_nonce = get32(buf + 16);
+      h->dst_nonce = get32(buf + 20);
       if (h->len > ND_MAX_PAYLOAD || sz != (size_t)(ND_HDR_SIZE + h->len))
          why = 4;    /* EXACT length or nothing */
       else
@@ -188,6 +192,7 @@ typedef struct nd_peer
    uint8_t  id;
    uint8_t  mac[6];
    uint32_t nonce;
+   uint32_t admission_challenge;
    char     nick[ND_NICK_LEN];
 
    /* ARQ tx: ring of queued reliable payloads; [head..head+count) live,
@@ -226,6 +231,17 @@ typedef struct nd_peer
 
 enum { ND_S_IDLE, ND_S_JOINING, ND_S_ACTIVE };
 
+/* Provisional admissions never expose a peer or disturb its current channel.
+ * Four fixed slots, no allocation. A fresh challenge rejects delayed CONFIRMs
+ * even when an old JOIN arrives again at the same address. */
+typedef struct nd_offer
+{
+   uint32_t nonce, challenge;
+   uint64_t expires;
+   uint8_t mac[6];
+   char nick[ND_NICK_LEN];
+} nd_offer;
+
 struct netdrv
 {
    nd_transport tp;
@@ -242,6 +258,9 @@ struct netdrv
    uint8_t  host_mac[6];         /* client: learned from WELCOME */
    uint8_t  roster_gen;
    uint8_t  have_gen;
+   int ever_started;
+   uint32_t challenge_next, offer_challenge, offer_host_nonce;
+   nd_offer offers[ND_MAX_CLIENTS - 1];
 
    nd_peer  peers[ND_MAX_CLIENTS];   /* indexed by client_id; self unused */
 
@@ -297,9 +316,9 @@ static uint32_t tmo(uint32_t override_us, uint32_t def_us)
 
 /* -------------------------------------------------------------- tx paths -- */
 
-static void nd_xmit(netdrv *nd, const uint8_t mac[6], uint8_t type,
+static void nd_xmit_instance(netdrv *nd, const uint8_t mac[6], uint8_t type,
                     uint8_t dst, uint16_t seq, uint16_t ack,
-                    const void *payload, uint16_t len)
+                    const void *payload, uint16_t len, uint32_t dst_nonce)
 {
    nd_hdr h;
    size_t sz;
@@ -309,6 +328,8 @@ static void nd_xmit(netdrv *nd, const uint8_t mac[6], uint8_t type,
    h.seq  = seq;
    h.ack  = ack;
    h.len  = len;
+   h.src_nonce = nd->cfg.join_nonce;
+   h.dst_nonce = dst_nonce;
    sz = nd_wire_build(nd->scratch, &h, payload);
    nd->st.tx_frames++;
    nd->st.tx_bytes += (uint32_t)sz;
@@ -316,6 +337,15 @@ static void nd_xmit(netdrv *nd, const uint8_t mac[6], uint8_t type,
       nd->tp.send_to(nd->tp.ctx, mac, nd->scratch, sz);
    else
       nd->tp.broadcast(nd->tp.ctx, nd->scratch, sz);
+}
+
+static void nd_xmit(netdrv *nd, const uint8_t mac[6], uint8_t type,
+                    uint8_t dst, uint16_t seq, uint16_t ack,
+                    const void *payload, uint16_t len)
+{
+   uint32_t nonce = dst < ND_MAX_CLIENTS && nd->peers[dst].active
+                     ? nd->peers[dst].nonce : 0;
+   nd_xmit_instance(nd, mac, type, dst, seq, ack, payload, len, nonce);
 }
 
 /* Unicast to an established peer, stamping the piggyback ack. */
@@ -935,7 +965,35 @@ static void session_teardown(netdrv *nd, int reason)
       nd->cb.session_stopped(nd->cb.user, reason);
 }
 
-/* Client: apply a roster payload from the host. */
+/* Validate every entry before changing generation, channels or callbacks. */
+static int roster_valid(const uint8_t mac[6], uint32_t host_nonce,
+                        const uint8_t *pl, uint16_t len)
+{
+   uint8_t seen[ND_MAX_CLIENTS] = { 0 };
+   int i, j, count;
+   if (len < 3)
+      return 0;
+   count = pl[2];
+   if (!count || count > ND_MAX_CLIENTS ||
+       len != (uint16_t)(3 + count * ND_ROSTER_ENTRY_SIZE))
+      return 0;
+   for (i = 0; i < count; i++)
+   {
+      const uint8_t *e = pl + 3 + i * ND_ROSTER_ENTRY_SIZE;
+      uint8_t id = e[0];
+      if (id >= ND_MAX_CLIENTS || seen[id])
+         return 0;
+      seen[id] = 1;
+      for (j = 0; j < i; j++)
+         if (memcmp(e + 1, pl + 4 + j * ND_ROSTER_ENTRY_SIZE, 6) == 0)
+            return 0;            /* one channel per transport address */
+      if (id == 0 && (memcmp(e + 1, mac, 6) != 0 || get32(e + 7) != host_nonce))
+         return 0;               /* host entry must name the sender */
+   }
+   return seen[0];
+}
+
+/* Client: apply a fully validated roster payload from the host. */
 static void roster_apply(netdrv *nd, const uint8_t *pl, uint16_t len)
 {
    uint8_t gen, count, present[ND_MAX_CLIENTS] = { 0 };
@@ -965,7 +1023,10 @@ static void roster_apply(netdrv *nd, const uint8_t *pl, uint16_t len)
       nick[ND_NICK_LEN - 1] = '\0';
       if (id == nd->local_id)
       {
-         present[id] = 1;         /* ourselves */
+         /* The id may have been reassigned after this instance stalled.
+          * Only the admitted address AND nonce still name ourselves. */
+         present[id] = nonce == nd->cfg.join_nonce &&
+                       memcmp(e + 1, nd->local_mac, 6) == 0;
          continue;
       }
       present[id] = 1;
@@ -1014,11 +1075,14 @@ static void client_send_join(netdrv *nd)
    nd->last_join_tx = nd->now;
 }
 
-static void host_send_welcome(netdrv *nd, const uint8_t mac[6], uint8_t your_id)
+static void host_send_welcome(netdrv *nd, const uint8_t mac[6], uint8_t your_id,
+                              uint32_t nonce, uint32_t challenge)
 {
    uint8_t pl[ND_ROSTER_MAX_SIZE];
    size_t n = roster_build(nd, pl, your_id);
-   nd_xmit(nd, mac, ND_T_WELCOME, ND_ID_JOINING, 0, 0, pl, (uint16_t)n);
+   nd_xmit_instance(nd, mac, ND_T_WELCOME, ND_ID_JOINING,
+                    (uint16_t)challenge, (uint16_t)(challenge >> 16),
+                    pl, (uint16_t)n, nonce);
 }
 
 static void host_on_join(netdrv *nd, const uint8_t mac[6],
@@ -1027,6 +1091,7 @@ static void host_on_join(netdrv *nd, const uint8_t mac[6],
    char proto[ND_PROTO_LEN], nick[ND_NICK_LEN];
    uint32_t nonce;
    int i, free_id = -1;
+   nd_offer *offer;
 
    if (len != ND_JOIN_SIZE)
       return;
@@ -1042,64 +1107,146 @@ static void host_on_join(netdrv *nd, const uint8_t mac[6],
       return;                     /* silently ignore; wrong app/version */
    }
 
-   /* Known instance re-JOINing (WELCOME lost, or same-addr restart)? */
+   /* A repeated JOIN after a lost final WELCOME needs no new challenge.
+    * A DIFFERENT instance at this address remains provisional until CONFIRM. */
    for (i = 1; i < ND_MAX_CLIENTS; i++)
    {
       nd_peer *p = &nd->peers[i];
       if (p->active && memcmp(p->mac, mac, 6) == 0)
       {
-         if (p->nonce != nonce)
+         if (p->nonce == nonce)
          {
-            /* Same address, new process: reset the channel, keep the id. */
-            uint8_t id = p->id;
-            peer_remove(nd, id, 1);
-            peer_add(nd, id, mac, nonce, nick);
-            nd->roster_gen++;
-            nd->roster_dirty = 1;
-            if (nd->cb.peer_connected &&
-                nd->cb.peer_connected(nd->cb.user, id) != 0)
-            {
-               peer_remove(nd, id, 0);
-               host_send_welcome(nd, mac, ND_ID_REFUSED);
-               return;
-            }
+            host_send_welcome(nd, mac, p->id, nonce, p->admission_challenge);
+            return;
          }
-         host_send_welcome(nd, mac, p->id);
-         return;
+         free_id = i;
+         break;
       }
    }
 
-   for (i = 1; i < ND_MAX_CLIENTS; i++)
-      if (!nd->peers[i].active) { free_id = i; break; }
+   if (free_id < 0)
+      for (i = 1; i < ND_MAX_CLIENTS; i++)
+      {
+         offer = &nd->offers[i - 1];
+         if (offer->challenge && nd->now >= offer->expires)
+            offer->challenge = 0;
+         if (offer->challenge && memcmp(offer->mac, mac, 6) == 0)
+         { free_id = i; break; }
+      }
+   if (free_id < 0)
+      for (i = 1; i < ND_MAX_CLIENTS; i++)
+         if (!nd->peers[i].active && !nd->offers[i - 1].challenge)
+         { free_id = i; break; }
 
    if (free_id < 0)
    {
-      host_send_welcome(nd, mac, ND_ID_REFUSED);   /* session full */
+      host_send_welcome(nd, mac, ND_ID_REFUSED, nonce, 0); /* session full */
       return;
    }
-
-   peer_add(nd, (uint8_t)free_id, mac, nonce, nick);
-   nd->roster_gen++;
-   nd->roster_dirty = 1;
-   if (nd->cb.peer_connected &&
-       nd->cb.peer_connected(nd->cb.user, (uint8_t)free_id) != 0)
+   offer = &nd->offers[free_id - 1];
+   if (!offer->challenge || offer->nonce != nonce || memcmp(offer->mac, mac, 6))
    {
-      /* Admission refused by the frontend/core. */
-      peer_remove(nd, (uint8_t)free_id, 0);
-      host_send_welcome(nd, mac, ND_ID_REFUSED);
+      offer->challenge = ++nd->challenge_next;
+      if (!offer->challenge)
+         offer->challenge = ++nd->challenge_next;
+      offer->nonce = nonce;
+      memcpy(offer->mac, mac, 6);
+      memcpy(offer->nick, nick, ND_NICK_LEN);
+   }
+   offer->expires = nd->now + tmo(nd->cfg.peer_dead_us, ND_PEER_DEAD_US);
+   nd_xmit_instance(nd, mac, ND_T_OFFER, ND_ID_JOINING,
+                    (uint16_t)offer->challenge, (uint16_t)(offer->challenge >> 16),
+                    NULL, 0, nonce);
+}
+
+static void host_on_confirm(netdrv *nd, const uint8_t mac[6], const nd_hdr *h)
+{
+   uint32_t challenge = (uint32_t)h->seq | ((uint32_t)h->ack << 16);
+   int i;
+   for (i = 1; i < ND_MAX_CLIENTS; i++)
+   {
+      nd_peer *p = &nd->peers[i];
+      nd_offer *offer = &nd->offers[i - 1];
+      if (p->active && p->nonce == h->src_nonce &&
+          p->admission_challenge == challenge && memcmp(p->mac, mac, 6) == 0)
+      {
+         host_send_welcome(nd, mac, p->id, p->nonce, challenge);
+         return;
+      }
+      if (!challenge || offer->challenge != challenge ||
+          offer->nonce != h->src_nonce || memcmp(offer->mac, mac, 6) ||
+          nd->now >= offer->expires)
+         continue;
+      peer_remove(nd, (uint8_t)i, 1);
+      peer_add(nd, (uint8_t)i, mac, offer->nonce, offer->nick);
+      p->admission_challenge = challenge;
+      offer->challenge = 0;
+      nd->roster_gen++;
+      nd->roster_dirty = 1;
+      if (nd->cb.peer_connected &&
+          nd->cb.peer_connected(nd->cb.user, (uint8_t)i) != 0)
+      {
+         peer_remove(nd, (uint8_t)i, 0);
+         host_send_welcome(nd, mac, ND_ID_REFUSED, h->src_nonce, challenge);
+         return;
+      }
+      host_send_welcome(nd, mac, (uint8_t)i, h->src_nonce, challenge);
+      host_broadcast_roster(nd);
+      nd_logf(nd, "admitted peer id=%d nick=%s", i, p->nick);
       return;
    }
-   host_send_welcome(nd, mac, (uint8_t)free_id);
-   host_broadcast_roster(nd);
-   nd_logf(nd, "admitted peer id=%d nick=%s", free_id, nick);
+   nd->st.rx_drop_stale++;
+}
+
+static void client_on_offer(netdrv *nd, const uint8_t mac[6], const nd_hdr *h)
+{
+   uint32_t challenge = (uint32_t)h->seq | ((uint32_t)h->ack << 16);
+   if (nd->state != ND_S_JOINING || !challenge)
+      return;
+   memcpy(nd->host_mac, mac, 6);
+   nd->offer_challenge = challenge;
+   nd->offer_host_nonce = h->src_nonce;
+   nd_xmit_instance(nd, mac, ND_T_CONFIRM, 0, h->seq, h->ack, NULL, 0,
+                    h->src_nonce);
+}
+
+/* Validate the complete admission before exposing an active session. A
+ * WELCOME without a host channel cannot time out, and a stale local nonce
+ * belongs to an earlier process at the same transport address. */
+static int welcome_valid(const netdrv *nd, const uint8_t mac[6], uint32_t host_nonce,
+                         const uint8_t *pl, uint16_t len)
+{
+   uint8_t your_id, count;
+   int i;
+   if (!roster_valid(mac, host_nonce, pl, len))
+      return 0;
+   your_id = pl[0];
+   count = pl[2];
+   if (your_id == ND_ID_REFUSED)
+      return 1;
+   if (your_id == 0 || your_id >= ND_MAX_CLIENTS)
+      return 0;
+   for (i = 0; i < count; i++)
+   {
+      const uint8_t *e = pl + 3 + i * ND_ROSTER_ENTRY_SIZE;
+      if (e[0] == your_id)
+         return memcmp(e + 1, nd->local_mac, 6) == 0 &&
+                get32(e + 7) == nd->cfg.join_nonce;
+   }
+   return 0;
 }
 
 static void client_on_welcome(netdrv *nd, const uint8_t mac[6],
-                              const uint8_t *pl, uint16_t len)
+                              const nd_hdr *h, const uint8_t *pl)
 {
    uint8_t your_id;
-   if (nd->state != ND_S_JOINING || len < 3)
+   if (nd->state != ND_S_JOINING)
       return;
+   if (!welcome_valid(nd, mac, h->src_nonce, pl, h->len))
+   {
+      nd->st.rx_drop_malformed++;
+      return;
+   }
    your_id = pl[0];
    if (your_id == ND_ID_REFUSED)
    {
@@ -1108,15 +1255,20 @@ static void client_on_welcome(netdrv *nd, const uint8_t mac[6],
          nd->cb.session_stopped(nd->cb.user, ND_STOP_REFUSED);
       return;
    }
-   if (your_id == 0 || your_id >= ND_MAX_CLIENTS)
+   if (!nd->offer_challenge || nd->offer_host_nonce != h->src_nonce ||
+       memcmp(nd->host_mac, mac, 6) != 0 ||
+       nd->offer_challenge != ((uint32_t)h->seq | ((uint32_t)h->ack << 16)))
+   {
+      nd->st.rx_drop_stale++;
       return;
+   }
    nd->local_id = your_id;
    nd->state = ND_S_ACTIVE;
    nd->is_host = 0;
    memcpy(nd->host_mac, mac, 6);
    if (nd->cb.session_started)
       nd->cb.session_started(nd->cb.user, nd->local_id);
-   roster_apply(nd, pl, len);    /* fires peer_connected incl. host (id 0) */
+   roster_apply(nd, pl, h->len); /* fires peer_connected incl. host (id 0) */
 }
 
 /* -------------------------------------------------------------- rx frame -- */
@@ -1141,18 +1293,48 @@ static void handle_frame(netdrv *nd, const uint8_t mac[6],
    switch (h->type)
    {
    case ND_T_JOIN:
+      if (h->src != ND_ID_JOINING || h->dst != ND_ID_BCAST ||
+          h->len != ND_JOIN_SIZE || !h->src_nonce || h->dst_nonce ||
+          get32(pl + 40) != h->src_nonce || memcmp(mac, nd->local_mac, 6) == 0)
+      { nd->st.rx_drop_malformed++; return; }
       if (nd->state == ND_S_ACTIVE && nd->is_host)
          host_on_join(nd, mac, pl, h->len);
       return;
+   case ND_T_OFFER:
+      if (h->src != 0 || h->dst != ND_ID_JOINING || h->len ||
+          !h->src_nonce || h->dst_nonce != nd->cfg.join_nonce)
+      { nd->st.rx_drop_malformed++; return; }
+      client_on_offer(nd, mac, h);
+      return;
+   case ND_T_CONFIRM:
+      if (h->src != ND_ID_JOINING || h->dst != 0 || h->len ||
+          !h->src_nonce || h->dst_nonce != nd->cfg.join_nonce)
+      { nd->st.rx_drop_malformed++; return; }
+      if (nd->state == ND_S_ACTIVE && nd->is_host)
+         host_on_confirm(nd, mac, h);
+      return;
    case ND_T_WELCOME:
-      client_on_welcome(nd, mac, pl, h->len);
+      if (h->src != 0 || h->dst != ND_ID_JOINING || !h->src_nonce ||
+          h->dst_nonce != nd->cfg.join_nonce)
+      {
+         nd->st.rx_drop_malformed++;
+         return;
+      }
+      client_on_welcome(nd, mac, h, pl);
       return;
    case ND_T_ROSTER:
       if (nd->state == ND_S_ACTIVE && !nd->is_host)
       {
-         if (memcmp(mac, nd->host_mac, 6) != 0)
+         if (memcmp(mac, nd->host_mac, 6) != 0 ||
+             h->src_nonce != nd->peers[0].nonce)
          {
             nd->st.rx_drop_unknown_peer++;   /* roster from a non-host source */
+            return;
+         }
+         if (h->src != 0 || h->dst != ND_ID_BCAST || h->dst_nonce ||
+             !roster_valid(mac, h->src_nonce, pl, h->len) || pl[0] != ND_ID_BCAST)
+         {
+            nd->st.rx_drop_malformed++;
             return;
          }
          roster_apply(nd, pl, h->len);
@@ -1169,7 +1351,7 @@ static void handle_frame(netdrv *nd, const uint8_t mac[6],
 
    /* Data plane: must come from an established roster peer. */
    p = lookup_peer(nd, h->src, mac);
-   if (!p)
+   if (!p || p->nonce != h->src_nonce || h->dst_nonce != nd->cfg.join_nonce)
    {
       nd->st.rx_drop_unknown_peer++;
       return;
@@ -1180,6 +1362,9 @@ static void handle_frame(netdrv *nd, const uint8_t mac[6],
       nd->st.rx_drop_malformed++;
       return;
    }
+   if (((h->type == ND_T_ACK || h->type == ND_T_BYE) && h->len) ||
+       (h->type == ND_T_PING && h->len != 0 && h->len != 2))
+   { nd->st.rx_drop_malformed++; return; }
    p->last_rx_us = nd->now;
 
    switch (h->type)
@@ -1481,6 +1666,7 @@ netdrv *netdrv_create(const nd_transport *tp, const nd_callbacks *cb,
       memcpy(nd->nick, cfg->nick, strnlen(cfg->nick, ND_NICK_LEN - 1));
    if (!nd->cfg.join_nonce)
       nd->cfg.join_nonce = 1;     /* must be nonzero; caller should randomize */
+   nd->challenge_next = nd->cfg.join_nonce;
    nd->tp.local_addr(nd->tp.ctx, nd->local_mac);
    nd->state = ND_S_IDLE;
    return nd;
@@ -1499,10 +1685,20 @@ void netdrv_destroy(netdrv *nd)
       free(nd);
 }
 
+static void session_begin(netdrv *nd)
+{
+   if (nd->ever_started && !++nd->cfg.join_nonce)
+      ++nd->cfg.join_nonce;
+   nd->ever_started = 1;
+   nd->offer_challenge = nd->offer_host_nonce = 0;
+   memset(nd->offers, 0, sizeof(nd->offers));
+}
+
 int netdrv_host(netdrv *nd)
 {
    if (nd->state != ND_S_IDLE)
       return -1;
+   session_begin(nd);
    nd->state = ND_S_ACTIVE;
    nd->is_host = 1;
    nd->local_id = 0;
@@ -1518,6 +1714,7 @@ int netdrv_join(netdrv *nd)
 {
    if (nd->state != ND_S_IDLE)
       return -1;
+   session_begin(nd);
    nd->state = ND_S_JOINING;
    nd->is_host = 0;
    nd->fatal = 0;

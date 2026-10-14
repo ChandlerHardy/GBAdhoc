@@ -5,6 +5,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
+#include <errno.h>
 
 #include "libretro.h"
 #include "../gbcore/gbcore.h"
@@ -68,7 +70,14 @@ static uint16_t gb_dual_buttons;
  * not on gb_core, because a link session (gbl) runs with no single core. */
 static int gb_family;
 /* The GB link session (fe_gblink.h), NULL when none. */
-static void save_recover_bak(const char *path);   /* below, with sram_load */
+static int save_recover_bak(const char *path);   /* below, with sram_load */
+static int state_file_exists(const char *path);
+static int state_file_rename(const char *from, const char *to);
+static int state_file_replace(const char *path, const void *data, size_t size);
+/* A failed battery load is not a new cartridge. Boot refuses it, and even
+ * cleanup/exit must not persist its empty or partially read RAM. Cleared by
+ * the next successful load (including a genuinely absent save). */
+static int battery_load_failed;
 static fe_gblink *gbl;
 static int gbl_last;               /* last fe_gblink_step result */
 static int gbl_is_gba;             /* the session is the GBA cable mirror */
@@ -328,9 +337,9 @@ static uint32_t gb_save_ram_crc(size_t image_size)
 static int gb_save_flush(int force)
 {
    size_t size = gbcore_save_ram_size(gb_core);
-   FILE *f = NULL;
    uint32_t crc;
-   int ok;
+   if (battery_load_failed)
+      return -1;
    if (!gb_core || !host.save_path || !size)
       return 0;
    if (gb_save_reserve(size) != 0 ||
@@ -344,19 +353,10 @@ static int gb_save_flush(int force)
       if (t)
          gb_rtc_mark(t);
    }
-   /* Same length on disk: overwrite in place.  "wb" truncates first, so an
-    * interrupted write left an empty file -- which the next boot cannot load
-    * and whose first flush then replaced with a blank cartridge. */
-   if (gb_save_file_len == (long)size)
-      f = fopen(host.save_path, "r+b");
-   if (!f)
-      f = fopen(host.save_path, "wb");
-   if (!f)
-      return -1;
-   ok = fwrite(gb_save_buffer, 1, size, f) == size;
-   if (fclose(f) != 0)
-      ok = 0;
-   if (!ok)
+   /* The snapshot is stable on the main thread. Preserve the previous file
+    * through short writes, full disks, deferred close errors and renames. */
+   if (save_recover_bak(host.save_path) < 0 ||
+       state_file_replace(host.save_path, gb_save_buffer, size) != 0)
    {
       gb_save_file_len = -1;
       return -1;
@@ -374,30 +374,41 @@ static int gb_save_flush(int force)
  * Requiring the exact size rejected saves imported from other emulators,
  * and the first periodic flush then overwrote the player's file with a
  * blank cartridge. */
-static void gb_save_load(void)
+static int gb_save_load(void)
 {
    size_t size = gbcore_save_ram_size(gb_core);
    size_t cap = size + GB_SAVE_TRAILER_MAX, n, load;
-   int whole;
+   int whole, read_ok;
    FILE *f;
    gb_save_crc_valid = 0;
    gb_save_file_len = -1;
-   if (!size || !host.save_path || gb_save_reserve(cap) != 0)
-      return;
-   save_recover_bak(host.save_path);
+   battery_load_failed = 0;
+   if (!size || !host.save_path)
+      return 0;
+   battery_load_failed = 1;
+   if (gb_save_reserve(cap) != 0 || save_recover_bak(host.save_path) < 0)
+      goto failed;
    f = fopen(host.save_path, "rb");
    if (!f)
    {
+      if (errno != ENOENT)
+         goto failed;
       fe_evt("gb_sram_load size=0");
-      return;
+      battery_load_failed = 0;
+      return 0;
    }
    n = fread(gb_save_buffer, 1, cap, f);
    whole = fgetc(f) == EOF;
-   fclose(f);
+   read_ok = !ferror(f);
+   if (fclose(f) != 0)
+      read_ok = 0;
+   if (!read_ok)
+      goto failed;
    if (!n)
    {
       fe_evt("gb_sram_load size=0");
-      return;
+      battery_load_failed = 0;
+      return 0;
    }
    /* Longer than any known layout: keep the RAM, let the clock reset. */
    load = whole ? n : gbcore_cart_ram_size(gb_core);
@@ -413,7 +424,7 @@ static void gb_save_load(void)
        gbcore_save_ram_read(gb_core, gb_save_buffer, gb_save_capacity) != 0)
    {
       fe_evt("gb_sram_load FAILED size=%u", (unsigned)n);
-      return;
+      goto failed;
    }
    /* A file in another layout stays "dirty", so the first flush rewrites it
     * in the standard layout (RAM, then the 48-byte trailer on clock carts)
@@ -422,6 +433,11 @@ static void gb_save_load(void)
    gb_save_crc_valid = gb_save_file_len == (long)size;
    fe_evt("gb_sram_load size=%u file=%u crc=%08x", (unsigned)size,
           (unsigned)n, gb_save_crc);
+   battery_load_failed = 0;
+   return 0;
+failed:
+   fe_log("gb_sram_load FAILED; preserving battery file %s", host.save_path);
+   return -1;
 }
 
 /* Per-boot cable state.  Registered with netpacket before the core exists, so
@@ -1157,49 +1173,65 @@ static uint32_t sram_crc(void)
  * would boot empty, the player would save, and the next pull would delete
  * the only copy of the original.  So before a save is loaded: no file, but
  * a .bak beside it -> the .bak is the save (review finding 5). */
-static void save_recover_bak(const char *path)
+static int save_recover_bak(const char *path)
 {
    char bak[512];
-   FILE *f;
+   int exists;
    if (!path || snprintf(bak, sizeof(bak), "%s.bak", path) >= (int)sizeof(bak))
-      return;
-   f = fopen(path, "rb");
-   if (f)
+      return -1;
+   /* A pending whole-image transaction is newer than a retained share
+    * backup. Resolve it before considering .bak, and never overwrite the
+    * sole old image when recovery is blocked. */
+   if (fe_host_state_recover(path) < 0)
+      return -1;
+   exists = state_file_exists(path);
+   if (exists != 0)
+      return exists < 0 ? -1 : 0;
+   exists = state_file_exists(bak);
+   if (exists <= 0)
+      return exists;
+   if (state_file_rename(bak, path) != 0)
    {
-      fclose(f);
-      return;
+      fe_log("save_recover: could not restore %s", bak);
+      return -1;
    }
-   f = fopen(bak, "rb");
-   if (!f)
-      return;
-   fclose(f);
-   if (rename(bak, path) == 0)
-      fe_evt("save_recovered from=.bak (an interrupted share replace)");
-   else
-      fe_log("save_recover: could not rename %s", bak);
+   fe_evt("save_recovered from=.bak (an interrupted share replace)");
+   return 1;
 }
 
-static void sram_load(void)
+static int sram_load(void)
 {
    void *p = retro_get_memory_data(RETRO_MEMORY_SAVE_RAM);
    FILE *f;
    size_t n = 0;
-   int exact = 0;
+   int exact = 0, read_ok;
 
+   battery_load_failed = 0;
    if (!p || !host.save_path)
-      return;
-   save_recover_bak(host.save_path);
+      return 0;
+   battery_load_failed = 1;
+   sram_have_blk = 0;
+   if (save_recover_bak(host.save_path) < 0)
+      goto failed;
 
    f = fopen(host.save_path, "rb");
    if (f)
    {
       n = fread(p, 1, FE_SRAM_SIZE, f);
       exact = (n == FE_SRAM_SIZE) && (fgetc(f) == EOF);   /* no trailing junk */
-      fclose(f);
+      read_ok = !ferror(f);
+      if (fclose(f) != 0)
+         read_ok = 0;
+      if (!read_ok)
+         goto failed;
       fe_evt("sram_load size=%u crc=%08x", (unsigned)n, (unsigned)sram_crc());
    }
    else
+   {
+      if (errno != ENOENT)
+         goto failed;
       fe_evt("sram_load size=0 crc=none");
+   }
 
    /* Whatever the game has written so far is what was just loaded. */
    sram_disk_gen = ffn_seen_gen = sram_gen_now();
@@ -1222,6 +1254,11 @@ static void sram_load(void)
                                     SRAM_BLOCK, SRAM_BLOCK);
       sram_have_blk = 1;
    }
+   battery_load_failed = 0;
+   return 0;
+failed:
+   fe_log("sram_load FAILED; preserving battery file %s", host.save_path);
+   return -1;
 }
 
 uint32_t fe_host_sram_crc_now(void)
@@ -1345,10 +1382,119 @@ int fe_host_mem_write(uint32_t gba_addr, const void *in, unsigned len)
 #define FE_STATE_MAX (416 * 1024)
 static uint8_t state_buf[FE_STATE_MAX];
 
+/* Save states are whole snapshots: updating one in place cannot recover a
+ * partial write. Keep the old slot until its replacement has been closed.
+ * .old is also the interrupted-share backup (fe_share_commit). */
+static int state_file_exists(const char *path)
+{
+   struct stat st;
+   if (stat(path, &st) == 0)
+      return 1;
+   return errno == ENOENT ? 0 : -1;
+}
+
+static int state_file_rename(const char *from, const char *to)
+{
+   (void)rename(from, to);
+   /* PSP and PPSSPP can disagree about rename's return value. Verify both
+    * names, as the PSP share implementation does. */
+   return state_file_exists(from) == 0 && state_file_exists(to) == 1 ? 0 : -1;
+}
+
+int fe_host_state_recover(const char *path)
+{
+   char old[512];
+   int exists;
+   if (!path || snprintf(old, sizeof(old), "%s.old", path) >= (int)sizeof(old))
+      return -1;
+   exists = state_file_exists(path);
+   if (exists != 0)
+      return exists < 0 ? -1 : 0;
+   exists = state_file_exists(old);
+   if (exists <= 0)
+      return exists;
+   if (state_file_rename(old, path) != 0)
+      return -1;
+   fe_evt("state_recovered file=%s from=.old", path);
+   return 1;
+}
+
+/* A writer may stream a stable snapshot in small blocks; it returns zero
+ * only when all bytes reached stdio. This helper owns close and promotion. */
+static int state_file_replace_writer(const char *path,
+                                     int (*write_image)(FILE *, void *),
+                                     void *user)
+{
+   char tmp[512], old[512];
+   FILE *f;
+   int ok, exists;
+   if (!path || snprintf(tmp, sizeof(tmp), "%s.tmp", path) >= (int)sizeof(tmp) ||
+       snprintf(old, sizeof(old), "%s.old", path) >= (int)sizeof(old) ||
+       fe_host_state_recover(path) < 0)
+      return -1;
+   f = fopen(tmp, "wb");
+   if (!f)
+      return -1;
+   ok = write_image(f, user) == 0;
+   if (fclose(f) != 0)
+      ok = 0;
+   if (!ok)
+   {
+      remove(tmp);
+      return -1;
+   }
+   exists = state_file_exists(path);
+   if (exists < 0)
+   {
+      remove(tmp);
+      return -1;
+   }
+   if (exists)
+   {
+      /* Never remove the current slot to make room. A failed rename or
+       * backup cleanup leaves it in place. */
+      if ((remove(old) != 0 && errno != ENOENT) ||
+          state_file_rename(path, old) != 0)
+      {
+         remove(tmp);
+         return -1;
+      }
+   }
+   if (state_file_rename(tmp, path) != 0)
+   {
+      if (exists)
+         (void)state_file_rename(old, path);
+      remove(tmp);
+      /* If rollback also failed, .old stays recoverable on the next load
+       * or slot scan. Never overwrite it with an empty/new slot. */
+      return -1;
+   }
+   if (exists)
+      remove(old);
+   return 0;
+}
+
+typedef struct
+{
+   const void *data;
+   size_t size;
+} state_file_image;
+
+static int state_file_write_image(FILE *f, void *user)
+{
+   const state_file_image *image = (const state_file_image *)user;
+   return fwrite(image->data, 1, image->size, f) == image->size ? 0 : -1;
+}
+
+static int state_file_replace(const char *path, const void *data, size_t size)
+{
+   state_file_image image = { data, size };
+   return state_file_replace_writer(path, state_file_write_image, &image);
+}
+
 int fe_host_state_save(const char *path)
 {
    size_t sz;
-   FILE *f;
 
    if (gb_family && !gb_core)
    {
@@ -1391,15 +1537,11 @@ int fe_host_state_save(const char *path)
          return -1;
       }
    }
-   f = fopen(path, "wb");
-   if (!f || fwrite(state_buf, 1, sz, f) != sz)
+   if (state_file_replace(path, state_buf, sz) != 0)
    {
-      if (f)
-         fclose(f);
       fe_evt("state_save file=%s FAILED reason=io", path);
       return -1;
    }
-   fclose(f);
    fe_evt("state_save file=%s size=%u crc=%08x", path, (unsigned)sz,
           (unsigned)fe_crc32(0, state_buf, sz));
    return 0;
@@ -1409,7 +1551,12 @@ int fe_host_state_load(const char *path)
 {
    size_t sz;
    size_t n;
-   FILE *f = fopen(path, "rb");
+   int whole, read_ok;
+   FILE *f;
+
+   if (fe_host_state_recover(path) < 0)
+      return -1;
+   f = fopen(path, "rb");
 
    if (!f)
    {
@@ -1417,7 +1564,15 @@ int fe_host_state_load(const char *path)
       return -1;
    }
    n = fread(state_buf, 1, sizeof(state_buf), f);
-   fclose(f);
+   whole = fgetc(f) == EOF;
+   read_ok = !ferror(f);
+   if (fclose(f) != 0)
+      read_ok = 0;
+   if (!whole || !read_ok)
+   {
+      fe_evt("state_load file=%s FAILED reason=io_or_size", path);
+      return -1;
+   }
    if (gb_family && !gb_core)
    {
       fe_evt("state_load file=%s FAILED reason=link_session", path);
@@ -1655,47 +1810,46 @@ static void sram_abandon_deltas(const char *why)
    sram_retry_full = 1;
 }
 
-/* Rewrite the whole .sav.  First flush of a run, or any time an in-place
- * update is impossible (file missing / wrong size / seek or write failed). */
-/* The whole image.  This is the ROUTINE recovery path after every wake (the
- * held-open handle is dead -> sram_abandon_deltas -> here ~0.5 s later), so
- * it must never leave the player without a save: "wb" truncates first, and
- * for the whole 128 KiB write the file was empty, then partial -- power lost
- * or a failed wake in that window and the old save was gone (also in 3.5.0).
- * A file of the right size is therefore overwritten IN PLACE ("r+b", as
- * gb_save_flush does for Game Boy saves): an interrupted write then leaves a
- * mix of old and new blocks, never an empty file.  "wb" only when the file
- * is missing or has another size.  A failed fclose (the FAT's deferred
- * write) is a failed write: no good baseline is recorded for it. */
+typedef struct
+{
+   const uint8_t *live;
+   uint32_t crc[SRAM_BLOCKS];
+} sram_full_image;
+
+static int sram_write_full_blocks(FILE *f, void *user)
+{
+   sram_full_image *image = (sram_full_image *)user;
+   unsigned i;
+   for (i = 0; i < SRAM_BLOCKS; i++)
+   {
+      /* The game may change live RAM while I/O yields to its thread. Record
+       * the bytes this write owns, never a later view of the live buffer. */
+      memcpy(sram_stage, image->live + (size_t)i * SRAM_BLOCK, SRAM_BLOCK);
+      image->crc[i] = fe_crc32(0, sram_stage, SRAM_BLOCK);
+      if (fwrite(sram_stage, 1, SRAM_BLOCK, f) != SRAM_BLOCK)
+         return -1;
+   }
+   return 0;
+}
+
+/* Whole rewrites use the same replacement transaction as save states.
+ * Keep the existing 4 KiB stage and only 128 bytes of CRCs on the stack;
+ * the PSP cannot afford another 128 KiB battery snapshot allocation. */
 static int sram_write_full(const void *p)
 {
-   FILE *f;
-   long len = -1;
+   sram_full_image image;
+   if (battery_load_failed)
+      return -1;
+   image.live = (const uint8_t *)p;
    sram_close();
-   f = fopen(host.save_path, "rb");
-   if (f)
+   if (save_recover_bak(host.save_path) < 0 ||
+       state_file_replace_writer(host.save_path, sram_write_full_blocks,
+                                  &image) != 0)
    {
-      if (fseek(f, 0, SEEK_END) == 0)
-         len = ftell(f);
-      fclose(f);
-   }
-   f = fopen(host.save_path, len == (long)FE_SRAM_SIZE ? "r+b" : "wb");
-   if (!f)
-   {
-      fe_log("sram_flush FAILED to open %s", host.save_path);
+      fe_log("sram_flush whole replacement FAILED on %s", host.save_path);
       return -1;
    }
-   if (fwrite(p, 1, FE_SRAM_SIZE, f) != FE_SRAM_SIZE)
-   {
-      fclose(f);
-      fe_log("sram_flush short write to %s", host.save_path);
-      return -1;
-   }
-   if (fclose(f) != 0)
-   {
-      fe_log("sram_flush close FAILED on %s", host.save_path);
-      return -1;
-   }
+   memcpy(sram_blk_crc, image.crc, sizeof(image.crc));
    return 0;
 }
 
@@ -1710,6 +1864,8 @@ static int sram_drain(uint32_t budget_us)
    uint64_t t0, slice;
    unsigned i;
 
+   if (battery_load_failed)
+      return -1;
    if (!p || !host.save_path)
       return 0;
 
@@ -1733,8 +1889,6 @@ static int sram_drain(uint32_t budget_us)
          sram_run_blk_max = slice;
       for (i = 0; i < SRAM_BLOCKS; i++)
       {
-         sram_blk_crc[i] = fe_crc32(0, p + (size_t)i * SRAM_BLOCK,
-                                    SRAM_BLOCK);
          sram_blk_state[i] = SBLK_CLEAN;
       }
       sram_run_bytes += FE_SRAM_SIZE;
@@ -1866,6 +2020,8 @@ int fe_host_sram_service_io(void)
    unsigned before;
    int req = sram_scan_req;
 
+   if (battery_load_failed)
+      return 0;
    if (gb_family)
    {
       /* This entry point belongs to the I/O worker. The GB core owns mutable
@@ -2131,6 +2287,8 @@ void fe_host_sram_service(void)
  * file with blocks still pending. */
 void fe_host_sram_sync(void)
 {
+   if (battery_load_failed)
+      return;
    if (gb_family)
    {
       /* Must run on the emulation thread: only it may read the GB core's RAM.
@@ -2298,6 +2456,8 @@ static int sram_scan(int force_write)
 
 int fe_host_sram_flush(int force_write)
 {
+   if (battery_load_failed)
+      return -1;
    if (gb_family)
       return gb_save_flush(force_write);
    /* Threaded: the writer thread owns the scan AND the writes, so this only
@@ -2522,11 +2682,10 @@ static void gb_rtc_to_local(uint8_t *image, size_t size)
 
 static int gbl_commit(void *user, const void *image, size_t size)
 {
-   FILE *f;
    int ok;
    uint8_t *local;
    (void)user;
-   if (!host.save_path)
+   if (!host.save_path || battery_load_failed)
       return -1;
    local = (uint8_t *)malloc(size);
    if (!local)
@@ -2534,15 +2693,8 @@ static int gbl_commit(void *user, const void *image, size_t size)
    memcpy(local, image, size);
    gb_rtc_to_local(local, size);
    image = local;
-   /* Same length: overwrite in place, as gb_save_flush does. */
-   f = gb_save_file_len == (long)size ? fopen(host.save_path, "r+b") : NULL;
-   if (!f)
-      f = fopen(host.save_path, "wb");
-   if (!f)
-      return -1;
-   ok = fwrite(image, 1, size, f) == size;
-   if (fclose(f) != 0)
-      ok = 0;
+   ok = save_recover_bak(host.save_path) >= 0 &&
+        state_file_replace(host.save_path, image, size) == 0;
    gb_save_file_len = ok ? (long)size : -1;
    gb_save_crc_valid = 0;
    fe_evt("gblink_save_commit size=%u crc=%08x ok=%d", (unsigned)size,
@@ -2570,7 +2722,12 @@ static int gb_single_boot(void)
                            core_sample_rate ? core_sample_rate : 32768, &cb);
    if (!gb_core)
       return -1;
-   gb_save_load();
+   if (gb_save_load() != 0)
+   {
+      gbcore_shutdown(gb_core);
+      gb_core = NULL;
+      return -1;
+   }
    return 0;
 }
 
@@ -3457,7 +3614,16 @@ int fe_host_boot(const fe_host_config *cfg)
       fe_evt("av_info fps=59.7275 rate=%u w=%u h=%u", core_sample_rate,
              gbcore_frame_width(gb_core), gbcore_frame_height(gb_core));
       if (host.boot_status) host.boot_status("Loading GB save");
-      gb_save_load();
+      if (gb_save_load() != 0)
+      {
+         if (gb_dual)
+            gbdual_destroy(gb_dual);
+         else
+            gbcore_shutdown(gb_core);
+         gb_dual = NULL;
+         gb_core = NULL;
+         return -1;
+      }
       fps_last_us = host.time_us ? host.time_us() : 0;
       fe_evt("gb_backend ready console=%d", (int)host.console);
       return 0;
@@ -3520,7 +3686,12 @@ int fe_host_boot(const fe_host_config *cfg)
    }
 
    if (host.boot_status) host.boot_status("Loading save");
-   sram_load();
+   if (sram_load() != 0)
+   {
+      retro_unload_game();
+      retro_deinit();
+      return -1;
+   }
 #ifdef GBA_LINK
    if (host.gba_dual && host.gba_dual_late && host.gba_dual_session)
    {
@@ -4300,7 +4471,7 @@ extern void     gpsp_rewind_marks_want(int on);
 extern int      gpsp_rewind_marks_ok(void);
 extern void     gpsp_rewind_clock_mode(int frames);
 extern void     gpsp_rewind_clock_sync(void);
-extern long long gpsp_rewind_clock_base(const long long *set);
+extern long long gpsp_rewind_clock_time(const long long *set);
 extern uint32_t gpsp_rewind_audio_bytes(void);
 extern uint32_t gpsp_rewind_audio_gather(uint8_t *dst, uint32_t stale);
 extern void     gpsp_rewind_audio_restore(const uint8_t *src);
@@ -4490,12 +4661,17 @@ static void rw_ema(uint32_t *e, uint32_t d)
 {
    *e = *e ? (*e * 7 + d) / 8 : d;
 }
-/* The clock's base after each of the last first-pass syncs, by the frame
- * that had just run.  A re-run that passes one of those frames takes the
- * same base from there on, so it reads the seconds the first pass read. */
-#define RW_CLK_N 64
-static struct { uint32_t frame; long long base; } rw_clk[RW_CLK_N];
-static unsigned rw_clk_at;
+/* The clock follows the input log's lifetime, including wrap and forks. */
+static uint64_t rw_frame_context(void)
+{
+   return (uint64_t)gpsp_rewind_clock_time(NULL);
+}
+
+static void rw_replay_context(uint64_t value)
+{
+   long long second = (long long)value;
+   (void)gpsp_rewind_clock_time(&second);
+}
 static uint16_t *rw_play_ext_pix;
 static uint32_t rw_frame_core_us;    /* retro_run's time for the last frame */
 static uint32_t rw_snap_est_us = 3000;
@@ -4504,16 +4680,6 @@ static uint32_t rw_snap_seen;
 static int rw_gather(void)
 {
    uint32_t used, hi, pg;
-   /* The clock's base joins the wall clock here and only here, and only on
-    * the first pass: a snapshot taken again on the way back to `now` keeps
-    * the base the frames since were run with. */
-   if (rw_opt.clock_frames && fe_rewind_frame_mach() == fe_rewind_frame_now())
-   {
-      gpsp_rewind_clock_sync();
-      rw_clk[rw_clk_at % RW_CLK_N].frame = fe_rewind_frame_mach();
-      rw_clk[rw_clk_at % RW_CLK_N].base = gpsp_rewind_clock_base(NULL);
-      rw_clk_at++;
-   }
    if (rw_pos_cur)
    {
       rw_pos_cur[0] = gba_rewind_rlog_pos;
@@ -4640,17 +4806,6 @@ static void rw_run(uint32_t input, uint16_t *pix, int16_t *aud,
    int ext = 0, skip = 0, fskip0 = -1, fskip = 0;
    uint32_t synth0 = sound_synth_off;
    uint64_t t_run;
-   if (rw_opt.clock_frames)
-   {
-      unsigned k, n = rw_clk_at < RW_CLK_N ? rw_clk_at : RW_CLK_N;
-      uint32_t at = fe_rewind_frame_mach();
-      for (k = 1; k <= n; k++)       /* newest first: a frame synced twice */
-         if (rw_clk[(rw_clk_at - k) % RW_CLK_N].frame == at)
-         {
-            (void)gpsp_rewind_clock_base(&rw_clk[(rw_clk_at - k) % RW_CLK_N].base);
-            break;
-         }
-   }
    if (rw_opt.no_capture)
       pix = NULL;
    if (rw_opt.pix_begin)
@@ -4830,6 +4985,10 @@ static void rw_latch_input(void)
    rw_cap_got = 0;
    rw_play_ext = 0;
    rw_tee = fe_rewind_play_slot(&rw_cap_pix, &rw_cap_aud);
+   /* play_slot may gather the preceding frame. Sample only afterwards so
+    * that snapshot retains its own time, and this frame gets wall time. */
+   if (rw_opt.clock_frames)
+      gpsp_rewind_clock_sync();
    if (rw_opt.no_capture)
       rw_tee = 0;               /* the slot exists (1 pixel); nothing goes in */
    if (rw_opt.pix_begin)
@@ -5161,6 +5320,11 @@ static void rw_config(const fe_host_rewind_opts *o, fe_host_rewind_opts *out,
    c->gather       = rw_gather;
    c->restore      = rw_restore;
    c->run          = rw_run;
+   if (out->clock_frames)
+   {
+      c->frame_context = rw_frame_context;
+      c->replay_context = rw_replay_context;
+   }
    c->now_us       = host.time_us ? rw_now : NULL;
 }
 
@@ -6021,21 +6185,32 @@ int fe_host_rewind_tick_step(int held, uint32_t step)
    rw_held_tick = held;
    r = fe_rewind_tick_step(held, step, &s, &rw_stepped);
    rw_held_tick = 0;
+   if (r == FE_RW_ERROR || gba_rewind_rlog_miss != rw_rlog_miss_seen)
+   {
+      /* A failed restore or a missing historical save read leaves a
+       * machine that has not earned permission to write the live save.
+       * Reset from the cartridge before reporting PLAY. retro_reset keeps
+       * the current battery bytes; replay never wrote those bytes. */
+      fe_evt("rewind_replay_fault restore=%d read_misses=%u frame=%u",
+             r == FE_RW_ERROR, (unsigned)gba_rewind_rlog_miss,
+             (unsigned)fe_rewind_frame_mach());
+      rw_rlog_miss_seen = gba_rewind_rlog_miss;
+      rw_jit_close();
+      rw_gesture = 0;
+      rw_present_valid = 0;
+      rw_mask_on = 0;
+      rw_tee = 0;
+      rw_distrust = 0;
+      rw_reset_owed = 1;
+      rw_reset_if_owed("replay_fault");
+      return FE_RW_PLAY;
+   }
    if (gba_rewind_backup_ro_hits != rw_ro_hits_seen)
    {
       /* Re-run frames passed over save writes: refused, as they must be
        * (the save is the game's last word, not the rewind's). */
       rw_replay_save_hits += gba_rewind_backup_ro_hits - rw_ro_hits_seen;
       rw_ro_hits_seen = gba_rewind_backup_ro_hits;
-   }
-   if (gba_rewind_rlog_miss != rw_rlog_miss_seen)
-   {
-      /* A re-run frame read save bytes the first pass did not read: it is
-       * not the frame it claims to be (or the log was cut under it).  It
-       * got the live bytes.  Said, counted; must not happen. */
-      rw_rlog_miss_seen = gba_rewind_rlog_miss;
-      fe_evt("rewind_save_read_unlogged n=%u frame=%u",
-             (unsigned)gba_rewind_rlog_miss, (unsigned)fe_rewind_frame_mach());
    }
    if (r == FE_RW_PLAY)
    {

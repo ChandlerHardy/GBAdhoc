@@ -478,21 +478,16 @@ static void power_on_is_fresh(const rom_t *x, const rom_t *y)
   for (slot = 0; slot < 2; slot++)
   {
     trace_t fresh, dirty;
-    unsigned f;
     fresh.f = shared;
     fresh.n = frames;
     run_single_ex(slot, 0, x, frames, &first, 1, 0);   /* history */
     free_trace(&first);
-    /* Without power-on the previous game leaks into this one... */
+    /* The APU now resets its registers and phases even on ordinary reuse.
+     * This generated history used to expose its stale wave/register data. */
     run_single_ex(slot, 0, y, frames, &dirty, 0, 0);
-    for (f = 0; f < frames; f++)
-      if (dirty.f[f].sync != fresh.f[f].sync)
-        break;
-    CHECK(f < frames);
-    printf("  instance %c: without power-on, game-visible state differs from "
-           "a fresh process at frame %u\n", 'A' + slot, f);
+    compare("APU reuse == fresh process", &fresh, &dirty, frames, 0);
     free_trace(&dirty);
-    /* ...and with it, it does not. */
+    /* Whole-instance power-on remains the stronger link-session guarantee. */
     run_single_ex(slot, 0, x, frames, &first, 1, 0);
     free_trace(&first);
     run_single_ex(slot, 0, y, frames, &after, 1, 0);

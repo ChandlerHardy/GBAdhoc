@@ -1480,7 +1480,11 @@ void retro_cheat_set(unsigned index, bool enabled, const char* code)
    case CheatErrorRegion:
    case CheatErrorAlign:
    case CheatErrorMixed:
+   case CheatErrorUnsupported:
       show_warning_message("Cheat type is not supported!", 2500);
+      break;
+   case CheatErrorWork:
+      show_warning_message("Cheats exceed the per-frame work limit!", 2500);
       break;
 #endif
    };

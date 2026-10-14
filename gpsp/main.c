@@ -1398,6 +1398,8 @@ void print_regs(void)
 bool main_check_savestate(const u8 *src)
 {
   int i;
+  if (!bson_contains_key(src, "emu", BSON_TYPE_DOC) ||
+      !bson_contains_key(src, "timers", BSON_TYPE_DOC)) return false;
   const u8 *p1 = bson_find_key(src, "emu");
   const u8 *p2 = bson_find_key(src, "timers");
   if (!p1 || !p2)
@@ -1412,11 +1414,22 @@ bool main_check_savestate(const u8 *src)
    * written before this field existed; missing simply means "no pending
    * serial IRQ", which is also the default after serialproto_reset. */
 
+  {
+    static const char *const optional[] = {
+      "frame-count", "serial-irq-cycles", "rand-state", "gbp-state"
+    };
+    unsigned n;
+    for (n = 0; n < sizeof(optional) / sizeof(optional[0]); n++)
+      if (bson_find_key(p1, optional[n]) &&
+          !bson_contains_key(p1, optional[n], BSON_TYPE_INT32)) return false;
+  }
+
   for (i = 0; i < 4; i++)
   {
     char tname[2] = {'0' + i, 0};
+    if (!bson_contains_key(p2, tname, BSON_TYPE_DOC)) return false;
     const u8 *p = bson_find_key(p2, tname);
-    u32 prescale, status, dsc, irq, frequency_step;
+    u32 prescale, status, dsc, irq, frequency_step, reload;
     if (!p)
       return false;
 
@@ -1429,7 +1442,10 @@ bool main_check_savestate(const u8 *src)
         !bson_contains_key(p, "status", BSON_TYPE_INT32))
       return false;
 
-    if (!bson_read_int32(p, "prescale", &prescale) ||
+    /* Hardware writes store 65536 - u16. Zero cannot advance an expired
+     * timer (and loops forever with lazy catch-up enabled). */
+    if (!bson_read_int32(p, "reload", &reload) || !reload || reload > 0x10000u ||
+        !bson_read_int32(p, "prescale", &prescale) ||
         (prescale != 0 && prescale != 6 &&
          prescale != 8 && prescale != 10) ||
         !bson_read_int32(p, "status", &status) || status > TIMER_CASCADE ||

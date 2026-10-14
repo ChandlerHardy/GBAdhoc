@@ -695,6 +695,7 @@ void cpu_exec(unsigned short clocks)
 		}
 #endif
 	}
+	apu_update(); /* GBAdhoc: clocks advance even without sound-register I/O. */
 }
 
 void cpu_set_trace(char trace) { b_trace=trace; }

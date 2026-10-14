@@ -23,6 +23,8 @@ static gbcore_t *boot(int mode) {
 }
 static void reset(void) {
   int dat[4]={0};cpu_restore_state_ex(dat);c_regs_PC=0x150;
+  *cpu_get_halt()=0;seri_occer=0x7fffffff;
+  struct cpu_regs *r=cpu_get_c_regs();r->I=0;r->SP=0xfffe;cpu_set_c_regs();cpu_write(0xffff,0);
   const byte legacy[8]={0};cpu_load_timer_timing(legacy);
   cpu_write(0xff07,0);cpu_write(0xff04,0);cpu_write(0xff05,0);cpu_write(0xff0f,0);
 }
@@ -142,6 +144,34 @@ int main(int argc,char **argv) {
         CHECK(gbcore_state_load(c,saved,length)==0);gbcore_set_headless(c,1);
         for(int i=0;i<8;i++){gbcore_run_frame(c,0);CHECK(gbcore_sync_hash(c)==hashes[i]);}
       }
+    }
+    if(!strcmp(which,"all")||!strcmp(which,"halt")) {
+      byte *r=get_rom();
+      for(int enabled=0;enabled<2;enabled++) {
+        memset(r+0x150,0,0x200);reset();cpu_write(0xff07,6);cpu_write(0xff05,0xff);cpu_write(0xff06,0x55);ticks(64,mode);
+        CHECK(cpu_read(0xff05)==0);CHECK(!(cpu_read(0xff0f)&4));
+        if(!enabled)cpu_write(0xff07,0);
+        r[c_regs_PC]=0x76;ticks(4,mode);CHECK(cpu_read(0xff05)==0x55);CHECK(cpu_read(0xff0f)&4);
+        ticks(4,mode);cpu_write(0xff05,0x77);CHECK(cpu_read(0xff05)==0x77); /* HALT expires reload window */
+      }
+      memset(r+0x150,0,0x200);reset();cpu_write(0xff07,6);cpu_write(0xff05,0xff);cpu_write(0xff06,0xfc);r[c_regs_PC]=0x76;
+      ticks(1024,mode);CHECK(cpu_read(0xff05)==0xff);CHECK(cpu_read(0xff04)==4);CHECK(cpu_get_clock()==1024);CHECK(*cpu_get_halt());
+      ticks(64,mode);CHECK(cpu_read(0xff05)==0);ticks(4,mode);CHECK(cpu_read(0xff05)==0xfc);
+      memset(r+0x150,0,0x200);reset();r[c_regs_PC]=0x76;ticks(512,mode);
+      byte apu_phase[36];apu_save_cpu_timing(apu_phase);
+      CHECK(cpu_get_clock()==512);CHECK(cpu_read(0xff04)==2);
+      CHECK((unsigned)(apu_phase[0]|(apu_phase[1]<<8))==(mode==2?256u:512u));
+      for(int ime=0;ime<2;ime++) {
+        memset(r+0x150,0,0x200);reset();cpu_write(0xff07,6);cpu_write(0xff05,0xff);cpu_write(0xff06,0x55);ticks(64,mode);
+        cpu_write(0xffff,4);struct cpu_regs *regs=cpu_get_c_regs();regs->I=(byte)ime;cpu_set_c_regs();
+        word next=(word)(c_regs_PC+1);r[c_regs_PC]=0x76;ticks(4,mode);CHECK(cpu_read(0xff0f)&4);ticks(4,mode);
+        regs=cpu_get_c_regs();CHECK(!*cpu_get_halt());CHECK(cpu_get_clock()==72);
+        if(ime){CHECK(c_regs_PC==0x51);CHECK(regs->SP==0xfffc);CHECK(!(cpu_read(0xff0f)&4));}
+        else {CHECK(c_regs_PC==(word)(next+1));CHECK(regs->SP==0xfffe);CHECK(cpu_read(0xff0f)&4);}
+      }
+      memset(r+0x150,0,0x200);reset();r[c_regs_PC]=0x76;cpu_write(0xffff,8);cpu_write(0xff01,0x35);cpu_write(0xff02,0x81);
+      ticks(4096,mode);CHECK(cpu_read(0xff02)&0x80);ticks(4,mode);CHECK(!(cpu_read(0xff02)&0x80));CHECK(cpu_read(0xff0f)&8);
+      ticks(4,mode);CHECK(!*cpu_get_halt());CHECK(c_regs_PC==0x152);CHECK(cpu_get_c_regs()->SP==0xfffe);
     }
     gbcore_shutdown(c);printf("PASS timer %s mode=%d\n",which,mode);
   }

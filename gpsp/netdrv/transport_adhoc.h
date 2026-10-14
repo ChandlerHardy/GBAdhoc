@@ -102,6 +102,7 @@ typedef struct adhoc_stats
  * ADHOC_GROUP_DEFAULT.  connect_timeout_us 0 = default 30 s (PPSSPP can
  * take ~2 s per adhocctl event — ADHOC-NOTES §11.17 — and real hardware
  * has radio+server latencies on top). */
+/* Host only: explicitly creates the BSS. Clients must use init_join below. */
 int adhoc_transport_init(const char *group, uint32_t connect_timeout_us);
 
 /* Room-discovery scan for the wireless Join panel (plan §8): performs the

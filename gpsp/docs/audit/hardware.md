@@ -38,9 +38,21 @@ the production protocol components, not application menus or game linking.
 The first attempt with the opposite host role failed before any traffic
 (`ctl_connect_wait`/no group); that failure is preserved separately.
 
+The host initializer was then corrected to call the SDK's explicit
+`sceNetAdhocctlCreate` API. A fixture containing only this production transport
+change passed full component probes in both host directions. Each direction
+passed 192 reliable echoes across three reconnects, three save sessions,
+partial cancellation/retry and version-1 refusal. All three 131,072-byte
+received saves and three original 4,096-byte backups matched independent
+SHA-256 checks, with no remaining `.gsp` temporary file. The application harness
+nettest join path now uses the existing scanned-group join initializer.
+
 Local evidence: `audit/hardware/results/candidate-rewind-me1`,
 `candidate-nr52`, `candidate-sgb` and `battery`; all contain device-specific
 logs. The earlier baseline NR52 fixture had an invalid script and is not a
 valid hardware comparison.
 Radio evidence: `audit/hardware/results/radio-v2-1000host/verdict.json` and its
 role-specific logs/files; `radio-v2-attempt1` preserves the initial failure.
+The corrected host API evidence is in `radio-create-3000host`,
+`radio-create-1000host` and `radio-create-summary.json`; full application menus
+and game-link gameplay remain outside these component probes.

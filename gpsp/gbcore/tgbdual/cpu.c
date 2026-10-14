@@ -167,6 +167,32 @@ static void cpu_clock_advance(unsigned clocks) {
     div_clock+=(int)clocks;
     g_regs.DIV+=(byte)(div_clock>>8);div_clock&=255;
     total_clock+=(int)clocks;
+    if (total_clock>seri_occer) {
+        seri_occer=0x7fffffff;
+        g_regs.SB=tgb_port_serial_complete(g_regs.SB,seri_rx);
+        g_regs.SC&=0x7f;cpu_irq(INT_SERIAL);
+    }
+}
+static unsigned cpu_halt_cycles(unsigned available) {
+    static const unsigned periods[]={1024,16,64,256};
+    unsigned wait;
+    if (g_regs.IE&INT_TIMER) {
+        if (timer_pending) {
+            if (available>timer_pending) available=timer_pending;
+        } else if (g_regs.TAC&4) {
+            unsigned period=periods[g_regs.TAC&3];
+            unsigned phase=((g_regs.DIV<<8)+div_clock)&(period-1);
+            wait=period-phase+(255-g_regs.TIMA)*period+4;
+            if (available>wait) available=wait;
+        }
+    }
+    if ((g_regs.IE&INT_SERIAL) && seri_occer!=0x7fffffff) {
+        wait=seri_occer>=total_clock ?
+            (unsigned)seri_occer-(unsigned)total_clock+1 : 1;
+        wait=(wait+3)&~3u; /* idle exits on an M-cycle boundary */
+        if (available>wait) available=wait;
+    }
+    return available;
 }
 void cpu_save_timer_timing(byte *out) {
     memset(out,0,8);memcpy(out,"TMR1",4);
@@ -598,8 +624,11 @@ void cpu_irq_process()
 		return;
 	}
 
-	if (halt)
-		c_regs_PC++;
+	if (halt) {
+        c_regs_PC++;halt=false;
+        /* IME-off HALT wakes on an enabled request without servicing it. */
+        if (!c_regs_I) {cpu_irq_check();return;}
+    }
 
 	cpu_write(c_regs_SP-2,c_regs_PC&0xFF);
 	cpu_write(c_regs_SP-1,(c_regs_PC>>8));
@@ -678,6 +707,11 @@ void cpu_exec(unsigned short clocks)
 
 	while(rest_clock>0){
 		if (int_invoke_next) cpu_irq_process();
+        if (halt) {
+            unsigned idle=cpu_halt_cycles((unsigned)rest_clock);
+            cpu_clock_advance(idle);rest_clock-=(int)idle;
+            continue;
+        }
 
 		op_code=op_read();
 		tmp_clocks=cycles[op_code];
@@ -688,40 +722,7 @@ void cpu_exec(unsigned short clocks)
 		cpu_clock_advance((unsigned)tmp_clocks);
 
 
-		/* GBAdhoc: serial completion restored.  MasterBoy had compiled it
-		 * out, so an internal-clock transfer never finished.  The byte was
-		 * exchanged at the SC write (cpu_io_write_02 -> tgb_port_serial);
-		 * here it lands in SB after the eight bit times, as on hardware.
-		 * An in-memory cable (a two-instance link session) exchanges it
-		 * now instead, with the peer machine's SB, as TGB Dual did. */
-		if (total_clock>seri_occer){
-			seri_occer=0x7fffffff;
-			g_regs.SB=tgb_port_serial_complete(g_regs.SB,seri_rx);
-			g_regs.SC&=0x7f;
-			cpu_irq(INT_SERIAL);
-		}
-#if 0
-		if (total_clock>seri_occer){
-			seri_occer=0x7fffffff;
-/*			if (ref_gb->get_target()){
-				byte ret=ref_gb->get_target()->get_cpu()->seri_send(g_regs.SB);
-				g_regs.SB=ret;
-				g_regs.SC&=3;
-			}
-			else*/{
-				if (hook_ext){ // ƒtƒbƒN‚µ‚Ü‚·
-					byte ret=hook_proc.send(g_regs.SB);
-					g_regs.SB=ret;
-					g_regs.SC&=3;
-				}
-				else{
-					g_regs.SB=0xff;
-					g_regs.SC&=3;
-				}
-			}
-			cpu_irq(INT_SERIAL);
-		}
-#endif
+
 	}
 	apu_update(); /* GBAdhoc: clocks advance even without sound-register I/O. */
 }

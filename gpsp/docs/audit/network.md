@@ -150,3 +150,40 @@ and hostile traffic tests passed under ASan/UBSan. The last complete run reporte
 892034 checks; netdrv admission and the complete netdrv suite also passed. See
 `GBAdhoc/audit/reliability/network.log`. PSP compilation is requested from the
 build owner; this follow-up does not claim physical-radio validation.
+
+## Physical host bring-up correction (2026-10-14 UTC)
+
+Host bring-up now calls the SDK's explicit `sceNetAdhocctlCreate`; clients keep
+scanning and joining the selected BSS. The transport-echo harness now also uses
+separate host/create and client/scan/join paths. This fixes the observed PSP-3000
+hosting failure without changing either wire protocol.
+
+The old host `Connect` call returned success, then emitted asynchronous event 0
+with error 80410002 and remained in adhocctl state 0. GetParameter returned
+80410b09, with no group/channel/BSSID available; WLAN switch and power were both
+1. PPSSPP's primary error enum identifies 80410002 as ERROR_NET_INTERNAL (not
+INVALID_ARG). PSPSDK documents Create as the host API. The original v4.0.0
+transport source/header are byte-identical to the pre-fix checkpoint. Its
+instrumented Connect run passed once, while the candidate Connect diagnostic
+failed; this does not establish a newly introduced bug or its firmware internals.
+
+An isolated full component fixture changing only host Connect to Create, without
+extra timing telemetry, passed on both physical role assignments: PSP-3000 host /
+PSP-1000 join and the reverse. Each run completed 192 reliable v2 echoes across
+three reconnects, three v2 share sessions and save commits, a partial fetch
+cancel/retry preserving the original, and v1 refusal. All six transferred saves
+and six original backups across both runs were downloaded and verified exactly;
+fresh device listings contained no .gsp. Both consoles exited and tore down
+naturally. This is actual-source radio/component coverage, not full app UI or
+commercial-gameplay validation.
+
+Evidence and all source/PRX/result/file hashes:
+`GBAdhoc/audit/hardware/results/radio-create-summary.json`;
+`radio-create-3000host/verdict.json` and `radio-create-1000host/verdict.json`.
+The earlier failed runs remain archived in radio-v2-attempt1 and
+radio-v2-3000host-retry. This correction supersedes the earlier unresolved
+host-direction limitation for the tested Create path.
+
+Primary references:
+- https://raw.githubusercontent.com/hrydgard/ppsspp/master/Core/HLE/NetInetConstants.h
+- https://raw.githubusercontent.com/pspdev/pspsdk/master/src/net/pspnet_adhocctl.h

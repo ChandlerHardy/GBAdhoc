@@ -79,6 +79,14 @@ Earlier observations and the LCD-filter feasibility review remain in
   event-driven counter consumes timer edges, reload deadlines and window
   expiration in time order. Instruction and DMA-stall clock advances share
   this path; pending reloads continue even after TAC is disabled.
+- **HALT timing bypass:** the old fast path consumed an entire clock budget
+  directly, bypassing the new reload/window state and using an immediate
+  timer reload shortcut. A reproduced overflow followed by four HALT clocks
+  left TIMA zero and its interrupt absent. HALT now only enters idle state;
+  the CPU batches idle clocks through the shared timer/DIV/serial clock
+  helper, stopping at eligible timer or serial wake deadlines. CPU and APU
+  clocks advance once. With IME off, an enabled request wakes HALT without
+  pushing an interrupt stack frame or clearing its pending flag.
 
 ## State and build compatibility
 
@@ -137,7 +145,7 @@ are recorded in `../../../audit/core/accuracy-results.txt`.
   reuse. Real-ROM isolation is explicitly skipped unless
   `GBADHOC_GB_ROMS` is configured.
 - Timer probes execute actual guest NOP and CALL instructions in SGB and
-  CGB normal/double speed with ASan/UBSan. Checkpoint `4cd524c` fails seven
+  CGB normal/double speed with ASan/UBSan. Checkpoint `4cd524c` fails eight
   controls independently: DIV at 256 clocks reads 255 instead of 1; TIMA
   at 1024 clocks reads 0 instead of 1; a 24-clock CALL crossing two timer
   boundaries loses an increment and overflow interrupt; enabling loses
@@ -158,6 +166,10 @@ are recorded in `../../../audit/core/accuracy-results.txt`.
   Public restore still normalizes the absolute CPU clock as before. The
   old-CPU negative-control build uses link-only idle timer-state stubs for
   new callers; the historical CPU timer behavior itself is unchanged.
+  HALT controls cover pending reload and reload-window expiration with TAC
+  enabled/disabled, repeated overflow ticks, exact CPU/DIV/APU clock totals,
+  IME-on interrupt service, IME-off wake and serial completion/wake deadlines
+  in all three modes. The disabled-timer fast path also advances DIV.
 - Adapted instruction-body tests from MIT-licensed
   [Mooneye commit 31510e12](https://github.com/Gekkio/mooneye-test-suite/tree/31510e12eea6286d36eea060a6adde755e1067aa/acceptance/timer)
   provide an independent reference. A narrow assembler preserves each
@@ -209,6 +221,9 @@ runner or frontend save code was edited by this audit.
   differ from hardware even though the selected adapted reload tests pass.
   Broad timer/bus-cycle conformance requires a CPU bus-cycle model and full
   official ROM testing. These host probes are not that certification.
+  STOP still uses the core's pre-existing HALT approximation; exact STOP
+  clock freezing and the separate hardware HALT-bug instruction-fetch quirk
+  are not implemented by this idle-clock correction.
 - RTC behavioral suites passed; no new ordinary-use RTC defect was
   established. The documented SGB-border, tilt/rumble and Shantae limitations
   remain. Palette/control defaults and normal frontend turbo handling were

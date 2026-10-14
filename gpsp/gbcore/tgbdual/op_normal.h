@@ -370,44 +370,8 @@ inline void op_code_normal_case0xF3(void) { c_regs_I=0; cpu_irq_check(); } //DI 
 inline void op_code_normal_case0xFB(void) { c_regs_I=1;int_disable_next=true; cpu_irq_check(); } //EI : state 4
 
 inline void op_code_normal_case0x76(void) {
-#ifndef EXSACT_CORE
-	if (g_regs.TAC&0x04){//É^ÉCÉ}äÑÇËÇ±Ç›
-		static const int timer_clocks[]={1024,16,64,256};
-		word tmp;
-		tmp=g_regs.TIMA+(sys_clock+rest_clock)/timer_clocks[g_regs.TAC&0x03];
-
-		if (tmp&0xFF00){//HALTíÜÇ…äÑÇËÇ±Ç›Ç™Ç©Ç©ÇÈèÍçá
-			total_clock+=(256-g_regs.TIMA)*timer_clocks[g_regs.TAC&0x03]-sys_clock;
-			rest_clock-=(256-g_regs.TIMA)*timer_clocks[g_regs.TAC&0x03]-sys_clock;
-			g_regs.TIMA=g_regs.TMA;
-			halt=true;
-			REG_PC--;
-			cpu_irq(INT_TIMER);
-			sys_clock=(sys_clock+rest_clock)&(timer_clocks[g_regs.TAC&0x03]-1);
-		}
-		else{
-			g_regs.TIMA=tmp&0xFF;
-			sys_clock=(sys_clock+rest_clock)&(timer_clocks[g_regs.TAC&0x03]-1);
-			halt=true;
-			total_clock+=rest_clock;
-			rest_clock=0;
-			REG_PC--;
-		}
-	}
-	else{
-		halt=true;
-		total_clock+=rest_clock;
-		div_clock+=rest_clock;
-		rest_clock=0;
-		REG_PC--;
-	}
-	tmp_clocks=0;
-	cpu_irq_check();
-#else
-	halt=true;
-	REG_PC--;
-	cpu_irq_check();
-#endif
+    /* cpu_exec batches idle clocks through the shared timer/DIV path. */
+    halt=true;REG_PC--;cpu_irq_check();
 } //HALT : state 4
 
 //rotate/shift opcode

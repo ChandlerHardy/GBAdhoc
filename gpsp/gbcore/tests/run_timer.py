@@ -32,7 +32,7 @@ int cpu_timer_timing_valid(const byte *in) { (void)in; return 1; }
     exe=t/'timer';run(['gcc','-std=gnu11',*g.WARN,*g.SAN,*g.CORE_FLAGS,'-I.',ROOT/'gbcore/tests/timer.c',*objects,'-lm','-o',exe])
 
     failures=0
-    for case in ('div','boundary','multi','phase','tac','reload','reload-state'):
+    for case in ('div','boundary','multi','phase','tac','reload','reload-state','halt'):
         p=subprocess.run([str(exe),case],env=env,text=True,capture_output=True)
         print(case+': '+p.stdout+p.stderr,end='')
         if 'Sanitizer' in p.stderr or 'runtime error:' in p.stderr:

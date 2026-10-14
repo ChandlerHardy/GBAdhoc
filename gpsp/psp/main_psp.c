@@ -8410,7 +8410,8 @@ static int run_nettest(int is_host, const char *group, long secs)
 
    fe_evt("nettest_start role=%s group=%s", is_host ? "host" : "join",
           group && group[0] ? group : ADHOC_GROUP_DEFAULT);
-   rc = adhoc_transport_init(group, 0);
+   rc = is_host ? adhoc_transport_init(group, 0)
+                : adhoc_transport_init_join(group, 0, 15000u);
    if (rc != ADHOC_OK)
    {
       net_error_evt("adhoc_init", rc);

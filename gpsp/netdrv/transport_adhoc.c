@@ -912,12 +912,11 @@ int adhoc_transport_init(const char *group, uint32_t connect_timeout_us)
    if (rc != ADHOC_OK)
       return rc;
 
-   /* 6. Create-or-join the group by name (Connect == Create in PPSSPP,
-    * §11.4), then wait for CONNECTED via handler flag OR GetState — the
-    * only header-blessed readiness check (§1.3).  Events can take ~2 s
-    * each in PPSSPP (§11.17). */
-   A.stage = "ctl_connect";
-   rc = sceNetAdhocctlConnect(A.group);
+   /* 6. This is the host path: explicitly create its BSS. Connect's
+    * create-or-join behavior can fail asynchronously on hardware while
+    * returning success here. Joining uses the scanned BSS in init_join. */
+   A.stage = "ctl_create";
+   rc = sceNetAdhocctlCreate(A.group);
    if (rc < 0)
    {
       A.last_sce = (uint32_t)rc;

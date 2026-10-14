@@ -47,9 +47,10 @@ NR52 and SGB checks cover `4cd524c`; physical radio components cover `88cd4c8`.
 
 ## Pending and limits
 
-PSP-3000 hosting failed before traffic while PSP-1000 hosting passed with both
-consoles. Initialization diagnosis is pending; the failure is not hidden by
-the successful role. Physical sleep/wake, abrupt power loss and complete
+The original PSP-3000 host initializer failed before traffic. The explicit SDK
+Create correction subsequently passed physical component probes with either
+console hosting; the earlier failure remains recorded. Physical sleep/wake,
+abrupt power loss and complete
 two-console game/menu flows remain unverified. Delayed timer reload coverage
 uses focused instruction/state tests and does not replace a full game corpus.
 [Future features](future-features.md) are distinct from reliability fixes.

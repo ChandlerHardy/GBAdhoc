@@ -818,10 +818,13 @@ static void t_corruption(void)
    /* the caller never commits a failed fetch: the joiner's save is as it
     * was, byte for byte */
    CHECK(file_crc(mine) == before);
-   put_file(DIRA, "Emerald.sav", 131072, 1);
-   /* and the same item can simply be fetched again */
+   /* A new fetch must checksum the changed file again, without requiring
+    * the sharer to restore its previous bytes or restart the session. */
    CHECK(fetch_file(OBJ(0, FE_SHARE_OBJ_SAVE, 0), "c.sav", 0, 100000)
          == FE_SHARE_CL_DONE);
+   join_paths(a, b, "Emerald.sav", "c.sav");
+   CHECK(same_file(a, b));
+   put_file(DIRA, "Emerald.sav", 131072, 1);
 }
 
 /* ---- 6. truncation -------------------------------------------------------- */
@@ -907,6 +910,37 @@ static size_t forge(uint8_t *d, int proto, int type, unsigned session,
    return 12 + bl;
 }
 
+static void t_request_order(void)
+{
+   uint8_t d[64], body[14] = {0};
+   uint32_t opens;
+   rig_up("b", "b"); rig_join(); q_n = 0;
+   body[2] = FE_SHARE_OBJ_SAVE; body[4] = 7;
+   fe_share_server_rx(&SRV, d, forge(d, FE_SHARE_PROTO, 4, SRV.session, body, 6), NOW);
+   CHECK(SRV.have_obj && SRV.req == 7);
+   opens = SF.opens;
+   /* Exact retransmission reuses the snapshot; a new request reopens it. */
+   fe_share_server_rx(&SRV, d, forge(d, FE_SHARE_PROTO, 4, SRV.session, body, 6), NOW);
+   CHECK(SF.opens == opens);
+   body[4] = 8;
+   fe_share_server_rx(&SRV, d, forge(d, FE_SHARE_PROTO, 4, SRV.session, body, 6), NOW);
+   CHECK(SF.opens == opens + 1 && SRV.req == 8);
+   body[10] = 1;
+   fe_share_server_rx(&SRV, d, forge(d, FE_SHARE_PROTO, 6, SRV.session, body, 14), NOW);
+   CHECK(SRV.win_mask == 1);
+   /* Delayed requests cannot replace the newest request or its window. */
+   body[4] = 7; body[10] = 2;
+   fe_share_server_rx(&SRV, d, forge(d, FE_SHARE_PROTO, 6, SRV.session, body, 14), NOW);
+   CHECK(SRV.req == 8 && SRV.win_mask == 1);
+   fe_share_server_rx(&SRV, d, forge(d, FE_SHARE_PROTO, 4, SRV.session, body, 6), NOW);
+   CHECK(SRV.req == 8 && SRV.win_mask == 1 && SF.opens == opens + 1);
+   /* Request serial numbers wrap through zero. */
+   SRV.req = 65535; body[4] = body[5] = 0;
+   fe_share_server_rx(&SRV, d, forge(d, FE_SHARE_PROTO, 4, SRV.session, body, 6), NOW);
+   CHECK(SRV.req == 0 && SF.opens == opens + 2);
+   q_n = 0;
+}
+
 static void t_hostile(void)
 {
    uint8_t d[FE_SHARE_DGRAM_MAX + 64], body[64];
@@ -979,8 +1013,10 @@ static void t_hostile(void)
    CHECK(SRV.tx_data == data_before);
    CHECK(SF.bad_opens == 0);
    /* a chunk index past the end, and a mask reaching past it, send nothing
-    * beyond the file */
-   q_n = 0;
+    * beyond the file. Start a new session after injecting arbitrary valid
+    * request IDs: its request watermark belongs to those synthetic requests,
+    * not the untouched client's sequence. */
+   rig_up("b", "b"); rig_join(); q_n = 0;
    CHECK(fetch_file(OBJ(0, FE_SHARE_OBJ_STATE, 3), "h.s3", 0, 20000)
          == FE_SHARE_CL_DONE);                       /* 3 chunks, now open */
    q_n = 0;
@@ -1269,7 +1305,7 @@ static uint32_t dir_a_crc(void)
    return c;
 }
 
-int main(void)
+int main(int argc, char **argv)
 {
    char base[] = "/tmp/fe_share_XXXXXX", cmd[600];
    uint32_t a0;
@@ -1279,6 +1315,14 @@ int main(void)
    CHECK(mkdir(DIRA, 0777) == 0 && mkdir(DIRB, 0777) == 0);
    Q = malloc(sizeof(pkt) * NQ);
    CHECK(Q != NULL);
+
+   if (argc > 1 && !strcmp(argv[1], "request-order"))
+   {
+      rig_files();
+      t_request_order();
+      fe_share_server_stop(&SRV);
+      goto cleanup;
+   }
 
    t_classify();
    t_identity();
@@ -1291,6 +1335,7 @@ int main(void)
    t_transfers(30, 10, 1);
    t_corruption();
    t_truncation();
+   t_request_order();
    t_hostile();
    t_versions();
    t_commit();
@@ -1298,6 +1343,7 @@ int main(void)
     * sharer's files are what they were. */
    CHECK(dir_a_crc() == a0);
 
+cleanup:
    free(Q);
    snprintf(cmd, sizeof(cmd), "rm -rf %s", base);
    if (system(cmd) != 0)

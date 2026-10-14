@@ -323,7 +323,13 @@ def suites(env: Env, baseline: Path | None):
          "-Ilibretro/libretro-common/include -Ifrontend-common -Inetdrv "
          "tools/tests/test_battery_persistence.c -Wl,--gc-sections "
          "-o /tmp/t_battery_persistence && "
-         "ASAN_OPTIONS=detect_leaks=1 /tmp/t_battery_persistence"),
+         "ASAN_OPTIONS=detect_leaks=1 /tmp/t_battery_persistence && "
+         "gcc -std=gnu99 -O1 -g -w -DGBA_LINK -fsanitize=address,undefined "
+         "-ffunction-sections -fdata-sections -Ilibretro "
+         "-Ilibretro/libretro-common/include -Ifrontend-common -Inetdrv "
+         "tools/tests/test_gba_save_handoff.c -Wl,--gc-sections "
+         "-o /tmp/t_gba_save_handoff && "
+         "ASAN_OPTIONS=detect_leaks=1 /tmp/t_gba_save_handoff"),
 
         # FF durability nudge: a battery save made during fast-forward is
         # persisted without waiting for FF to end; zero yields when nothing

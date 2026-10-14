@@ -21,12 +21,13 @@ with tempfile.TemporaryDirectory() as directory:
         if name=='cpu.c' and '--baseline' in sys.argv:
             source=t/'cpu.c'
             source.write_bytes(subprocess.check_output(['git','show','4cd524c:gpsp/gbcore/tgbdual/cpu.c'],cwd=ROOT.parent))
+            (t/'cpu_io.h').write_bytes(subprocess.check_output(['git','show','4cd524c:gpsp/gbcore/tgbdual/cpu_io.h'],cwd=ROOT.parent))
         o=t/(name+'.o');run(['gcc','-std=gnu11',*g.WARN,*g.SAN,*g.CORE_FLAGS,'-Igbcore/tgbdual','-c',source,'-o',o]);objects.append(o)
     o=t/'adapter.o';run(['gcc','-std=gnu11',*g.WARN,*g.SAN,'-c',ROOT/'gbcore/gbcore_tgbdual.c','-o',o]);objects.append(o)
     exe=t/'timer';run(['gcc','-std=gnu11',*g.WARN,*g.SAN,*g.CORE_FLAGS,'-I.',ROOT/'gbcore/tests/timer.c',*objects,'-lm','-o',exe])
-    
+
     failures=0
-    for case in ('div','boundary','multi'):
+    for case in ('div','boundary','multi','phase','tac'):
         p=subprocess.run([str(exe),case],env=env,text=True,capture_output=True)
         print(case+': '+p.stdout+p.stderr,end='')
         if 'Sanitizer' in p.stderr or 'runtime error:' in p.stderr:
@@ -36,4 +37,3 @@ with tempfile.TemporaryDirectory() as directory:
 
 
     if failures and '--baseline' not in sys.argv: raise SystemExit(1)
-

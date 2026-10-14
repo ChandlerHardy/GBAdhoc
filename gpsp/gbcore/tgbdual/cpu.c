@@ -645,7 +645,9 @@ void cpu_exec(unsigned short clocks)
 		total_clock+=tmp_clocks;
 
 		if (g_regs.TAC&0x04){//ƒ^ƒCƒ}Š„‚è‚±‚Ý
-			sys_clock+=tmp_clocks;
+			/* TIMA and DIV observe the same free-running system counter. */
+			sys_clock=(((g_regs.DIV<<8)+div_clock-tmp_clocks)&
+				(timer_clocks[g_regs.TAC&0x03]-1))+tmp_clocks;
 			while (sys_clock>=timer_clocks[g_regs.TAC&0x03]){
 				sys_clock-=timer_clocks[g_regs.TAC&0x03];
 				if (!(++g_regs.TIMA)){

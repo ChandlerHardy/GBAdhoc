@@ -47,6 +47,32 @@ int main(int argc,char **argv) {
       ticks(24,mode);CHECK(cpu_read(0xff05)==0xfc);CHECK(cpu_read(0xff0f)&4);
       cpu_write(0xff0f,0);ticks(64,mode);CHECK(cpu_read(0xff05)==0xfc);CHECK(cpu_read(0xff0f)&4);
     }
+    if(!strcmp(which,"all")||!strcmp(which,"phase")) {
+      const unsigned periods[]={1024,16,64,256};
+      for(int sel=0;sel<4;sel++) {
+        reset();ticks(periods[sel]-4,mode);cpu_write(0xff07,(byte)(4|sel));
+        ticks(4,mode);CHECK(cpu_read(0xff05)==1); /* enabling preserves DIV phase */
+        reset();cpu_write(0xff07,(byte)(4|sel));
+        for(unsigned i=0;i<300;i++) {
+          ticks(periods[sel]/2-4,mode);cpu_write(0xff04,0);
+          CHECK(cpu_read(0xff05)==0);CHECK(!(cpu_read(0xff0f)&4));
+        }
+        ticks(periods[sel]/2,mode);cpu_write(0xff04,0);CHECK(cpu_read(0xff05)==1);
+        ticks(periods[sel]-4,mode);CHECK(cpu_read(0xff05)==1);
+        ticks(4,mode);CHECK(cpu_read(0xff05)==2);
+      }
+    }
+    if(!strcmp(which,"all")||!strcmp(which,"tac")) {
+      reset();cpu_write(0xff07,5);ticks(8,mode);cpu_write(0xff07,5);
+      CHECK(cpu_read(0xff05)==0); /* same source has no falling edge */
+      cpu_write(0xff07,4);CHECK(cpu_read(0xff05)==1); /* high bit 3 -> low bit 9 */
+      reset();cpu_write(0xff07,5);ticks(8,mode);cpu_write(0xff07,1);
+      CHECK(cpu_read(0xff05)==(mode==0?1:0)); /* DMG/SGB disable tick; CGB no tick */
+      reset();cpu_write(0xff07,4);ticks(512,mode);cpu_write(0xff07,4);
+      CHECK(cpu_read(0xff05)==0);
+      cpu_write(0xff05,0xff);cpu_write(0xff06,0x55);cpu_write(0xff07,5);
+      CHECK(cpu_read(0xff05)==0x55);CHECK(cpu_read(0xff0f)&4);
+    }
     gbcore_shutdown(c);printf("PASS timer %s mode=%d\n",which,mode);
   }
   return 0;

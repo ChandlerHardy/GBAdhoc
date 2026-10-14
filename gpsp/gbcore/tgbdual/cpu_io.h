@@ -543,14 +543,29 @@ static void cpu_io_write_02( word adr,byte dat )
 		}
 }
 static void cpu_io_write_03( word adr,byte dat ){ ; }
-static void cpu_io_write_04( word adr,byte dat ){ apu_div_reset(); g_regs.DIV=0; div_clock=0; } /* GBAdhoc: DIV-APU falling edge */
+static void cpu_io_write_04( word adr,byte dat ){
+    static const unsigned short timer_bits[]={512,8,32,128};
+    /* Resetting a selected high divider bit creates a TIMA falling edge. */
+    apu_div_reset();
+    if ((g_regs.TAC&4) && (((g_regs.DIV<<8)+div_clock)&timer_bits[g_regs.TAC&3])) {
+      if (!(++g_regs.TIMA)) { cpu_irq(INT_TIMER); g_regs.TIMA=g_regs.TMA; }
+    }
+    g_regs.DIV=0; div_clock=0; sys_clock=0;
+  }
 static void cpu_io_write_05( word adr,byte dat ){ g_regs.TIMA=dat; }
 static void cpu_io_write_06( word adr,byte dat ){ g_regs.TMA=dat; }
 static void cpu_io_write_07( word adr,byte dat )
 {
-		if ((dat&0x04)&&!(g_regs.TAC&0x04))
-			sys_clock=0;
-		g_regs.TAC=dat;
+    static const unsigned short timer_bits[]={512,8,32,128};
+    unsigned counter=(g_regs.DIV<<8)+div_clock;
+    int old_high=(counter&timer_bits[g_regs.TAC&3])!=0;
+    int new_high=(counter&timer_bits[dat&3])!=0;
+    /* DMG gates enable before the edge detector; CGB gates it after. */
+    if ((g_regs.TAC&4) && old_high &&
+        ((dat&4) ? !new_high : now_gb_mode!=3)) {
+      if (!(++g_regs.TIMA)) { cpu_irq(INT_TIMER); g_regs.TIMA=g_regs.TMA; }
+    }
+    g_regs.TAC=dat;
 }
 static void cpu_io_write_08( word adr,byte dat ){ ; }
 static void cpu_io_write_09( word adr,byte dat ){ ; }

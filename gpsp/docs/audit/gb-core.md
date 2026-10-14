@@ -64,6 +64,14 @@ Earlier observations and the LCD-filter feasibility review remain in
   The clock source and APU DIV-reset handling are unchanged. The independent
   expectations follow [Pan Docs timer registers](https://gbdev.io/pandocs/Timer_and_Divider_Registers.html).
   This is a focused correction, not full timer edge/reload emulation.
+- **Shared divider phase and register-write edges:** TIMA's separate
+  accumulator ignored DIV resets and restarted on TAC enable. It now
+  derives phase from the existing DIV register and low divider counter.
+  DIV reset clocks TIMA when its selected bit was high. TAC source changes
+  clock a high-to-low transition; disabling also clocks a high bit on
+  DMG/SGB, but not CGB. APU reset sequencing remains unchanged and no new
+  saved-state fields are introduced. The model distinction follows
+  [Pan Docs timer circuitry](https://gbdev.io/pandocs/Timer_Obscure_Behaviour.html).
 
 ## State and build compatibility
 
@@ -114,14 +122,33 @@ are recorded in `../../../audit/core/accuracy-results.txt`.
   reuse. Real-ROM isolation is explicitly skipped unless
   `GBADHOC_GB_ROMS` is configured.
 - Timer probes execute actual guest NOP and CALL instructions in SGB and
-  CGB normal/double speed with ASan/UBSan. Checkpoint `4cd524c` fails three
+  CGB normal/double speed with ASan/UBSan. Checkpoint `4cd524c` fails five
   controls independently: DIV at 256 clocks reads 255 instead of 1; TIMA
   at 1024 clocks reads 0 instead of 1; a 24-clock CALL crossing two timer
-  boundaries loses an increment and overflow interrupt. The corrected
+  boundaries loses an increment and overflow interrupt; enabling loses
+  DIV phase; changing TAC from a high source bit to a low one misses a tick. The corrected
   source passes exact boundaries at all four rates, 300 repeated DIV
   periods and wraparound, disabled TIMA, DIV/TIMA writes, repeated modulo
   reloads and interrupt requests. CPU clocks are the oracle units, so CGB
-  double-speed tests supply half as many base-clock ticks.
+  double-speed tests supply half as many base-clock ticks. Additional
+  controls cover 300 repeated DIV resets at a low selected bit at each
+  frequency, high-bit reset increments, retained phase when enabling,
+  unchanged TAC writes, source-change overflow and DMG/CGB disable differences.
+- Adapted instruction-body tests from MIT-licensed
+  [Mooneye commit 31510e12](https://github.com/Gekkio/mooneye-test-suite/tree/31510e12eea6286d36eea060a6adde755e1067aa/acceptance/timer)
+  provide an independent reference. A narrow assembler preserves each
+  selected test's instructions and expected register values; the common
+  boot/report harness is replaced by direct adapter entry and host register
+  checks. These are adapted bodies, not full official ROM conformance.
+  `div_write` now finishes all 65,535 DIV-reset iterations without an
+  interrupt in SGB and CGB normal/double speed; checkpoint `88cd4c8`
+  interrupted after 23 iterations. `tim00_div_trigger` yields DE=0405
+  in all modes; its earlier accidental pass alone did not prove edge behavior.
+  `rapid_toggle` now matches BC=FFD9 in SGB. CGB still fails that reference
+  (BC=FCD3); CGB enable-write quirks remain unmodeled. `tima_reload` still
+  fails its two zero-window assertions in all
+  modes. Logs are in `audit/reliability/mooneye-timer.log`; the runner's
+  successful exit records characterization, not all cases passing.
 - The earlier original guest probes now return SGB white `ffff` and NR52
   `f1,f1,f0`, whose activity bits are `1,1,0`. This is host evidence;
   the earlier PSP mask-off screenshot did not provide a valid visual
@@ -151,8 +178,8 @@ runner or frontend save code was edited by this audit.
 - State validation does not yet cover every CPU/DMA/adapter scalar or prove
   robustness against arbitrary malicious state bytes. Targeted fuzzing is
   useful next work. Direct internal restore helpers are not public APIs.
-- Timer DIV/TAC-write falling-edge increments, four-clock delayed overflow
-  reload/write races, STOP/speed-switch details and DMA-only clock advances
+- Timer CGB enable-write quirks, four-clock delayed overflow reload/write
+  races, STOP/speed-switch details and DMA-only clock advances
   still need a hardware-reference oracle and a coordinated timer rewrite.
   The arithmetic probe is not broad timer conformance certification.
 - RTC behavioral suites passed; no new ordinary-use RTC defect was

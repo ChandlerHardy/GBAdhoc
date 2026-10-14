@@ -23,11 +23,21 @@ versus 6.09–8.73 ms for interval 3. Final retained-history sizes differ partly
 because the gestures traversed different distances and are not a controlled
 capacity comparison.
 
-These results reject changing the interval alone. A separate, bounded test
-of interval 3 with `rewind_pace_ms=50` would test actual snapshot density and
+These results reject changing the interval alone. A separate, bounded arm
+used interval 3 with `rewind_pace_ms=50` to test actual snapshot density and
 capture overhead. Skipping audio synthesis changes the user experience and
 was not tested or enabled.
+
+The subsequent interval-3/50 ms arm also exited 0 on both consoles, with no
+reported anomalies. It produced 634/646 snapshots on PSP-1000/3000, versus
+325/327 for interval 6: the desired density increase occurred. Gather plus
+pack work rose from 521/535 ms to 953/979 ms over the run. Rewind remained
+slower: PSP-1000 showed 230/169 frames at 1.29/0.96 frames per cadence period;
+PSP-3000 showed 167/172 at 0.96/0.98. This also rejects replacing the default
+6/100 ms configuration with 3/50 ms. More snapshot work did not compensate
+for the smaller picture capture allocation in these fixtures.
 
 Evidence: `audit/hardware/results/interval3-clean`, `interval6-clean`, and
 `rewind-interval-summary.json`. The first interval-3 run overlapped Memory
 Stick staging; it is preserved as `interval3-confounded` and excluded above.
+The density follow-up is preserved in `interval3-pace50`.

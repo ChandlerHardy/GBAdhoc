@@ -57,6 +57,7 @@ byte *ram_bank;
 byte z802gb[256],gb2z80[256];
 //	word org_pal[16][4];
 int total_clock,rest_clock,sys_clock,seri_occer,div_clock;
+static unsigned timer_pending, timer_reloading;
 /* GBAdhoc: the byte an internal-clock transfer delivers into SB when
  * seri_occer expires (0xFF with no cable), set at the SC write. */
 byte seri_rx=0xFF;
@@ -112,6 +113,7 @@ void cpu_reset(void)
 
 	rest_clock=0;
 	total_clock=sys_clock=div_clock=0;
+	timer_pending=timer_reloading=0;
 	seri_occer=0x7fffffff;
 	halt=false;
 	speed=false;
@@ -130,6 +132,53 @@ void cpu_reset(void)
 	memset(oam,0,sizeof(oam));
 	memset(spare_oam,0,sizeof(spare_oam));
 	seri_rx=0xFF;
+}
+
+/* CPU timer: reload delay and active reload M-cycle in T clocks. */
+static void cpu_timer_increment(void) {
+    if (timer_reloading) return;
+    if (!(++g_regs.TIMA)) timer_pending=4;
+}
+static void cpu_timer_advance(unsigned clocks) {
+    static const unsigned periods[]={1024,16,64,256};
+    if (!(g_regs.TAC&4) && !timer_pending && !timer_reloading) return;
+    unsigned period=periods[g_regs.TAC&3];
+    unsigned phase=((g_regs.DIV<<8)+div_clock)&(period-1);
+    while (clocks) {
+        unsigned step=clocks;
+        unsigned until_tick=period-phase;
+        unsigned pending=timer_pending;
+        if ((g_regs.TAC&4) && step>until_tick) step=until_tick;
+        if (timer_pending && step>timer_pending) step=timer_pending;
+        if (timer_reloading && step>timer_reloading) step=timer_reloading;
+        if (timer_reloading) timer_reloading-=step;
+        if (timer_pending) timer_pending-=step;
+        phase=(phase+step)&(period-1);clocks-=step;
+        if (pending && !timer_pending) {
+            g_regs.TIMA=g_regs.TMA;cpu_irq(INT_TIMER);timer_reloading=4;
+        }
+        if ((g_regs.TAC&4) && step==until_tick) cpu_timer_increment();
+    }
+    if (g_regs.TAC&4) sys_clock=(int)phase;
+}
+
+static void cpu_clock_advance(unsigned clocks) {
+    cpu_timer_advance(clocks);
+    div_clock+=(int)clocks;
+    g_regs.DIV+=(byte)(div_clock>>8);div_clock&=255;
+    total_clock+=(int)clocks;
+}
+void cpu_save_timer_timing(byte *out) {
+    memset(out,0,8);memcpy(out,"TMR1",4);
+    out[4]=(byte)timer_pending;out[5]=(byte)timer_reloading;
+}
+int cpu_timer_timing_valid(const byte *in) {
+    return memcmp(in,"TMR1",4)!=0 ||
+        (in[4]<=4 && in[5]<=4 && !(in[4] && in[5]));
+}
+void cpu_load_timer_timing(const byte *in) {
+    timer_pending=timer_reloading=0;
+    if (!memcmp(in,"TMR1",4)) {timer_pending=in[4];timer_reloading=in[5];}
 }
 
 void cpu_save_state(int *dat)
@@ -606,7 +655,6 @@ int tmp_clocks;
 void cpu_exec(unsigned short clocks)
 {
 	unsigned short op_code;
-	static const unsigned short timer_clocks[]={1024,16,64,256};
 	/* GBAdhoc: MasterBoy's "Z80 clock" percentage (gblCpuCycles) removed;
 	 * the Game Boy always runs at its own clock. */
 
@@ -615,19 +663,15 @@ void cpu_exec(unsigned short clocks)
 
 	rest_clock+=clocks;
 
-	if (gdma_rest){
+	if (gdma_rest && rest_clock>0){
 		if (rest_clock<=gdma_rest){
 			gdma_rest-=rest_clock;
-			sys_clock+=rest_clock;
-			div_clock+=rest_clock;
-			total_clock+=rest_clock;
+			cpu_clock_advance((unsigned)rest_clock);
 			rest_clock=0;
 		}
 		else{
 			rest_clock-=gdma_rest;
-			sys_clock+=gdma_rest;
-			div_clock+=gdma_rest;
-			total_clock+=gdma_rest;
+			cpu_clock_advance((unsigned)gdma_rest);
 			gdma_rest=0;
 		}
 	}
@@ -641,26 +685,8 @@ void cpu_exec(unsigned short clocks)
 		op_code_normal_JmpTbl[op_code]();
 
 		rest_clock-=tmp_clocks;
-		div_clock+=tmp_clocks;
-		total_clock+=tmp_clocks;
+		cpu_clock_advance((unsigned)tmp_clocks);
 
-		if (g_regs.TAC&0x04){//ƒ^ƒCƒ}Š„‚è‚±‚Ý
-			/* TIMA and DIV observe the same free-running system counter. */
-			sys_clock=(((g_regs.DIV<<8)+div_clock-tmp_clocks)&
-				(timer_clocks[g_regs.TAC&0x03]-1))+tmp_clocks;
-			while (sys_clock>=timer_clocks[g_regs.TAC&0x03]){
-				sys_clock-=timer_clocks[g_regs.TAC&0x03];
-				if (!(++g_regs.TIMA)){
-					cpu_irq(INT_TIMER);
-					g_regs.TIMA=g_regs.TMA;
-				}
-			}
-		}
-
-		if (div_clock>=0x100){
-			g_regs.DIV+=div_clock>>8;
-			div_clock&=0xff;
-		}
 
 		/* GBAdhoc: serial completion restored.  MasterBoy had compiled it
 		 * out, so an internal-clock transfer never finished.  The byte was

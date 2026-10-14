@@ -28,7 +28,19 @@ Sticks: short writes, failed closes/loads, concurrent save generation and
 recovery retry preserved usable prior data. This is not an abrupt-power-loss
 test. Physical sleep/wake and two-console radio gameplay remain unverified.
 
+The actual `88cd4c8` netdrv/adhoc/share components subsequently passed a
+two-PSP radio probe with PSP-1000 hosting and PSP-3000 joining: three reliable
+message leave/rejoin cycles followed by three 131,072-byte save transfers,
+commit/backup checks, cancellation recovery and version-1 refusal. Independent
+SHA-256 verification matched all three received files and all three original
+backups; the remote listing contained no temporary `.gsp` file. This validates
+the production protocol components, not application menus or game linking.
+The first attempt with the opposite host role failed before any traffic
+(`ctl_connect_wait`/no group); that failure is preserved separately.
+
 Local evidence: `audit/hardware/results/candidate-rewind-me1`,
 `candidate-nr52`, `candidate-sgb` and `battery`; all contain device-specific
 logs. The earlier baseline NR52 fixture had an invalid script and is not a
 valid hardware comparison.
+Radio evidence: `audit/hardware/results/radio-v2-1000host/verdict.json` and its
+role-specific logs/files; `radio-v2-attempt1` preserves the initial failure.

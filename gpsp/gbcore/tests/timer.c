@@ -4,9 +4,16 @@
 #include <stdlib.h>
 #include <string.h>
 static byte rom[32768];
+static byte state[1<<20], pending_state[1<<20], bad[1<<20], after[1<<20];
+static uint64_t audio_hash;
+static unsigned audio_count;
+static void audio(void *u,const int16_t *p,size_t n) {
+  (void)u;audio_count+=(unsigned)n;
+  for(size_t i=0;i<2*n;i++)audio_hash=(audio_hash^(uint16_t)p[i])*1099511628211ULL;
+}
 #define CHECK(x) do { if (!(x)) { fprintf(stderr,"FAIL line %d: %s DIV=%u TIMA=%u\n",__LINE__,#x,cpu_read(0xff04),cpu_read(0xff05)); exit(1); } } while (0)
 static gbcore_t *boot(int mode) {
-  byte sum=0;gbcore_callbacks_t cb={0};memset(rom,0,sizeof rom);
+  byte sum=0;gbcore_callbacks_t cb={0};cb.audio_batch=audio;memset(rom,0,sizeof rom);
   rom[0x143]=mode?0x80:0;rom[0x146]=3;rom[0x14b]=0x33;
   for(unsigned i=0x134;i<=0x14c;i++)sum=(byte)(sum-rom[i]-1);
   rom[0x14d]=sum;
@@ -16,6 +23,7 @@ static gbcore_t *boot(int mode) {
 }
 static void reset(void) {
   int dat[4]={0};cpu_restore_state_ex(dat);c_regs_PC=0x150;
+  const byte legacy[8]={0};cpu_load_timer_timing(legacy);
   cpu_write(0xff07,0);cpu_write(0xff04,0);cpu_write(0xff05,0);cpu_write(0xff0f,0);
 }
 static void ticks(unsigned cpu_clocks,int mode) {cpu_exec((unsigned short)(cpu_clocks/(mode==2?2:1)));}
@@ -71,7 +79,69 @@ int main(int argc,char **argv) {
       reset();cpu_write(0xff07,4);ticks(512,mode);cpu_write(0xff07,4);
       CHECK(cpu_read(0xff05)==0);
       cpu_write(0xff05,0xff);cpu_write(0xff06,0x55);cpu_write(0xff07,5);
-      CHECK(cpu_read(0xff05)==0x55);CHECK(cpu_read(0xff0f)&4);
+      CHECK(cpu_read(0xff05)==0);CHECK(!(cpu_read(0xff0f)&4));
+      ticks(4,mode);CHECK(cpu_read(0xff05)==0x55);CHECK(cpu_read(0xff0f)&4);
+    }
+    if(!strcmp(which,"all")||!strcmp(which,"reload")) {
+      byte timing[8];
+      reset();cpu_write(0xff07,6);cpu_write(0xff05,0xff);cpu_write(0xff06,0x55);
+      ticks(60,mode);CHECK(cpu_read(0xff05)==0xff);CHECK(!(cpu_read(0xff0f)&4));
+      ticks(4,mode);CHECK(cpu_read(0xff05)==0);CHECK(!(cpu_read(0xff0f)&4));
+      cpu_save_timer_timing(timing);CHECK(timing[4]==4&&timing[5]==0);
+      ticks(4,mode);CHECK(cpu_read(0xff05)==0x55);CHECK(cpu_read(0xff0f)&4);
+      cpu_write(0xff05,0x77);CHECK(cpu_read(0xff05)==0x55);
+      cpu_write(0xff06,0x66);CHECK(cpu_read(0xff05)==0x66);
+      ticks(4,mode);cpu_write(0xff05,0x77);CHECK(cpu_read(0xff05)==0x77);
+      reset();cpu_write(0xff07,6);cpu_write(0xff05,0xff);ticks(64,mode);
+      cpu_write(0xff05,0x77);ticks(4,mode);CHECK(cpu_read(0xff05)==0x77);CHECK(!(cpu_read(0xff0f)&4));
+      reset();cpu_write(0xff07,6);cpu_write(0xff05,0xff);ticks(64,mode);
+      cpu_write(0xff06,0x66);cpu_write(0xff04,0);cpu_write(0xff07,0);
+      ticks(4,mode);CHECK(cpu_read(0xff05)==0x66);CHECK(cpu_read(0xff0f)&4);
+      reset();cpu_write(0xff07,6);cpu_write(0xff05,0xff);cpu_write(0xff06,0x55);ticks(64,mode);
+      gdma_rest=4;ticks(4,mode);CHECK(cpu_read(0xff05)==0x55);CHECK(cpu_read(0xff0f)&4);
+      reset();gdma_rest=256;ticks(256,mode);CHECK(cpu_read(0xff04)==1);
+    }
+    if(!strcmp(which,"all")||!strcmp(which,"reload-state")) {
+      reset();cpu_write(0xff26,0x80);cpu_write(0xff12,0xf0);cpu_write(0xff24,0x77);cpu_write(0xff25,0x11);cpu_write(0xff14,0x80);
+      cpu_write(0xff07,6);cpu_write(0xff05,0xff);cpu_write(0xff06,0x55);ticks(64,mode);
+      byte saved_timing[8], loaded_timing[8];cpu_save_timer_timing(saved_timing);
+      long n=gbcore_state_save(c,state,sizeof state);CHECK(n>0);
+      long pending_n=n;memcpy(pending_state,state,(size_t)n);
+      ticks(4,mode);CHECK(cpu_read(0xff05)==0x55);CHECK(cpu_read(0xff0f)&4);
+      CHECK(gbcore_state_load(c,state,(size_t)n)==0);cpu_save_timer_timing(loaded_timing);CHECK(!memcmp(saved_timing,loaded_timing,8));
+      uint64_t hash=gbcore_sync_hash(c); /* public restore normalizes total_clock */
+      ticks(4,mode);CHECK(gbcore_state_load(c,state,(size_t)n)==0);CHECK(gbcore_sync_hash(c)==hash);
+      ticks(4,mode);CHECK(cpu_read(0xff05)==0x55);CHECK(cpu_read(0xff0f)&4);
+      n=gbcore_state_save(c,state,sizeof state);CHECK(n>0);cpu_save_timer_timing(saved_timing);
+      ticks(4,mode);cpu_write(0xff05,0x77);CHECK(cpu_read(0xff05)==0x77);
+      CHECK(gbcore_state_load(c,state,(size_t)n)==0);cpu_save_timer_timing(loaded_timing);CHECK(!memcmp(saved_timing,loaded_timing,8));
+      cpu_write(0xff05,0x77);CHECK(cpu_read(0xff05)==0x55);
+      cpu_write(0xff06,0x66);CHECK(cpu_read(0xff05)==0x66);
+      size_t timer=40+4+(mode?0xc000:0x4000)+0x2000+0xa0+0x80+8+(mode?8:0)+
+        sizeof(struct cpu_regs)+sizeof(struct gb_regs)+(mode?sizeof(struct gbc_regs)+128:0)+
+        16+(mode?24:0)+2*sizeof(struct apu_stat)+0x30+(mode?1:0)+80;
+      CHECK(!memcmp(state+timer,"TMR1",4));
+      CHECK(gbcore_state_save(c,after,sizeof after)==n);memcpy(bad,state,(size_t)n);bad[timer+4]=5;
+      CHECK(gbcore_state_load(c,bad,(size_t)n)!=0);CHECK(gbcore_state_save(c,bad,sizeof bad)==n);CHECK(!memcmp(bad,after,(size_t)n));
+      memcpy(bad,state,(size_t)n);bad[timer+4]=1;bad[timer+5]=1;
+      CHECK(gbcore_state_load(c,bad,(size_t)n)!=0);CHECK(gbcore_state_save(c,bad,sizeof bad)==n);CHECK(!memcmp(bad,after,(size_t)n));
+      memcpy(bad,state,(size_t)n);memset(bad+timer,0,8);CHECK(gbcore_state_load(c,bad,(size_t)n)==0);
+      cpu_write(0xff05,0x77);CHECK(cpu_read(0xff05)==0x77); /* legacy extension loads idle */
+      gbcore_set_headless(c,1);CHECK(gbcore_state_load(c,state,(size_t)n)==0);
+      cpu_write(0xff05,0x77);CHECK(cpu_read(0xff05)==0x55);
+      gbcore_set_headless(c,0);
+      byte *r=get_rom();r[0x200]=0xc3;r[0x201]=0;r[0x202]=2;c_regs_PC=0x200;
+      n=gbcore_state_save(c,state,sizeof state);CHECK(n>0);
+      uint64_t hashes[8], sounds[8];unsigned counts[8];
+      for(int phase=0;phase<2;phase++) {
+        const byte *saved=phase?state:pending_state;size_t length=(size_t)(phase?n:pending_n);
+        gbcore_set_headless(c,0);CHECK(gbcore_state_load(c,saved,length)==0);
+        for(int i=0;i<8;i++){audio_hash=1;audio_count=0;gbcore_run_frame(c,0);hashes[i]=gbcore_sync_hash(c);sounds[i]=audio_hash;counts[i]=audio_count;CHECK(audio_count>0);}
+        CHECK(gbcore_state_load(c,saved,length)==0);
+        for(int i=0;i<8;i++){audio_hash=1;audio_count=0;gbcore_run_frame(c,0);CHECK(gbcore_sync_hash(c)==hashes[i]);CHECK(audio_hash==sounds[i]);CHECK(audio_count==counts[i]);}
+        CHECK(gbcore_state_load(c,saved,length)==0);gbcore_set_headless(c,1);
+        for(int i=0;i<8;i++){gbcore_run_frame(c,0);CHECK(gbcore_sync_hash(c)==hashes[i]);}
+      }
     }
     gbcore_shutdown(c);printf("PASS timer %s mode=%d\n",which,mode);
   }

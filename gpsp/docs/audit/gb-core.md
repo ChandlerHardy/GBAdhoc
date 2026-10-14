@@ -72,6 +72,13 @@ Earlier observations and the LCD-filter feasibility review remain in
   DMG/SGB, but not CGB. APU reset sequencing remains unchanged and no new
   saved-state fields are introduced. The model distinction follows
   [Pan Docs timer circuitry](https://gbdev.io/pandocs/Timer_Obscure_Behaviour.html).
+- **Timer overflow reload:** overflow now leaves TIMA zero for four CPU
+  clocks before copying TMA and requesting its interrupt. A TIMA write in
+  that interval cancels the reload/interrupt; during the following reload
+  M-cycle, TIMA writes are ignored and TMA writes also update TIMA. The
+  event-driven counter consumes timer edges, reload deadlines and window
+  expiration in time order. Instruction and DMA-stall clock advances share
+  this path; pending reloads continue even after TAC is disabled.
 
 ## State and build compatibility
 
@@ -83,6 +90,14 @@ deterministic defaults; they cannot recover history never saved by the old
 binary. New output bytes, audio and sync hashes intentionally differ from
 v4.0.0. The underlying TGB state still assumes compatible native integer and
 struct layout; this work does not make it a portable interchange format.
+
+Native reserved bytes 80..87 now hold a `TMR1` marker, pending reload and
+active reload-window countdowns. They do not overlap APU bytes 0..79 or the
+adapter's separate `A2` extension. Timer fields are validated before RAM
+mutation; missing legacy markers load an idle timer pipeline. Save-state
+size/version are unchanged. Rewind uses this same state path. The sync hash
+includes the timer pipeline so equal visible TIMA values cannot hide
+different pending interrupt/reload behavior.
 
 No new heap allocations were added. Pitch conversion divides only when a
 write or sweep changes pitch. The additional sequencer work still needs
@@ -122,7 +137,7 @@ are recorded in `../../../audit/core/accuracy-results.txt`.
   reuse. Real-ROM isolation is explicitly skipped unless
   `GBADHOC_GB_ROMS` is configured.
 - Timer probes execute actual guest NOP and CALL instructions in SGB and
-  CGB normal/double speed with ASan/UBSan. Checkpoint `4cd524c` fails five
+  CGB normal/double speed with ASan/UBSan. Checkpoint `4cd524c` fails seven
   controls independently: DIV at 256 clocks reads 255 instead of 1; TIMA
   at 1024 clocks reads 0 instead of 1; a 24-clock CALL crossing two timer
   boundaries loses an increment and overflow interrupt; enabling loses
@@ -134,6 +149,15 @@ are recorded in `../../../audit/core/accuracy-results.txt`.
   controls cover 300 repeated DIV resets at a low selected bit at each
   frequency, high-bit reset increments, retained phase when enabling,
   unchanged TAC writes, source-change overflow and DMG/CGB disable differences.
+  Reload controls verify the zero/interrupt delay, TIMA cancel/ignored
+  writes, TMA writes, DMA-only advances, atomic rejection of invalid timer
+  states and legacy idle defaults. States captured while reload is pending
+  and while its write window is active preserve those phases after restore;
+  eight-frame repeated restore runs reproduce active-APU audio pair counts,
+  every sample hash, guest hashes and drawn/headless parity in all modes.
+  Public restore still normalizes the absolute CPU clock as before. The
+  old-CPU negative-control build uses link-only idle timer-state stubs for
+  new callers; the historical CPU timer behavior itself is unchanged.
 - Adapted instruction-body tests from MIT-licensed
   [Mooneye commit 31510e12](https://github.com/Gekkio/mooneye-test-suite/tree/31510e12eea6286d36eea060a6adde755e1067aa/acceptance/timer)
   provide an independent reference. A narrow assembler preserves each
@@ -145,9 +169,10 @@ are recorded in `../../../audit/core/accuracy-results.txt`.
   interrupted after 23 iterations. `tim00_div_trigger` yields DE=0405
   in all modes; its earlier accidental pass alone did not prove edge behavior.
   `rapid_toggle` now matches BC=FFD9 in SGB. CGB still fails that reference
-  (BC=FCD3); CGB enable-write quirks remain unmodeled. `tima_reload` still
-  fails its two zero-window assertions in all
-  modes. Logs are in `audit/reliability/mooneye-timer.log`; the runner's
+  (BC=FCD3); CGB enable-write quirks remain unmodeled. The adapted
+  `tima_reload`, `tima_write_reloading` and `tma_write_reloading` bodies now
+  meet every original register assertion in all modes. Logs are in
+  `audit/reliability/mooneye-timer.log`; the runner's
   successful exit records characterization, not all cases passing.
 - The earlier original guest probes now return SGB white `ffff` and NR52
   `f1,f1,f0`, whose activity bits are `1,1,0`. This is host evidence;
@@ -178,10 +203,12 @@ runner or frontend save code was edited by this audit.
 - State validation does not yet cover every CPU/DMA/adapter scalar or prove
   robustness against arbitrary malicious state bytes. Targeted fuzzing is
   useful next work. Direct internal restore helpers are not public APIs.
-- Timer CGB enable-write quirks, four-clock delayed overflow reload/write
-  races, STOP/speed-switch details and DMA-only clock advances
-  still need a hardware-reference oracle and a coordinated timer rewrite.
-  The arithmetic probe is not broad timer conformance certification.
+- Timer CGB enable-write quirks and STOP/speed-switch details remain.
+  The CPU executes register accesses at whole-instruction boundaries;
+  mixed instruction widths and multiple bus accesses can therefore still
+  differ from hardware even though the selected adapted reload tests pass.
+  Broad timer/bus-cycle conformance requires a CPU bus-cycle model and full
+  official ROM testing. These host probes are not that certification.
 - RTC behavioral suites passed; no new ordinary-use RTC defect was
   established. The documented SGB-border, tilt/rumble and Shantae limitations
   remain. Palette/control defaults and normal frontend turbo handling were

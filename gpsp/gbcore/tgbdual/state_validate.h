@@ -54,6 +54,8 @@ static int gb_state_valid(const byte *buf, size_t size)
 	p += 4 * sizeof(int); /* halt, old serial field, mapper, RAM-enable */
 	if (model >= 3) p += 6 * sizeof(int);
 	if (!state_apu_valid(p) || !state_apu_valid(p + sizeof(struct apu_stat) + 0x30)) return 0;
+	if (!cpu_timer_timing_valid(p + 2 * sizeof(struct apu_stat) + 0x30 +
+	    (model >= 3 ? 1 : 0) + 80)) return 0;
 	p += 2 * sizeof(struct apu_stat) + 0x30 + 256 + (model >= 3 ? 1 : 0);
 	if (model == 2) {
 		/* A corrupt packet cursor otherwise indexes outside sgb_buffer on the

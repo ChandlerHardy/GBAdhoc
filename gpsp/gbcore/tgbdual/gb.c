@@ -217,7 +217,8 @@ size_t gb_save_state(byte *buf)
 		write_state(fd, apu_get_stat_gen(),sizeof(struct apu_stat));
 
 		byte resurved[256];
-		apu_save_timing(resurved); /* GBAdhoc: use the existing reserved block. */
+		apu_save_timing(resurved);
+		cpu_save_timer_timing(resurved+80); /* GBAdhoc: use the existing reserved block. */
 		write_state(fd, resurved,256);//将来のために確保
 
 		// RIN拡張
@@ -303,7 +304,8 @@ size_t gb_save_state(byte *buf)
 		write_state(fd, apu_get_stat_gen(),sizeof(struct apu_stat));
 
 		byte resurved[256],reload=1;
-		apu_save_timing(resurved); /* GBAdhoc: use the existing reserved block. */
+		apu_save_timing(resurved);
+		cpu_save_timer_timing(resurved+80); /* GBAdhoc: use the existing reserved block. */
 //		resurved[0]=1;
 		write_state(fd, &reload,1);
 		write_state(fd, resurved,256);//将来のために確保
@@ -384,7 +386,8 @@ int gb_restore_state(const byte *buf, size_t size)
 
 		byte resurved[256];
 		read_state(fd, resurved, 256);
-		apu_load_timing(resurved);//将来のために確保
+		apu_load_timing(resurved);
+		cpu_load_timer_timing(resurved+80);//将来のために確保
 
 		// RIN拡張
 		if(gb_type==2 && sgb_mode){
@@ -495,7 +498,8 @@ int gb_restore_state(const byte *buf, size_t size)
 		/* GBAdhoc: consume the CGB palette-format byte written by save. */
 		read_state(fd, &reload, 1);
 		read_state(fd, resurved,256);
-		apu_load_timing(resurved);//将来のために確保
+		apu_load_timing(resurved);
+		cpu_load_timer_timing(resurved+80);//将来のために確保
 	}
 
 #ifdef CHEAT_SUPPORT

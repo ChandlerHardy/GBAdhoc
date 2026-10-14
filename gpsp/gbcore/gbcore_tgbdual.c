@@ -1442,6 +1442,11 @@ uint64_t gbcore_sync_hash(gbcore_t *core)
     apu_save_cpu_timing(timing);
     h = sync_bytes(h, timing, sizeof(timing));
   }
+  {
+    uint8_t timing[8];
+    cpu_save_timer_timing(timing);
+    h = sync_bytes(h, timing, sizeof(timing));
+  }
 
   if (now_gb_mode == 2)
   {

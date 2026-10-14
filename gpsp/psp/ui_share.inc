@@ -650,7 +650,7 @@ static void share_host_run(const char *rom_dir)
    share_ident(&me);
    io.user = h;
    fe_share_server_init(&h->srv, &io, &me, h->e, h->n, h->manifest, h->msize,
-                        (uint16_t)(share_now_ms() | 1u));
+                        (uint32_t)(sceKernelGetSystemTimeLow() | 1u));
    fe_evt("share_host_up group=%s build=%s entries=%u saves=%u states=%u "
           "manifest=%u", h->group, me.build, h->n, h->srv.n_saves,
           h->srv.n_states, h->msize);
@@ -774,7 +774,7 @@ typedef struct
    char group[9], room[ROOM_LABEL_CAP];
    fe_share_client cl;
    fe_share_ident me;
-   uint16_t nonce;
+   uint32_t nonce;
    uint8_t *dg;
 
    fe_share_entry *e;
@@ -2037,7 +2037,7 @@ static void share_join_run(const char *rom_dir, const char *group)
    j->shot_slot = -1;
    snprintf(j->group, sizeof(j->group), "%.8s", group);
    room_label(j->group, j->room, sizeof(j->room));
-   j->nonce = (uint16_t)sceKernelGetSystemTimeLow();
+   j->nonce = (uint32_t)sceKernelGetSystemTimeLow();
    j->dg = (uint8_t *)malloc(FE_SHARE_DGRAM_MAX + 8);
    j->ythumb = (uint16_t *)memalign(16, FE_SHARE_SLOTS * SHJ_THUMB_TEXELS * 2);
    j->tthumb = (uint16_t *)memalign(16, FE_SHARE_SLOTS * SHJ_THUMB_TEXELS * 2);

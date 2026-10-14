@@ -7,8 +7,8 @@
 /* ---- message types (the numbers are the wire) ---------------------------- */
 enum
 {
-   T_HELLO = 1,   /* c->s  mac[6] nonce u16 build[24] fmt u32 x3            */
-   T_WELCOME,     /* s->c  mac[6] nonce u16 build[24] fmt x3 n u16 saves u16
+   T_HELLO = 1,   /* c->s  mac[6] nonce u32 build[24] fmt u32 x3            */
+   T_WELCOME,     /* s->c  mac[6] nonce u32 build[24] fmt x3 n u16 saves u16
                            states u16 manifest_size u32 manifest_crc u32     */
    T_REFUSE,      /* s->c  code u8 proto u8 build[24]   LAYOUT NEVER CHANGES */
    T_STAT,        /* c->s  obj[4] req u16                                    */
@@ -17,7 +17,9 @@ enum
    T_DATA,        /* s->c  obj[4] req u16 chunk u32 len u16 data             */
    T_PING,        /* c->s                                                    */
    T_PONG,        /* s->c                                                    */
-   T_BYE          /* either way                                              */
+   T_BYE,         /* either way                                              */
+   T_OFFER,       /* s->c ident echoing nonce; header is provisional session */
+   T_CONFIRM      /* c->s ident; echo OFFER session before admission          */
 };
 enum { REFUSE_PROTO = 1, REFUSE_BUSY = 2 };
 enum { ST_OK = 0, ST_GONE, ST_TOO_BIG, ST_NOT_OPEN, ST_BAD };
@@ -439,7 +441,14 @@ static uint8_t *dg_begin(uint8_t *d, int type, unsigned session)
    memcpy(d, FE_SHARE_MAGIC, 4);
    d[4] = FE_SHARE_PROTO;
    d[5] = (uint8_t)type;
-   put16(d + 6, session);
+   /* Keep discovery/refusal framing readable by v1 rooms: neither has an
+    * established session. Old hosts can then route REFUSE to the real MAC. */
+   if (type == T_HELLO || type == T_REFUSE)
+   {
+      put16(d + 6, 0);
+      return d + 8;
+   }
+   put32(d + 6, session);
    return d + FE_SHARE_HDR;
 }
 
@@ -457,16 +466,20 @@ static int dg_check(const void *buf, size_t len, int *proto, int *type,
                     unsigned *session, const uint8_t **body, size_t *blen)
 {
    const uint8_t *d = (const uint8_t *)buf;
-   if (!d || len < FE_SHARE_HDR + 4 || len > FE_SHARE_DGRAM_MAX ||
+   size_t hdr;
+   if (!d || len < 12 || len > FE_SHARE_DGRAM_MAX ||
        memcmp(d, FE_SHARE_MAGIC, 4) != 0)
+      return -1;
+   hdr = d[4] == 1 || d[5] == T_HELLO || d[5] == T_REFUSE ? 8u : FE_SHARE_HDR;
+   if (len < hdr + 4)
       return -1;
    if (get32(d + len - 4) != fe_share_crc32(0, d, len - 4))
       return -1;
    *proto = d[4];
    *type = d[5];
-   *session = get16(d + 6);
-   *body = d + FE_SHARE_HDR;
-   *blen = len - FE_SHARE_HDR - 4;
+   *session = hdr == 8 ? get16(d + 6) : get32(d + 6);
+   *body = d + hdr;
+   *blen = len - hdr - 4;
    return 0;
 }
 
@@ -496,27 +509,27 @@ static uint8_t *put_ident(uint8_t *p, const fe_share_ident *id, unsigned nonce)
 {
    int i;
    memcpy(p, id->mac, 6);
-   put16(p + 6, nonce);
-   memcpy(p + 8, id->build, FE_SHARE_BUILD_CAP);
+   put32(p + 6, nonce);
+   memcpy(p + 10, id->build, FE_SHARE_BUILD_CAP);
    for (i = 0; i < FE_SHARE_CONSOLES; i++)
-      put32(p + 8 + FE_SHARE_BUILD_CAP + 4 * i, id->state_fmt[i]);
-   return p + 8 + FE_SHARE_BUILD_CAP + 4 * FE_SHARE_CONSOLES;
+      put32(p + 10 + FE_SHARE_BUILD_CAP + 4 * i, id->state_fmt[i]);
+   return p + 10 + FE_SHARE_BUILD_CAP + 4 * FE_SHARE_CONSOLES;
 }
-#define IDENT_WIRE (8u + FE_SHARE_BUILD_CAP + 4u * FE_SHARE_CONSOLES)
+#define IDENT_WIRE (10u + FE_SHARE_BUILD_CAP + 4u * FE_SHARE_CONSOLES)
 
 static unsigned get_ident(const uint8_t *p, fe_share_ident *id)
 {
    int i;
    memcpy(id->mac, p, 6);
-   memcpy(id->build, p + 8, FE_SHARE_BUILD_CAP);
+   memcpy(id->build, p + 10, FE_SHARE_BUILD_CAP);
    id->build[FE_SHARE_BUILD_CAP - 1] = '\0';
    for (i = 0; id->build[i]; i++)
       if ((unsigned char)id->build[i] < 0x20 ||
           (unsigned char)id->build[i] > 0x7E)
          id->build[i] = '?';
    for (i = 0; i < FE_SHARE_CONSOLES; i++)
-      id->state_fmt[i] = get32(p + 8 + FE_SHARE_BUILD_CAP + 4 * i);
-   return get16(p + 6);
+      id->state_fmt[i] = get32(p + 10 + FE_SHARE_BUILD_CAP + 4 * i);
+   return get32(p + 6);
 }
 
 static uint32_t chunks_of(uint32_t size)
@@ -530,7 +543,7 @@ void fe_share_server_init(fe_share_server *s, const fe_share_server_io *io,
                           const fe_share_ident *me,
                           const fe_share_entry *entries, unsigned n,
                           const uint8_t *manifest, uint32_t manifest_size,
-                          uint16_t session_seed)
+                          uint32_t session_seed)
 {
    unsigned i, k;
    memset(s, 0, sizeof(*s));
@@ -681,20 +694,58 @@ void fe_share_server_rx(fe_share_server *s, const void *buf, size_t len,
          srv_refuse(s, id.mac, REFUSE_BUSY);
          return;
       }
-      if (s->state != FE_SHARE_SRV_CONNECTED || nonce != s->peer_nonce)
+      if (!nonce || session)
+      { s->rx_bad++; return; }
+      if (s->state == FE_SHARE_SRV_CONNECTED && nonce == s->peer_nonce)
       {
-         /* A new guest, or the same PSP joining again: a new session.  A
-          * repeated HELLO (its WELCOME was lost, or the radio delivered it
-          * twice) carries the same nonce and keeps the session it has. */
-         srv_close_obj(s);
-         s->have_req = 0;
-         s->session = s->session_seed++;
-         if (!s->session)
-            s->session = s->session_seed++;
+         /* Repeat the active OFFER as well: a delayed obsolete OFFER may
+          * have arrived before WELCOME. The next HELLO repairs that race. */
+         uint8_t d[96], *p = dg_begin(d, T_OFFER, s->session);
+         p = put_ident(p, &s->me, nonce);
+         s->io.send(s->io.user, id.mac, d, dg_end(d, p));
+         return;
       }
-      s->peer_nonce = (uint16_t)nonce;
+      if (!s->offer_session || nonce != s->offer_nonce ||
+          memcmp(id.mac, s->offer_ident.mac, 6) ||
+          (uint32_t)(now_ms - s->offer_ms) >= SERVER_GUEST_TIMEOUT)
+      {
+         s->offer_session = s->session_seed++;
+         if (!s->offer_session)
+            s->offer_session = s->session_seed++;
+         s->offer_nonce = nonce;
+         s->offer_ident = id;
+      }
+      s->offer_ms = now_ms;
+      {
+         uint8_t d[96], *p = dg_begin(d, T_OFFER, s->offer_session);
+         p = put_ident(p, &s->me, nonce);
+         s->io.send(s->io.user, id.mac, d, dg_end(d, p));
+      }
+      s->rx_ok++;
+      return;
+   }
+   if (type == T_CONFIRM)
+   {
+      fe_share_ident id;
+      unsigned nonce;
+      if (bl != IDENT_WIRE)
+      { s->rx_bad++; return; }
+      nonce = get_ident(b, &id);
+      if (s->state == FE_SHARE_SRV_CONNECTED && session == s->session &&
+          nonce == s->peer_nonce && !memcmp(id.mac, s->peer, 6))
+      { srv_welcome(s, nonce); return; }
+      if (!session || session != s->offer_session || nonce != s->offer_nonce ||
+          memcmp(id.mac, s->offer_ident.mac, 6) ||
+          (uint32_t)(now_ms - s->offer_ms) >= SERVER_GUEST_TIMEOUT ||
+          (s->state == FE_SHARE_SRV_CONNECTED && memcmp(id.mac, s->peer, 6)))
+      { s->rx_bad++; return; }
+      srv_close_obj(s);
+      s->have_req = 0;
+      s->session = session;
+      s->peer_nonce = nonce;
       memcpy(s->peer, id.mac, 6);
-      s->peer_ident = id;
+      s->peer_ident = s->offer_ident;
+      s->offer_session = 0;
       s->state = FE_SHARE_SRV_CONNECTED;
       s->last_rx_ms = now_ms;
       s->rx_ok++;
@@ -720,6 +771,7 @@ void fe_share_server_rx(fe_share_server *s, const void *buf, size_t len,
       if (bl != 0)
          break;
       srv_close_obj(s);
+      s->offer_session = 0;
       s->state = FE_SHARE_SRV_WAITING;
       s->rx_ok++;
       return;
@@ -846,19 +898,20 @@ void fe_share_server_stop(fe_share_server *s)
       srv_send(s, d, p);
    }
    srv_close_obj(s);
+   s->offer_session = 0;
    s->state = FE_SHARE_SRV_WAITING;
 }
 
 /* ====================== client ============================================ */
 
 void fe_share_client_init(fe_share_client *c, const fe_share_client_io *io,
-                          const fe_share_ident *me, uint16_t nonce)
+                          const fe_share_ident *me, uint32_t nonce)
 {
    memset(c, 0, sizeof(*c));
    c->io = *io;
    c->me = *me;
    c->me.build[FE_SHARE_BUILD_CAP - 1] = '\0';
-   c->nonce = nonce;
+   c->nonce = nonce ? nonce : 1;
 }
 
 static void cl_send(fe_share_client *c, const uint8_t mac[6], uint8_t *d,
@@ -892,6 +945,10 @@ static void cl_hello(fe_share_client *c, uint32_t now_ms)
 
 void fe_share_client_hello(fe_share_client *c, uint32_t now_ms)
 {
+   if (c->hello_started && !++c->nonce)
+      ++c->nonce;
+   c->hello_started = 1;
+   c->offer_session = 0;
    c->state = FE_SHARE_CL_HELLO;
    c->err = 0;
    c->session = 0;
@@ -1060,18 +1117,34 @@ void fe_share_client_rx(fe_share_client *c, const void *buf, size_t len,
          c->rx_bad++;
       return;
    }
+   if (type == T_OFFER)
+   {
+      fe_share_ident id;
+      uint8_t d[96], *p;
+      if (c->state != FE_SHARE_CL_HELLO || bl != IDENT_WIRE || !session ||
+          get_ident(b, &id) != c->nonce)
+      { c->rx_bad++; return; }
+      c->offer_session = session;
+      c->host = id;
+      p = dg_begin(d, T_CONFIRM, session);
+      p = put_ident(p, &c->me, c->nonce);
+      cl_send(c, id.mac, d, p, now_ms);
+      c->rx_ok++;
+      return;
+   }
    if (type == T_WELCOME)
    {
       fe_share_ident id;
       if (c->state != FE_SHARE_CL_HELLO || bl != IDENT_WIRE + 14 ||
-          get_ident(b, &id) != c->nonce || !session)
+          get_ident(b, &id) != c->nonce || !session ||
+          session != c->offer_session || memcmp(id.mac, c->host.mac, 6))
       {
          c->rx_bad++;
          return;
       }
       b += IDENT_WIRE;
       c->host = id;
-      c->session = (uint16_t)session;
+      c->session = session;
       c->n_entries = get16(b);
       c->n_saves = get16(b + 2);
       c->n_states = get16(b + 4);

@@ -899,15 +899,90 @@ static size_t forge(uint8_t *d, int proto, int type, unsigned session,
                     const uint8_t *body, size_t bl)
 {
    uint32_t c;
+   size_t hdr = proto == 1 || type == 1 || type == 3 ? 8u : FE_SHARE_HDR;
    memcpy(d, FE_SHARE_MAGIC, 4);
    d[4] = (uint8_t)proto; d[5] = (uint8_t)type;
    d[6] = (uint8_t)session; d[7] = (uint8_t)(session >> 8);
-   if (bl)
-      memcpy(d + 8, body, bl);
-   c = fe_share_crc32(0, d, 8 + bl);
-   d[8 + bl] = (uint8_t)c; d[9 + bl] = (uint8_t)(c >> 8);
-   d[10 + bl] = (uint8_t)(c >> 16); d[11 + bl] = (uint8_t)(c >> 24);
-   return 12 + bl;
+   if (hdr == FE_SHARE_HDR) {
+      d[8] = (uint8_t)(session >> 16); d[9] = (uint8_t)(session >> 24);
+   }
+   if (bl) memcpy(d + hdr, body, bl);
+   c = fe_share_crc32(0, d, hdr + bl);
+   d[hdr + bl] = (uint8_t)c; d[hdr + bl + 1] = (uint8_t)(c >> 8);
+   d[hdr + bl + 2] = (uint8_t)(c >> 16); d[hdr + bl + 3] = (uint8_t)(c >> 24);
+   return hdr + 4 + bl;
+}
+
+static void t_session_replay(void)
+{
+   pkt hello, offer, confirm, welcome, new_offer;
+   uint8_t d[128], body[15] = {0};
+   uint32_t session, last_rx, opens;
+   int i;
+   rig_up("b", "b");
+   SRV.session_seed = 0xABCD004Du;
+   CL.nonce = 0xBEEF1234u;
+   fe_share_client_hello(&CL, NOW);
+   CHECK(q_n == 1); hello = Q[0]; q_n = 0;
+   fe_share_server_rx(&SRV, hello.d, hello.n, NOW);
+   CHECK(SRV.state == FE_SHARE_SRV_WAITING && q_n == 1);
+   offer = Q[0]; q_n = 0;
+   fe_share_client_rx(&CL, offer.d, offer.n, NOW);
+   CHECK(q_n == 1); confirm = Q[0]; q_n = 0;
+   /* An expired confirmation cannot admit anyone. */
+   NOW += 8000;
+   fe_share_server_rx(&SRV, confirm.d, confirm.n, NOW);
+   CHECK(SRV.state == FE_SHARE_SRV_WAITING && q_n == 0);
+   fe_share_server_rx(&SRV, hello.d, hello.n, NOW);
+   CHECK(q_n == 1); new_offer = Q[0]; q_n = 0;
+   fe_share_client_rx(&CL, new_offer.d, new_offer.n, NOW);
+   CHECK(q_n == 1);
+   fe_share_server_rx(&SRV, Q[0].d, Q[0].n, NOW);
+   welcome = Q[1]; q_n = 0;
+   session = SRV.session;
+   CHECK(session > 65535 && SRV.peer_nonce == 0xBEEF1234u);
+   /* Reordered obsolete OFFER must recover through periodic HELLO even
+    * when the first final WELCOME was lost. */
+   fe_share_client_rx(&CL, offer.d, offer.n, NOW);
+   CHECK(q_n == 1);
+   fe_share_server_rx(&SRV, Q[0].d, Q[0].n, NOW); q_n = 0;
+   CHECK(SRV.session == session);
+   for (i = 0; i < 200 && CL.state == FE_SHARE_CL_HELLO; i++) frame(8);
+   CHECK(CL.state == FE_SHARE_CL_READY && CL.session == session);
+   /* Duplicate final admission is harmless once linked. */
+   fe_share_client_rx(&CL, welcome.d, welcome.n, NOW);
+   CHECK(CL.state == FE_SHARE_CL_READY && CL.session == session);
+   /* A deliberate reconnect gets a new nonce/session. */
+   rig_join(); q_n = 0;
+   CHECK(CL.nonce == 0xBEEF1235u && SRV.session != session);
+   body[2] = FE_SHARE_OBJ_SAVE; body[4] = 9;
+   fe_share_server_rx(&SRV, d, forge(d, FE_SHARE_PROTO, 4, SRV.session, body, 6), NOW);
+   CHECK(SRV.have_obj && SRV.req == 9);
+   body[10] = 1;
+   fe_share_server_rx(&SRV, d, forge(d, FE_SHARE_PROTO, 6, SRV.session, body, 14), NOW);
+   opens = SF.opens; last_rx = SRV.last_rx_ms; q_n = 0;
+   NOW += 7;
+   fe_share_server_rx(&SRV, hello.d, hello.n, NOW);
+   fe_share_server_rx(&SRV, confirm.d, confirm.n, NOW);
+   fe_share_server_rx(&SRV, d, forge(d, FE_SHARE_PROTO, 4, session, body, 6), NOW);
+   fe_share_server_rx(&SRV, d, forge(d, FE_SHARE_PROTO, 6, session, body, 14), NOW);
+   fe_share_server_rx(&SRV, d, forge(d, FE_SHARE_PROTO, 10, session, body, 0), NOW);
+   /* Same low 16 bits, wrong high 16 bits: still an obsolete instance. */
+   fe_share_server_rx(&SRV, d, forge(d, FE_SHARE_PROTO, 10,
+                                   SRV.session ^ 0x10000u, body, 0), NOW);
+   CHECK(SRV.state == FE_SHARE_SRV_CONNECTED && SRV.session == CL.session);
+   CHECK(SRV.have_obj && SRV.req == 9 && SRV.win_mask == 1);
+   CHECK(SF.opens == opens && SRV.last_rx_ms == last_rx);
+   last_rx = CL.t_last_rx;
+   fe_share_client_rx(&CL, offer.d, offer.n, NOW);
+   fe_share_client_rx(&CL, welcome.d, welcome.n, NOW);
+   fe_share_client_rx(&CL, d, forge(d, FE_SHARE_PROTO, 9, session, body, 0), NOW);
+   fe_share_client_rx(&CL, d, forge(d, FE_SHARE_PROTO, 10, session, body, 0), NOW);
+   fe_share_client_rx(&CL, d, forge(d, FE_SHARE_PROTO, 5, session, body, 15), NOW);
+   fe_share_client_rx(&CL, d, forge(d, FE_SHARE_PROTO, 7, session, body, 12), NOW);
+   CHECK(CL.state == FE_SHARE_CL_READY && CL.t_last_rx == last_rx);
+   q_n = 0;
+   printf("  stale share handshakes/session replay: ok\n");
 }
 
 static void t_request_order(void)
@@ -1043,7 +1118,7 @@ static void t_versions(void)
    uint8_t d[128], body[64];
    fe_share_client_io cio2 = { &CL2, c_send };
    fe_share_ident id2 = ident("b", 3);
-   uint16_t sess;
+   uint32_t sess;
    int i;
    /* a DIFFERENT BUILD on the same protocol: joins, saves cross, states
     * are not offered */
@@ -1062,16 +1137,19 @@ static void t_versions(void)
       CHECK(!fe_share_states_ok(&a, &b, 3));
    }
 
-   /* a repeated HELLO (same nonce) keeps the session; a new nonce from the
-    * same PSP starts a new one */
+   /* A delayed HELLO stays provisional; only its current challenge can
+    * replace the active guest. Same-nonce HELLO preserves the transfer. */
    sess = SRV.session;
    memcpy(body, CL.me.mac, 6);
-   body[6] = 0x34; body[7] = 0x12;
-   memset(body + 8, 0, 36);
-   fe_share_server_rx(&SRV, d, forge(d, FE_SHARE_PROTO, 1, 0, body, 44), NOW);
+   body[6] = 0x34; body[7] = 0x12; body[8] = body[9] = 0;
+   memset(body + 10, 0, 36);
+   fe_share_server_rx(&SRV, d, forge(d, FE_SHARE_PROTO, 1, 0, body, 46), NOW);
    CHECK(SRV.session == sess);
    body[6] = 0x35;
-   fe_share_server_rx(&SRV, d, forge(d, FE_SHARE_PROTO, 1, 0, body, 44), NOW);
+   fe_share_server_rx(&SRV, d, forge(d, FE_SHARE_PROTO, 1, 0, body, 46), NOW);
+   CHECK(SRV.session == sess && SRV.offer_session != sess);
+   fe_share_server_rx(&SRV, d, forge(d, FE_SHARE_PROTO, 12, SRV.offer_session,
+                                   body, 46), NOW);
    CHECK(SRV.session != sess);
    q_n = 0;
 
@@ -1115,6 +1193,22 @@ static void t_versions(void)
                       NOW);
    CHECK(CL.state == FE_SHARE_CL_ERROR && CL.err == FE_SHARE_E_REFUSED);
    CHECK(CL.refused_proto == FE_SHARE_PROTO + 1);
+   /* v1 framing stays readable in both directions. Old hosts see the
+    * actual client MAC at offset 8, and old REFUSE remains parseable. */
+   rig_up("b", "b");
+   memcpy(body, CL.me.mac, 6); memset(body + 6, 0, 38);
+   fe_share_server_rx(&SRV, d, forge(d, 1, 1, 0, body, 44), NOW);
+   CHECK(SRV.state == FE_SHARE_SRV_WAITING && SRV.rx_refused == 1);
+   CHECK(q_n == 1 && Q[0].n == 8 + 2 + FE_SHARE_BUILD_CAP + 4);
+   CHECK(Q[0].d[8] == 1 && Q[0].d[9] == FE_SHARE_PROTO);
+   q_n = 0;
+   fe_share_client_hello(&CL, NOW);
+   CHECK(q_n == 1 && !memcmp(Q[0].d + 8, CL.me.mac, 6));
+   body[0] = 1; body[1] = 1; memset(body + 2, 0, FE_SHARE_BUILD_CAP);
+   fe_share_client_rx(&CL, d, forge(d, 1, 3, 0, body,
+                                  2 + FE_SHARE_BUILD_CAP), NOW);
+   CHECK(CL.state == FE_SHARE_CL_ERROR && CL.err == FE_SHARE_E_REFUSED);
+   CHECK(CL.refused_proto == 1);
    /* A WELCOME for somebody else's HELLO (wrong nonce) is not ours. */
    rig_up("b", "b");
    fe_share_client_hello(&CL, NOW);
@@ -1336,6 +1430,7 @@ int main(int argc, char **argv)
    t_corruption();
    t_truncation();
    t_request_order();
+   t_session_replay();
    t_hostile();
    t_versions();
    t_commit();

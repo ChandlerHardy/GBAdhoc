@@ -646,8 +646,8 @@ void cpu_exec(unsigned short clocks)
 
 		if (g_regs.TAC&0x04){//ƒ^ƒCƒ}Š„‚è‚±‚Ý
 			sys_clock+=tmp_clocks;
-			if (sys_clock>timer_clocks[g_regs.TAC&0x03]){
-				sys_clock&=timer_clocks[g_regs.TAC&0x03]-1;
+			while (sys_clock>=timer_clocks[g_regs.TAC&0x03]){
+				sys_clock-=timer_clocks[g_regs.TAC&0x03];
 				if (!(++g_regs.TIMA)){
 					cpu_irq(INT_TIMER);
 					g_regs.TIMA=g_regs.TMA;
@@ -655,8 +655,8 @@ void cpu_exec(unsigned short clocks)
 			}
 		}
 
-		if (div_clock&0x100){
-			g_regs.DIV-=div_clock>>8;
+		if (div_clock>=0x100){
+			g_regs.DIV+=div_clock>>8;
 			div_clock&=0xff;
 		}
 

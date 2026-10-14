@@ -124,3 +124,29 @@ hardware interoperability verification was performed by this checkpoint.
 
 This checkpoint supersedes the earlier remaining-review notes above concerning
 ROSTER structure and netdrv stale-instance admission.
+
+## Save-share v2 follow-up (supersedes the deferred limitation)
+
+Save sharing now uses a 32-bit session and client nonce. The host keeps one
+bounded provisional offer (identity, nonce, session and timestamp). A HELLO
+cannot close an open object, change the active session, reset request tracking
+or refresh active guest liveness. Only a nonexpired matching CONFIRM commits a
+replacement guest. Reconnects increment the client nonce; stale operations with
+prior session numbers are rejected before object/window/liveness mutation.
+Repeated HELLO repeats the active offer so an obsolete reordered OFFER and a
+lost WELCOME recover through the normal retry timer. Repeated CONFIRM resends
+WELCOME without resetting the open transfer.
+
+Normal v2 headers add two bytes (10 rather than 8). HELLO and REFUSE retain the
+8-byte discovery header: this lets v1 hosts find the real MAC and lets either
+generation parse a protocol refusal. Mixed generations must update to transfer.
+PSP session and nonce seeds preserve all 32 bits of the system clock. These are
+instance/replay checks, not cryptographic authentication.
+
+Validation: the focused expired/stale handshake and 32-bit session replay test,
+both v1/v2 refusal directions, the existing 0/10/30-percent packet-loss runs
+with duplicates/reordering, changed-file CRC recovery, abort/error/commit tests,
+and hostile traffic tests passed under ASan/UBSan. The last complete run reported
+892034 checks; netdrv admission and the complete netdrv suite also passed. See
+`GBAdhoc/audit/reliability/network.log`. PSP compilation is requested from the
+build owner; this follow-up does not claim physical-radio validation.

@@ -57,6 +57,13 @@ Earlier observations and the LCD-filter feasibility review remain in
   the existing vertical zero-palette compatibility rule. The packet/count
   expectations follow [Pan Docs packet transfers](https://gbdev.io/pandocs/SGB_Command_Packet.html)
   and [attribute commands](https://gbdev.io/pandocs/SGB_Command_Attribute.html).
+- **CPU timer arithmetic:** FF04 exposed a descending DIV register even
+  though it must increment every 256 CPU clocks. TIMA skipped an exact
+  period boundary and discarded additional ticks crossed by a long
+  instruction. DIV now increments; TIMA consumes every complete period.
+  The clock source and APU DIV-reset handling are unchanged. The independent
+  expectations follow [Pan Docs timer registers](https://gbdev.io/pandocs/Timer_and_Divider_Registers.html).
+  This is a focused correction, not full timer edge/reload emulation.
 
 ## State and build compatibility
 
@@ -79,6 +86,8 @@ From `gpsp/` under WSL/Linux:
 
 ```sh
 python3 gbcore/tests/run_accuracy.py --baseline
+python3 gbcore/tests/run_timer.py --baseline
+python3 gbcore/tests/run_timer.py
 ```
 
 The runner compiles the actual adapter/core with GCC, `-Wall -Wextra
@@ -104,6 +113,15 @@ are recorded in `../../../audit/core/accuracy-results.txt`.
   per frame, drawn/headless parity, cable scheduling and fresh-process
   reuse. Real-ROM isolation is explicitly skipped unless
   `GBADHOC_GB_ROMS` is configured.
+- Timer probes execute actual guest NOP and CALL instructions in SGB and
+  CGB normal/double speed with ASan/UBSan. Checkpoint `4cd524c` fails three
+  controls independently: DIV at 256 clocks reads 255 instead of 1; TIMA
+  at 1024 clocks reads 0 instead of 1; a 24-clock CALL crossing two timer
+  boundaries loses an increment and overflow interrupt. The corrected
+  source passes exact boundaries at all four rates, 300 repeated DIV
+  periods and wraparound, disabled TIMA, DIV/TIMA writes, repeated modulo
+  reloads and interrupt requests. CPU clocks are the oracle units, so CGB
+  double-speed tests supply half as many base-clock ticks.
 - The earlier original guest probes now return SGB white `ffff` and NR52
   `f1,f1,f0`, whose activity bits are `1,1,0`. This is host evidence;
   the earlier PSP mask-off screenshot did not provide a valid visual
@@ -133,10 +151,10 @@ runner or frontend save code was edited by this audit.
 - State validation does not yet cover every CPU/DMA/adapter scalar or prove
   robustness against arbitrary malicious state bytes. Targeted fuzzing is
   useful next work. Direct internal restore helpers are not public APIs.
-- CPU timer code deserves an independent hardware oracle: DIV currently
-  decrements its exposed register and TIMA uses a `>` threshold with one
-  update per instruction. These source observations were not folded into
-  the APU patch or represented as validated timer conformance.
+- Timer DIV/TAC-write falling-edge increments, four-clock delayed overflow
+  reload/write races, STOP/speed-switch details and DMA-only clock advances
+  still need a hardware-reference oracle and a coordinated timer rewrite.
+  The arithmetic probe is not broad timer conformance certification.
 - RTC behavioral suites passed; no new ordinary-use RTC defect was
   established. The documented SGB-border, tilt/rumble and Shantae limitations
   remain. Palette/control defaults and normal frontend turbo handling were

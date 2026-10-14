@@ -273,6 +273,7 @@ def main() -> int:
              "-Wl,--gc-sections",
              "-lm"])
         run([str(t / "gb_rtc_utc")], asan)
+    run([sys.executable, "gbcore/tests/run_timer.py"])
     print("gb: all GB/GBC host tests passed")
     return 0
 

@@ -21,10 +21,13 @@
  * bytes at most, on the ad-hoc transport's bulk lane beside nothing else:
  * a share room runs no link session):
  *
- *   magic "GSHR" | proto u8 | type u8 | session u16 | body | crc32
+ *   magic "GSHR" | proto u8 | type u8 | session u32 | body | crc32
+ * HELLO/REFUSE retain the v1 8-byte header with a zero u16 session so mixed
+ * generations can route and parse the refusal; other v2 headers are 10 bytes.
  *
  * The CRC covers everything before it.  `session` is 0 in HELLO and is the
- * server's per-guest number from WELCOME on; a datagram with the wrong one
+ * server's provisional challenge in OFFER/CONFIRM and per-guest number from
+ * WELCOME on; HELLO never replaces a guest until its CONFIRM matches. A datagram with the wrong one
  * is dropped.  A datagram whose proto byte is not FE_SHARE_PROTO is
  * answered with REFUSE (whose layout never changes), so two different
  * protocol generations tell their players to update instead of timing out.
@@ -48,9 +51,9 @@ extern "C" {
 #endif
 
 #define FE_SHARE_MAGIC        "GSHR"
-#define FE_SHARE_PROTO        1
+#define FE_SHARE_PROTO        2
 #define FE_SHARE_CHUNK        1024u
-#define FE_SHARE_HDR          8u
+#define FE_SHARE_HDR          10u
 #define FE_SHARE_DGRAM_MAX    (FE_SHARE_HDR + 16u + FE_SHARE_CHUNK + 4u)
 #define FE_SHARE_SLOTS        5
 #define FE_SHARE_CONSOLES     3            /* fe_console_t: GBA, GB, GBC */
@@ -246,7 +249,10 @@ typedef struct
    int      state;
    uint8_t  peer[6];
    fe_share_ident peer_ident;
-   uint16_t session, session_seed, peer_nonce;
+   uint32_t session, session_seed, peer_nonce;
+   /* One bounded provisional guest. HELLO cannot replace the active guest. */
+   fe_share_ident offer_ident;
+   uint32_t offer_nonce, offer_session, offer_ms;
    uint32_t last_rx_ms;
 
    /* the open object */
@@ -270,7 +276,7 @@ void fe_share_server_init(fe_share_server *s, const fe_share_server_io *io,
                           const fe_share_ident *me,
                           const fe_share_entry *entries, unsigned n,
                           const uint8_t *manifest, uint32_t manifest_size,
-                          uint16_t session_seed);
+                          uint32_t session_seed);
 void fe_share_server_rx(fe_share_server *s, const void *buf, size_t len,
                         uint32_t now_ms);
 /* Send up to `budget` DATA datagrams of the pending window and run the
@@ -310,7 +316,8 @@ typedef struct
    fe_share_client_io io;
    fe_share_ident me, host;
    int      state, err;
-   uint16_t session, nonce;
+   uint32_t session, nonce, offer_session;
+   int hello_started;
    uint32_t t_start, t_last_rx, t_last_tx, t_last_data;
    /* from WELCOME */
    unsigned n_entries, n_saves, n_states;
@@ -339,7 +346,7 @@ typedef struct
 #define FE_SHARE_RETRY_AFTER   250u
 
 void fe_share_client_init(fe_share_client *c, const fe_share_client_io *io,
-                          const fe_share_ident *me, uint16_t nonce);
+                          const fe_share_ident *me, uint32_t nonce);
 /* Start looking for the room's sharer (broadcast HELLO until WELCOME). */
 void fe_share_client_hello(fe_share_client *c, uint32_t now_ms);
 /* Start fetching `o` into `sink`.  Needs state READY or DONE/ERROR of a

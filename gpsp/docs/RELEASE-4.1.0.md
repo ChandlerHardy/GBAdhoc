@@ -6,9 +6,11 @@ GPL-2.0; the bundled mGBA open-source BIOS has its separate MPL-2.0 license.
 
 ## Release status
 
-Staged for a stable release. Publication and the final `v4.1.0` tag wait for the
-owner's testing of the separate `GBAdhoc410` installations on PSP-1000 and
-PSP-3000. No remote branch, tag or public release has been pushed by this staging.
+Released as **4.1.0 stable on 14 October 2026**, following owner gameplay
+acceptance of the beta: no significant or obvious regressions were observed.
+The executable and PRX modules are unchanged from the tested Beta 1 build.
+The release includes corresponding source, checksums and a separate ready-made
+cheat pack. [Download 4.1.0](https://github.com/ShoshinFauteux/GBAdhoc/releases/tag/v4.1.0).
 
 ## Changes since 4.0.0
 
@@ -51,22 +53,13 @@ Coverage and evidence are mapped in [audit/INDEX.md](audit/INDEX.md). The two
 rewind density experiments were slower on the tested hardware; defaults were
 retained. No LCD filter or rewind speed improvement is advertised in this release.
 
-## Owner acceptance before publication
+## Acceptance and remaining coverage
 
-Record pass/fail on both PSPs for:
+The owner approved stable publication after gameplay testing found no significant
+or obvious regressions. This does not extend the automated coverage to every game,
+physical sleep/wake or abrupt power loss. Routine incremental GBA saves remain
+block writes; a complete multi-block in-game save is not atomic under power loss.
 
-- Browser, copied settings/controls, favourites and representative GBA/GB/GBC games.
-- Battery saving, clean exit, reboot and state load/save using the copied data.
-- Rewind, fast-forward and Media Engine rendering in demanding games.
-- Physical sleep/wake and subsequent save/exit.
-- Full wireless gameplay, with each PSP hosting, and save/share menu flows.
-- Supported cheats and refusal of unsupported entries.
-
-Physical sleep/wake, abrupt power loss and complete two-console gameplay have
-not been certified by the automated checks. Routine incremental GBA saves are
-still block writes; this release does not make an entire multi-block in-game
-save atomic under sudden power loss.
-
-After acceptance, publish the staged install ZIP, corresponding source ZIP,
-checksums and these release notes from the recorded source commit. Do not rebuild
-or substitute binaries after acceptance without validating the replacement.
+The stable executable and PRX modules are identical to Beta 1. Packaging and release
+documentation were updated without changing runtime source. Existing Beta 1 users
+already have the stable runtime and do not need to reinstall it.

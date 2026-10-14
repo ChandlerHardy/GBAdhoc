@@ -1,5 +1,28 @@
 # Battery persistence review — 4.0.0
 
+## GBA cable save ownership handoff follow-up
+
+The prior `21d7c44` cable-start hold blocked future scans but did not drain an
+already queued or running battery write. A later drain read live session RAM
+and could publish unvalidated session bytes. A deterministic production-code
+test reproduced this in all four delta/full × synchronous/async-interface
+combinations, including whole-image replacement.
+
+Cable start now lands rewind, holds the writer and completes the pre-link
+scan/write while the emulation thread is parked and its pre-link RAM is still
+live. A checked barrier includes the complete writer cycle, pending blocks,
+full replacement and failed-delta recovery. Timeout or I/O failure rejects
+start before machine reload/session creation. The hold remains through nested
+late-memory reload; failure restores the previous ownership state.
+
+`test_gba_save_handoff.c` passed ASan/UBSan preservation, abort/validated-image
+continuation, busy timeout/retry and sync/async I/O failure/retry cases. The
+same production test passed on both PSP Memory Sticks (`END result=0`), using
+deterministic writer-interface callbacks: this tests native file I/O and the
+ownership protocol, not an actual OS-thread interleaving or power loss.
+Affected persistence suites and four RTC/rewind/GBA-dual clock suites passed.
+Evidence: `audit/reliability/gba-handoff` and `audit/hardware/results/gba-handoff`.
+
 Reviewed release `b5eeb238ae8ce1090cf78ae5f6253460897b4eb9`, then tested
 the workspace fixes. Scope: the production frontend's GBA battery writer,
 GB/GBC battery writer, GB cable-session commit, battery loading and their

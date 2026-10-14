@@ -93,6 +93,7 @@ static int gbl_hold;               /* harness: single machine held for a link */
 static int gba_cable;
 static int gba_rom_sampled = 1;  /* fe_host_gba_cable_rom_sampled */
 static volatile int gba_sram_hold;
+static volatile int gba_sram_quiescing;
 static uint8_t *gba_prelink_sram;
 #define GBA_CABLE gba_cable
 #else
@@ -2014,7 +2015,8 @@ static int sram_drain(uint32_t budget_us)
 
 /* The writer thread's entry point.  No budget: nothing here is on a frame
  * path, so it drains everything it finds in one pass. */
-int fe_host_sram_service_io(void)
+static volatile int sram_io_busy;
+static int sram_service_io_body(void)
 {
    uint64_t now = host.time_us ? host.time_us() : 0;
    unsigned before;
@@ -2082,6 +2084,15 @@ int fe_host_sram_service_io(void)
       sram_disk_gen = sram_scan_gen;
    { unsigned after = sram_pending();
      return (int)(before > after ? before - after : 0); }
+}
+
+int fe_host_sram_service_io(void)
+{
+   int rc;
+   sram_io_busy = 1;
+   rc = sram_service_io_body();
+   sram_io_busy = 0;
+   return rc;
 }
 
 /* The console is about to sleep (PSP power callback, its own thread): ask
@@ -2285,18 +2296,17 @@ void fe_host_sram_service(void)
  * path.  Budgeted draining is a smoothness optimisation and must never
  * become a durability regression — without this, shutdown could close the
  * file with blocks still pending. */
-void fe_host_sram_sync(void)
+static int sram_sync_checked(void)
 {
    if (battery_load_failed)
-      return;
+      return -1;
    if (gb_family)
    {
       /* Must run on the emulation thread: only it may read the GB core's RAM.
        * Not forced: exit reaches this two or three times (io_thread_stop,
        * then fe_host_shutdown's flush + sync) and an unchanged cartridge
        * needs no memory-stick write at all. */
-      (void)gb_save_flush(0);
-      return;
+      return gb_save_flush(0);
    }
    if (!host_io)
    {
@@ -2333,7 +2343,7 @@ void fe_host_sram_sync(void)
          sram_full_req = 1;
          (void)sram_drain(0);
       }
-      return;
+      return sram_pending() || sram_full_req || sram_retry_full ? -1 : 0;
    }
    /* Async: the writer thread owns the file, so we must not touch it — we
     * wake it and YIELD until it is done.  Yielding is load-bearing, not
@@ -2352,13 +2362,19 @@ void fe_host_sram_sync(void)
          /* A pending SCAN counts as outstanding work: a forced flush must
           * not return before the scan that decides what to write has even
           * run (ADR-0026). */
-         if (!sram_scan_req && !sram_pending() && !sram_full_req)
-            return;
+         if (!sram_io_busy && !sram_scan_req && !sram_pending() && !sram_full_req)
+            return sram_retry_full ? -1 : 0;
          host_io->yield();
       }
    }
    fe_evt("sram_sync_timeout blocks=%u full=%d scan=%d", sram_pending(),
           sram_full_req, sram_scan_req);
+   return -1;
+}
+
+void fe_host_sram_sync(void)
+{
+   (void)sram_sync_checked();
 }
 
 /* The dirty scan, callable from EITHER thread (ADR-0026).
@@ -2387,7 +2403,7 @@ static int sram_scan(int force_write)
    if (!p || !host.save_path)
       return 0;
 #ifdef GBA_LINK
-   if (gba_sram_hold)
+   if (gba_sram_hold && !gba_sram_quiescing)
       return 0;         /* a GBA link session owns the battery image */
 #endif
 
@@ -3055,11 +3071,34 @@ static int gba_session_mem_body(int up)
  * sync waits out any cycle already running, which reads the RAM while it is
  * still the save -- and released after the restore.  A session's own hold
  * (gba_cable_start / gba_cable_close) is kept as it was. */
+static int gba_sram_hold_begin(void)
+{
+   int was = gba_sram_hold, rc;
+   if (was)
+      return sram_sync_checked();
+   /* The emulation thread is parked at its frame boundary. Finish the last
+    * pre-link scan and write while its RAM is still live; only this phase
+    * permits a scan under the hold. No session machine may start on failure. */
+   gba_sram_hold = 1;
+   gba_sram_quiescing = 1;
+   if (host_io)
+      sram_scan_req = 1;
+   else
+      (void)sram_scan(0);
+   rc = sram_sync_checked();
+   gba_sram_quiescing = 0;
+   if (rc == 0)
+      rc = sram_sync_checked();
+   if (rc != 0)
+      gba_sram_hold = was;
+   return rc;
+}
+
 static int gba_session_mem(int up)
 {
    int was = gba_sram_hold, rc;
-   gba_sram_hold = 1;
-   fe_host_sram_sync();
+   if (gba_sram_hold_begin() != 0)
+      return -3;
    rc = gba_session_mem_body(up);
    gba_sram_hold = was;
    return rc;
@@ -3076,7 +3115,7 @@ int fe_host_gba_sessmem_cycle(int up)
    return gba_session_mem(up);
 }
 
-static int gba_cable_start(int is_host, unsigned input_delay, int64_t rtc_seed)
+static int gba_cable_start_body(int is_host, unsigned input_delay, int64_t rtc_seed)
 {
    fe_gblink_platform p;
    fe_gblink_local l;
@@ -3085,12 +3124,6 @@ static int gba_cable_start(int is_host, unsigned input_delay, int64_t rtc_seed)
    size_t sn;
    if (gbl)
       return -1;
-#ifdef REWIND
-   /* The session starts from the machine as it stands (it is serialized
-    * below, for both consoles): never from an old frame that a rewind in
-    * progress is re-running.  Land first (fe_host.h). */
-   (void)fe_host_rewind_land(0);
-#endif
    if (gba_cable_late && !fe_gbadual_loaded())
    {
       int mrc = gba_session_mem(1);
@@ -3191,6 +3224,25 @@ static int gba_cable_start(int is_host, unsigned input_delay, int64_t rtc_seed)
    }
    gbl_early_n = 0;
    return 0;
+}
+
+static int gba_cable_start(int is_host, unsigned input_delay, int64_t rtc_seed)
+{
+   int was = gba_sram_hold, rc;
+   if (gbl)
+      return -1;
+#ifdef REWIND
+   (void)fe_host_rewind_land(0);
+#endif
+   if (gba_sram_hold_begin() != 0)
+   {
+      fe_evt("gblink_start FAILED reason=save_sync");
+      return -1;
+   }
+   rc = gba_cable_start_body(is_host, input_delay, rtc_seed);
+   if (rc != 0)
+      gba_sram_hold = was;
+   return rc;
 }
 
 static int gba_cable_close(void);

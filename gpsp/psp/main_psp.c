@@ -1991,7 +1991,25 @@ static int psp_rewind_land(const char *why, unsigned budget_us);
 static int power_cb(int unknown, int pwrflags, void *common)
 {
    (void)unknown; (void)common;
-   if (pwrflags & PSP_POWER_CB_SUSPENDING)
+   /* Log the raw flag word, before any delay or teardown, while the writer
+    * can still get it to the stick.  A manual slide can arrive as
+    * POWER_SWITCH without SUSPENDING (the later SUSPENDING must not tear
+    * down the same renderer and volatile partition twice), and the PSP Go's
+    * slider offers "Resume Game", which may deliver yet another subset.
+    * The bits are the only way to tell. */
+   fe_evt("power flags=0x%08X switch=%d susp=%d resuming=%d complete=%d slept=%d",
+          (unsigned)pwrflags,
+          !!(pwrflags & PSP_POWER_CB_POWER_SWITCH),
+          !!(pwrflags & PSP_POWER_CB_SUSPENDING),
+          !!(pwrflags & PSP_POWER_CB_RESUMING),
+          !!(pwrflags & PSP_POWER_CB_RESUME_COMPLETE), g_pwr_slept);
+   if (pwrflags & (PSP_POWER_CB_POWER_SWITCH | PSP_POWER_CB_SUSPENDING))
+      standby_note("flags=0x%08X switch=%d susp=%d slept=%d",
+                   (unsigned)pwrflags,
+                   !!(pwrflags & PSP_POWER_CB_POWER_SWITCH),
+                   !!(pwrflags & PSP_POWER_CB_SUSPENDING), g_pwr_slept);
+   if ((pwrflags & (PSP_POWER_CB_POWER_SWITCH | PSP_POWER_CB_SUSPENDING)) &&
+       !(g_pcfg.standby && g_pwr_slept))
    {
       /* Menu = HOME: HOME is the system's across a sleep.  The module turns
        * the popup back on within one poll (16 ms), well inside the 60 ms
@@ -2109,16 +2127,6 @@ static int power_cb(int unknown, int pwrflags, void *common)
        * losing progress and usually not. */
       sceKernelDelayThread(80000);
    }
-   /* Log the raw flag word too.  The PSP Go's slider offers "Resume Game",
-    * which is a different user-facing path from the other models' standby,
-    * and it is not obvious from the outside whether it delivers the same
-    * SUSPENDING/RESUME_COMPLETE pair, a different subset, or an exit.  The
-    * bits are the only way to tell. */
-   fe_evt("power flags=0x%08X susp=%d resuming=%d complete=%d",
-          (unsigned)pwrflags,
-          !!(pwrflags & PSP_POWER_CB_SUSPENDING),
-          !!(pwrflags & PSP_POWER_CB_RESUMING),
-          !!(pwrflags & PSP_POWER_CB_RESUME_COMPLETE));
    if (pwrflags & PSP_POWER_CB_RESUMING)
       fe_evt("power resuming");
    if (pwrflags & PSP_POWER_CB_RESUME_COMPLETE)

@@ -515,7 +515,8 @@ def suites(env: Env, baseline: Path | None):
           "-ffunction-sections -fdata-sections "
           "-I%s -Ifrontend-common -Ipsp tools/test_video_geometry.c "
           "-Wl,--gc-sections -o /tmp/t_vgeo565 && /tmp/t_vgeo565 && "
-          "python3 tools/tests/test_psp_runtime.py")
+          "python3 tools/tests/test_psp_runtime.py && "
+          "python3 tools/tests/test_power_callback.py")
          % (sdk, sdk, sdk)),
 
         ("perf_loop", False, lambda: None,

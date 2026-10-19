@@ -2176,8 +2176,10 @@ static int power_cb(int unknown, int pwrflags, void *common)
             held = 1;      /* answered below, once this callback is done */
          else
          {
-            /* No park point (browser, a menu, the wake overlay): a census of
-             * what is live there, once, for comparison with the game's. */
+            /* Nothing parked (the browser and its menus, or a game loop
+             * that did not reach its top in time): a census of what is live
+             * there, once, for comparison with the game's.  The in-game
+             * menu and the pause screen both park at the loop's top. */
             sleep_inventory("nopark");
             /* Release the loop in any case; a suspend that never completes
              * must not leave it waiting forever. */
@@ -2328,9 +2330,9 @@ static void pwr_release_all(void)
  * is about.  `rewind_park_land = 0` is the MUTANT "the park point's budget is
  * spent": no landing, so the last resort has to act.
  * `sleep_sim_nopark = 1`: the loop does not answer the
- * park request and stands still until the resume, as a blocking loop that
- * has no park point does (the pause overlay): power_cb then tears nothing
- * down.  `sleep_sim_trash_pool = 1` overwrites the rewind's part of the
+ * park request and stands still until the resume, as a blocking loop with
+ * no park point would (the pause overlay was one until it learned to yield
+ * to the loop's top): power_cb then tears nothing down.  `sleep_sim_trash_pool = 1` overwrites the rewind's part of the
  * volatile pool while "asleep", which is what the OS is entitled to do; and
  * `rewind_pool_restart = 0` is the MUTANT that leaves the history as it was
  * after such a sleep (docs/REWIND.md 23: the test must then fail).
@@ -11355,11 +11357,11 @@ static int psp_rewind_tick(int ff)
  * the power callback may take the renderer's memory.  Quiesce, report
  * `parked`, stay held until the wake (loop_unpark undoes the quiesce).
  *
- * Called at the top of the game loop (which covers the in-game menu: its
- * pages are drawn by the loop) and, through ui_set_wake_park, by the wake
- * overlay's own modal loop -- the SELECT+TRIANGLE pause screen, which used
- * to have no park point at all: a switch there timed the park out with the
- * renderer live (power_cb's park_timeout branch, nothing torn down). */
+ * Called at the top of the game loop and nowhere else.  That covers the
+ * in-game menu (its pages are drawn by the loop) and, since the wake
+ * overlay yields to it (wake_overlay_yield), the SELECT+TRIANGLE pause
+ * screen too: every in-game sleep is entered from this one place, in the
+ * same state. */
 static int loop_park(void)
 {
    if (!g_pwr_park_req)
@@ -11409,18 +11411,50 @@ static void loop_unpark(const char *why)
       sleep_quiesce_up(why);
 }
 
-/* The wake overlay's park hook (ui_set_wake_park), once a frame: 1 when it
- * parked, so the overlay swallows what is held as the console wakes. */
-static int wake_overlay_park(void)
+/* The wake overlay's yield hook (ui_set_wake_yield), once a frame: the
+ * power callback wants the loop parked, so the overlay leaves and the loop
+ * goes round to its top to park there (wake_service: WAKE_YIELD).
+ *
+ * e0a6f66 parked from INSIDE the overlay instead (loop_park through this
+ * hook), and the first sleep taken on the pause screen of a PSP-3001
+ * (ARK-4 6.61, sleeptest e0a6f66) never came back: the full quiesce and
+ * teardown were logged, `q play_unlock by=park`, and nothing after; the
+ * retest of the same thing woke.  The logged state was identical to an
+ * in-game sleep's, so the cause is not proven; what differed is WHERE the
+ * loop slept -- nested in wake_service at the in-game present, mid-
+ * iteration, after the pad read and before the ME's staged frame was
+ * presented, without the loop top's own work (the GB cart-RAM flush the
+ * callback asks for, the rewind's power hold).  Now there is one park
+ * point and nothing else to differ. */
+static int wake_overlay_yield(void)
 {
-   int parked = loop_park();
-   loop_unpark("overlay");
-   return parked;
+   return g_pwr_park_req;
+}
+
+/* A WAKE'S ANSWER IS NOT INPUT.  The X that confirms Continue on the wake
+ * overlay is still down when the overlay returns, and the game loop's next
+ * pad read handed it to the core: Pokemon Crystal took it as B (PSP-3001,
+ * sleeptest e0a6f66; 4.1.0 did the same).  pad_swallow_arm() at Continue
+ * makes every button down at the next read invisible until that button is
+ * released -- to the core (GBA and GB/GBC alike: ctl_game_mask reads g_pad)
+ * and to the shortcuts; ui_swallow_pad() does the same for the menu's own
+ * edges. */
+static unsigned g_pad_swallow;
+static void pad_swallow_arm(void)
+{
+   g_pad_swallow = 0xFFFFFFFFu;  /* narrowed to what is held at the read */
+}
+static unsigned pad_swallow(unsigned pad)
+{
+   g_pad_swallow &= pad;         /* a released button is free again */
+   return pad & ~g_pad_swallow;
 }
 
 /* THE WAKE: one rebuild, after the overlay's answer, on this thread.
- * Returns 1 when the player chose `Quit to game list` (g_running is 0 and
- * the caller must `continue` to the loop's end), else 0.
+ * Returns WAKE_QUIT when the player chose `Quit to game list` (g_running is
+ * 0 and the caller must `continue` to the loop's end), WAKE_YIELD when the
+ * overlay left for a park (the caller `continue`s; the loop's top parks and
+ * the overlay opens again after), else 0.
  *
  * Called where the game loop presents, and FIRST THING in the in-game
  * menu's branch.  That branch ends its iteration with `continue`, so it
@@ -11432,6 +11466,8 @@ static int wake_overlay_park(void)
  * (PSP-3001, ARK-4, sleeptest 62a1d12: `q up why=resume` and no
  * `wake begin`).  Now the overlay comes up over the menu, and Continue
  * rebuilds and returns to the menu where it was. */
+#define WAKE_QUIT  1
+#define WAKE_YIELD 2
 static int wake_service(void)
 {
    if (g_pwr_rebuild)
@@ -11456,8 +11492,18 @@ static int wake_service(void)
       g_wake_menu = 0;
       home_host_disarm();   /* the overlay is not the game: HOME is the system's */
       ctl_turbo_stop(&g_turbo);   /* the console slept: auto-fire is over */
-      if (ui_wake_menu(g_wake_have ? g_wake_frame : NULL,
-                       (int)g_wake_w, (int)g_wake_h, g_pcfg.last_rom))
+      int answer = ui_wake_menu(g_wake_have ? g_wake_frame : NULL,
+                                (int)g_wake_w, (int)g_wake_h,
+                                g_pcfg.last_rom);
+      if (answer == UI_WAKE_YIELD)
+      {
+         /* The switch: the loop parks at its top, and the overlay (the same
+          * snapshot) is back after -- as the wake overlay if a sleep came. */
+         g_wake_menu = 1;
+         fe_evt("wake_menu yield park_req=%d", g_pwr_park_req);
+         return WAKE_YIELD;
+      }
+      if (answer)
       {
          /* The same quit the menu's "Quit to game list" makes: through
           * the teardown (SRAM flushed) to the browser.  It used to
@@ -11471,11 +11517,14 @@ static int wake_service(void)
          g_pwr_rebuild = 0;
          g_relaunch = RELAUNCH_GAMELIST;
          g_running = 0;
-         return 1;
+         return WAKE_QUIT;
       }
       fe_evt("wake_menu choice=continue frame=%d slept=%d running=%d",
              g_wake_have, g_pwr_slept, g_running);
       g_wake_have = 0;
+      /* The answer's X is still down: not the game's (pad_swallow). */
+      pad_swallow_arm();
+      g_pad = 0;                 /* nor this iteration's, read before it */
       if (!g_running)
       {
          /* HOME / exit while the overlay was up: leaving, as above. */
@@ -13814,7 +13863,7 @@ session_top:
    rig_cfg_audit_report();   /* every harness key has been read by now */
 
    pwr_release();            /* the boot's hold: the loop can park from here */
-   ui_set_wake_park(wake_overlay_park);   /* the pause screen parks too */
+   ui_set_wake_yield(wake_overlay_yield);   /* the pause screen parks too */
    while (g_running)
    {
       unsigned frames;
@@ -13851,7 +13900,8 @@ session_top:
       }
       if (SLEEP_SIM_NOPARK() && (g_pwr_park_req || SLEEP_SIM_ASLEEP()))
       {
-         /* harness: a blocking loop with no park point (the pause overlay) */
+         /* harness: a loop that never answers the park request (what the
+          * pause overlay was before e0a6f66) */
          while ((g_pwr_park_req || SLEEP_SIM_ASLEEP()) && g_running)
             sceKernelDelayThread(5000);
       }
@@ -13900,6 +13950,7 @@ session_top:
          g_pad |= ctl_stick_bits(g_pcfg.stick, pd.Lx, pd.Ly, &g_stick_state);
       else
          g_stick_state = 0;
+      g_pad = pad_swallow(g_pad);   /* a wake's answer, until released */
 #ifdef GPSP_PERF_RIG
       if (pd.Lx < g_stick_min[0]) g_stick_min[0] = pd.Lx;
       if (pd.Lx > g_stick_max[0]) g_stick_max[0] = pd.Lx;
@@ -14378,9 +14429,10 @@ session_top:
           * by the menu as a press of its own. */
          if (g_pwr_rebuild || g_wake_menu)
          {
-            if (wake_service())
+            int w = wake_service();
+            if (w == WAKE_QUIT)
                exit_reason = "game_list";
-            else
+            else if (!w)
                ui_swallow_pad();
             continue;
          }
@@ -14626,10 +14678,17 @@ session_top:
        * suppressed while a wake is pending (see g_wake_hold), otherwise the
        * loop iteration that was in flight when the machine suspended finishes
        * and puts the stale frame up first, which reads as a flicker. */
-      if (wake_service())
       {
-         exit_reason = "game_list";
-         continue;
+         int w = wake_service();
+         if (w)
+         {
+            /* WAKE_YIELD: the switch, slid on the pause screen.  Round to
+             * the top, which parks; nothing of this frame is presented or
+             * run first. */
+            if (w == WAKE_QUIT)
+               exit_reason = "game_list";
+            continue;
+         }
       }
       FE_LP_SET(FELP_L_PRES0);
       me_video_present();
@@ -15285,7 +15344,7 @@ session_top:
    /* The loop ended with a sleep's quiesce still in force (HOME or an exit
     * while held): put back what it stopped, so the teardown below finds the
     * state it was written for.  The gameplay power lock is play's only. */
-   ui_set_wake_park(NULL);   /* no game loop: nothing to park */
+   ui_set_wake_yield(NULL);   /* no game loop: nothing to park */
    sleep_quiesce_up("loop_exit");
    play_lock_drop("loop_exit");
    pwr_hold("teardown");

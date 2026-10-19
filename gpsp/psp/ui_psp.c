@@ -880,8 +880,8 @@ void ui_wake_inject(int choice) { (void)choice; }
 void ui_wake_inject_frame(int frame) { (void)frame; }
 #endif
 
-static int (*g_wake_park)(void);
-void ui_set_wake_park(int (*park)(void)) { g_wake_park = park; }
+static int (*g_wake_yield)(void);
+void ui_set_wake_yield(int (*yield)(void)) { g_wake_yield = yield; }
 void ui_swallow_pad(void) { g_prev_pad = 0xFFFFFFFFu; }
 
 int ui_wake_menu(const uint16_t *frame, int frame_w, int frame_h,
@@ -925,12 +925,15 @@ int ui_wake_menu(const uint16_t *frame, int frame_w, int frame_h,
       unsigned now, edges;
       int i;
 
-      /* The power switch, slid while this screen is up: park as the game
-       * loop does (the pause screen used to have no park point, so the
-       * suspend found the renderer live).  A sleep came and went: what is
-       * held now was held as the console woke. */
-      if (g_wake_park && g_wake_park())
-         first = 1;
+      /* The power switch, slid while this screen is up: leave it, so the
+       * game loop parks at its OWN top -- the one park point, in exactly
+       * the state an in-game sleep reaches -- and opens this screen again
+       * afterwards (UI_WAKE_YIELD).  Checked before the pad and before any
+       * drawing: no list is started after the request is seen.  (e0a6f66
+       * parked from here instead, nested inside the loop's present; the
+       * first SELECT+TRIANGLE sleep on a PSP-3001 never came back.) */
+      if (g_wake_yield && g_wake_yield())
+         return UI_WAKE_YIELD;
       sceCtrlPeekBufferPositive(&pad, 1);
       now   = pad.Buttons;
       edges = now & ~prev;

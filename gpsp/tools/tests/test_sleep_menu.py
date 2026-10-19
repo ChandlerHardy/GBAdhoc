@@ -10,10 +10,16 @@ standby trail ran the whole quiesce (`suspend parked=1`, `step rend_down`,
 g_wake_hold suppressed every swap onto the blanked screen, and the renderer
 was never rebuilt.
 
+Hardware, sleeptest e0a6f66: the first sleep taken on the SELECT+TRIANGLE
+pause screen never came back (the overlay parked from inside itself, nested
+in the loop's present); and the X that answers Continue after an in-game
+sleep reached the game (Pokemon Crystal read it as B; 4.1.0 too).
+
 Extracted, unchanged, from psp/main_psp.c: the game loop's in-game-menu
-branch (brace-matched out of main()), wake_service, loop_park, loop_unpark,
-wake_overlay_park and the g_wake_hold macro; from psp/ui_psp.c: the wake
-overlay (ui_wake_menu) with its park hook and ui_swallow_pad.  Stubbed: the
+branch and its in-game present's wake call (both brace-matched out of
+main()), wake_service, loop_park, loop_unpark, wake_overlay_yield, the pad
+swallow and the g_wake_hold macro; from psp/ui_psp.c: the wake overlay
+(ui_wake_menu) with its yield hook and ui_swallow_pad.  Stubbed: the
 callback's half (the hold simulates teardown + RESUME_COMPLETE), drawing, pad.
 
   1. Menu open, sleep, wake: the overlay comes up, Continue rebuilds once,
@@ -22,11 +28,17 @@ callback's half (the hold simulates teardown + RESUME_COMPLETE), drawing, pad.
   2. The same, answered `Quit to game list`: the loop leaves for the browser,
      nothing rebuilt.
   3. The SELECT+TRIANGLE pause screen (the overlay, modal, renderer live):
-     a switch slid there parks through the overlay's hook, the overlay stays
-     up, swallows what is held at the wake, and Continue rebuilds.
+     a switch slid there makes the overlay LEAVE without parking; the loop
+     goes round and parks at its own top; the overlay is back as the wake
+     overlay, swallows what is held at the wake, Continue rebuilds, and the
+     answer's X never reaches the core.
   4. Nothing pending: wake_service is a no-op.
-  5. Wiring in main(): the hook is registered before the game loop, the
-     in-game present still runs wake_service, the loop top still parks.
+  5. In-game sleep (GBA and GB/GBC share the pad path): Continue's X, still
+     held, is not seen by the core until released; a new press is.
+  6. The pause screen yields but no sleep follows: the pause screen is back.
+  7. Wiring in main(): the hook is registered before the game loop, the
+     in-game present still runs wake_service, the loop top still parks, the
+     pad read goes through the swallow.
 
 Then mutants of the production text, each of which must fail.
 """
@@ -66,23 +78,54 @@ def menu_block(main_src):
     return braced(main_src, i)
 
 
+PRESENT_HEAD = "      {\n         int w = wake_service();\n         if (w)\n"
+
+
+def present_block(main_src):
+    i = main_src.find(PRESENT_HEAD)
+    assert i >= 0, "the in-game present's wake call not found"
+    return braced(main_src, i)
+
+
+def static_fn(source, signature):
+    i = source.find(signature + "\n{")
+    assert i >= 0, signature + " not found"
+    return braced(source, i)
+
+
 def production(main_src, ui_src):
     parts = []
-    m = re.search(r"^#define g_wake_hold .*$", main_src, re.M)
-    assert m, "g_wake_hold not found"
+    for pattern in (r"^#define g_wake_hold .*$", r"^#define WAKE_QUIT .*$",
+                    r"^#define WAKE_YIELD .*$",
+                    r"^static unsigned g_pad_swallow;$"):
+        m = re.search(pattern, main_src, re.M)
+        assert m, pattern + " not found"
+        parts.append(m.group(0))
+    m = re.search(r"^static int \(\*g_wake_yield\)\(void\);$", ui_src, re.M)
+    assert m, "g_wake_yield not found"
     parts.append(m.group(0))
-    m = re.search(r"^static int \(\*g_wake_park\)\(void\);$", ui_src, re.M)
-    assert m, "g_wake_park not found"
-    parts.append(m.group(0))
-    for name in ("ui_set_wake_park", "ui_swallow_pad", "ui_wake_menu"):
+    for name in ("ui_set_wake_yield", "ui_swallow_pad", "ui_wake_menu"):
         parts.append(function(ui_src, name))
-    for name in ("loop_park", "loop_unpark", "wake_overlay_park",
-                 "wake_service"):
+    for name in ("loop_park", "loop_unpark", "wake_overlay_yield",
+                 "pad_swallow_arm"):
         parts.append(function(main_src, name))
+    parts.append(static_fn(main_src, "static unsigned pad_swallow(unsigned pad)"))
+    parts.append(function(main_src, "wake_service"))
     parts.append("static int menu_iteration(void)\n{\n   do\n   {\n" +
                  menu_block(main_src) +
                  "\n      return 1;   /* fell through: menu closed */\n"
                  "   } while (0);\n   return 0;   /* the branch's continue */\n}")
+    # One game-loop iteration out of the menu: top, pad read, the in-game
+    # present's wake call (extracted), then the core reads g_pad.
+    parts.append("static int game_iteration(void)\n{\n   do\n   {\n"
+                 "      loop_top();\n"
+                 "      game_frames++;\n"
+                 "      g_pad = pad_swallow(game_pad[game_frames & 63]);\n" +
+                 present_block(main_src) +
+                 "\n      core_seen[game_frames & 63] = g_pad;  /* retro_run */\n"
+                 "      core_frames++;\n"
+                 "      return 1;\n"
+                 "   } while (0);\n   return 0;   /* the present's continue */\n}")
     return "\n\n".join(parts)
 
 
@@ -99,6 +142,7 @@ STUB = r'''
 #define PSP_CTRL_DOWN   0x0040u
 #define PSP_CTRL_CROSS  0x4000u
 #define PSP_CTRL_CIRCLE 0x2000u
+#define UI_WAKE_YIELD 2
 #define VID_SCR_W 480
 #define VID_SCR_H 272
 #define FE_FONT_H 16
@@ -145,7 +189,13 @@ static int menu_active = 1, menu_frames, menu_presses;
 static int rend_up = 1, rebuilds, blanks;
 static int ov_frames, ov_swaps, ov_answer_frame, screen_swaps;
 static int ov_switch_at;           /* overlay frame whose hook sees a switch */
+static int switch_fired;
+static int hold_sleeps = 1;        /* 0: the park ends with no sleep */
 static unsigned ov_pad[64];        /* the pad, per overlay frame (1-based) */
+static unsigned game_pad[64];      /* the pad, per game iteration (1-based) */
+static unsigned core_seen[64];     /* g_pad as the core read it */
+static int game_frames, core_frames;
+static void loop_top(void);
 
 /* ---- the callback's half, simulated inside the hold ------------------- */
 static void sleep_quiesce_down(void) { SQ_TRACE("qdown"); g_sq.down = 1; }
@@ -154,7 +204,7 @@ static void sleep_park_hold(void)
    SQ_TRACE("hold");
    assert(g_pwr_parked && g_pwr_park_ack);
    /* power_cb: parked -> me_standby_down (renderer down, VRAM blanked) */
-   g_pwr_slept = 1; rend_up = 0; blanks++;
+   if (hold_sleeps) { g_pwr_slept = 1; rend_up = 0; blanks++; }
    /* RESUME_COMPLETE */
    g_pwr_park_req = 0; g_pwr_sleep_pending = 0;
    g_pwr_rebuild = g_pwr_slept;
@@ -199,7 +249,8 @@ static void sceCtrlPeekBufferPositive(SceCtrlData *pd, int n)
 {
    (void)n;
    ov_frames++;
-   pd->Buttons = ov_frames < 64 ? ov_pad[ov_frames] : 0;
+   assert(ov_frames < 64 || !"the overlay never answered");
+   pd->Buttons = ov_pad[ov_frames];
    if (pd->Buttons & PSP_CTRL_CROSS) ov_answer_frame = ov_frames;
 }
 
@@ -260,20 +311,28 @@ static void machine(void)
    exit_reason = NULL; g_pad = 0; g_prev_pad = 0;
    menu_frames = menu_presses = rebuilds = blanks = 0;
    ov_frames = ov_swaps = ov_answer_frame = screen_swaps = 0;
-   ov_switch_at = 0;
+   ov_switch_at = 0; switch_fired = 0; hold_sleeps = 1;
    memset(ov_pad, 0, sizeof(ov_pad));
-   ui_set_wake_park(wake_overlay_park);
+   memset(game_pad, 0, sizeof(game_pad));
+   memset(core_seen, 0xAA, sizeof(core_seen));
+   game_frames = core_frames = 0;
+   g_pad_swallow = 0;
+   ui_set_wake_yield(wake_overlay_yield);
 }
 
-/* The overlay's hook, with the switch slid between two of its frames. */
+/* The overlay's hook, with the switch slid (once) between two of its frames. */
 static int hook_with_switch(void)
 {
-   if (ov_frames + 1 == ov_switch_at)
+   int r, now = 0;
+   if (!switch_fired && ov_frames + 1 == ov_switch_at)
    {
+      switch_fired = now = 1;
       g_pwr_park_req = 1;
       g_pwr_sleep_pending = 1;
    }
-   return wake_overlay_park();
+   r = wake_overlay_yield();
+   assert(!now || strcmp(trace, "") == 0 || !"no park inside the overlay");
+   return r;
 }
 
 int main(void)
@@ -326,20 +385,30 @@ int main(void)
    /* 3. The pause screen: modal, renderer live, a switch slid there. */
    machine();
    menu_active = 0;
-   ui_set_wake_park(hook_with_switch);
+   ui_set_wake_yield(hook_with_switch);
    g_wake_menu = 1;                           /* SELECT+TRIANGLE */
-   ov_switch_at = 2;
+   ov_switch_at = 2;                          /* slid after its 1st frame */
+   in_overlay = 1;
+   assert(game_iteration() == 0);             /* the overlay left... */
+   in_overlay = 0;
+   assert(strcmp(trace, "") == 0);            /* ...without parking in it */
+   assert(ov_frames == 1 && ov_swaps == 1);   /* nothing drawn after the ask */
+   assert(core_frames == 0 && exit_reason == NULL && g_running);
+   assert(g_wake_menu == 1 && g_pwr_park_req == 1);   /* back after the park */
    ov_pad[2] = PSP_CTRL_CROSS;                /* held as the console wakes */
    ov_pad[3] = PSP_CTRL_CROSS;
    ov_pad[4] = 0;
    ov_pad[5] = PSP_CTRL_CROSS;                /* the real answer */
    in_overlay = 1;
-   assert(wake_service() == 0);
+   assert(game_iteration() == 1);             /* the loop's top parked */
    in_overlay = 0;
-   assert(strstr(trace, "qdown hold qup rebuild") != NULL);
+   assert(strcmp(trace, "qdown hold qup rebuild ") == 0);
    assert(blanks == 1 && rebuilds == 1 && rend_up && !g_sq.down);
    assert(ov_frames == 5);                    /* the wake's X was swallowed */
    assert(g_running && !g_pwr_slept && !g_pwr_rebuild && !g_wake_menu);
+   assert(core_seen[2] == 0);                 /* the answer is not the game's */
+   game_pad[3] = PSP_CTRL_CROSS;              /* ...nor while still held */
+   assert(game_iteration() == 1 && core_seen[3] == 0);
 
    /* 4. Nothing pending: nothing happens. */
    machine();
@@ -347,8 +416,45 @@ int main(void)
    loop_top();
    assert(trace[0] == '\0');
 
-   puts("sleep from the menu / pause screen: overlay, one rebuild, menu "
-        "swaps again, held X swallowed, quit, no-op pass");
+   /* 5. In-game sleep, Continue: X held after the answer is not B. */
+   machine();
+   menu_active = 0;
+   g_pwr_park_req = 1; g_pwr_sleep_pending = 1;   /* the switch, in play */
+   ov_pad[3] = PSP_CTRL_CROSS;                /* Continue */
+   game_pad[1] = PSP_CTRL_UP;                 /* read before the overlay */
+   in_overlay = 1;
+   assert(game_iteration() == 1);
+   in_overlay = 0;
+   assert(strcmp(trace, "qdown hold qup rebuild ") == 0);
+   assert(ov_answer_frame == 3 && rebuilds == 1);
+   assert(core_seen[1] == 0);
+   game_pad[2] = PSP_CTRL_CROSS;              /* the answer, still held */
+   game_pad[3] = PSP_CTRL_CROSS | PSP_CTRL_UP;   /* + a new press */
+   game_pad[4] = 0;                           /* released */
+   game_pad[5] = PSP_CTRL_CROSS;              /* a real press */
+   assert(game_iteration() == 1 && core_seen[2] == 0);
+   assert(game_iteration() == 1 && core_seen[3] == PSP_CTRL_UP);
+   assert(game_iteration() == 1 && core_seen[4] == 0);
+   assert(game_iteration() == 1 && core_seen[5] == PSP_CTRL_CROSS);
+
+   /* 6. The pause screen yields, the park ends with no sleep: it is back. */
+   machine();
+   menu_active = 0;
+   hold_sleeps = 0;
+   ui_set_wake_yield(hook_with_switch);
+   g_wake_menu = 1;
+   ov_switch_at = 2;
+   in_overlay = 1;
+   assert(game_iteration() == 0 && trace[0] == '\0');
+   ov_pad[3] = PSP_CTRL_CROSS;
+   assert(game_iteration() == 1);
+   in_overlay = 0;
+   assert(strcmp(trace, "qdown hold qup ") == 0 && rebuilds == 0);
+   assert(ov_answer_frame == 3 && !g_wake_menu && g_running);
+
+   puts("sleep from the menu / pause screen / play: overlay, one rebuild, "
+        "the pause screen parks at the loop top, menu swaps again, held X "
+        "swallowed by menu and core, quit, no-op pass");
    return 0;
 }
 '''
@@ -372,55 +478,88 @@ def run(functions, expect_pass):
 
 def wiring(main_src):
     """main(): hook registered before the game loop; the loop top parks;
-    the in-game present still runs the wake.  Returns a list of failures."""
+    the in-game present still runs the wake; the pad read goes through the
+    swallow before anything reads g_pad.  Returns a list of failures."""
     bad = []
     body = main_src[main_src.index("int main(int argc, char *argv[])"):]
-    reg = body.find("ui_set_wake_park(wake_overlay_park);")
+    reg = body.find("ui_set_wake_yield(wake_overlay_yield);")
     loop = body.find("   while (g_running)\n   {\n      unsigned frames;")
     if reg < 0 or loop < 0 or reg > loop:
         bad.append("hook not registered before the game loop")
     if not re.search(r"\(void\)loop_park\(\);\s*loop_unpark\(\"resume\"\);",
                      body):
         bad.append("loop top no longer parks")
+    if len(re.findall(r"\bloop_park\(\)", main_src)) != 1:   # the loop top
+        bad.append("loop_park called from somewhere other than the loop top")
     present = body.find("      FE_LP_SET(FELP_L_PRES0);\n      me_video_present();")
-    ingame = body.rfind("      if (wake_service())\n      {\n         "
-                        "exit_reason = \"game_list\";\n         continue;\n"
-                        "      }\n", 0, present)
+    ingame = body.rfind(PRESENT_HEAD, 0, present)
     if present < 0 or ingame < 0 or ingame < body.find(MENU_HEAD):
         bad.append("in-game present no longer runs wake_service")
+    read = body.find("      g_pad = pd.Buttons & ~CTL_STICK_ALL;")
+    swallow = body.find("      g_pad = pad_swallow(g_pad);", read)
+    first_use = body.find("      pad_new = g_pad & ~prev_pad;", read)
+    if read < 0 or swallow < 0 or first_use < 0 or swallow > first_use:
+        bad.append("the pad read does not go through the swallow")
     return bad
 
 
 good = production(MAIN, UI)
 print(run(good, True).stdout.strip())
 assert wiring(MAIN) == [], wiring(MAIN)
-print("wiring: hook registered, loop top parks, in-game wake intact")
+print("wiring: hook registered, loop top is the only park, in-game wake "
+      "intact, pad read swallowed")
 
-MENU_CALL = '''         if (g_pwr_rebuild || g_wake_menu)
+MENU_CALL = """         if (g_pwr_rebuild || g_wake_menu)
          {
-            if (wake_service())
+            int w = wake_service();
+            if (w == WAKE_QUIT)
                exit_reason = "game_list";
-            else
+            else if (!w)
                ui_swallow_pad();
             continue;
          }
-'''
+"""
+YIELD_FN = "static int wake_overlay_yield(void)\n{\n   return g_pwr_park_req;\n}"
 MUTANTS = (
     # (label, file, old, new, expected text in stderr)
     ("the menu branch skips the wake (the 62a1d12 hardware bug)",
      "main", MENU_CALL, "", "ov_answer_frame == 3"),
     ("the menu reads the overlay's X as its own press",
-     "main", "            else\n               ui_swallow_pad();\n", "",
+     "main", "            else if (!w)\n               ui_swallow_pad();\n", "",
      "menu_presses == 0"),
     ("Continue does not rebuild",
      "main", "         me_standby_up();\n         pwr_release();",
      "         pwr_release();", "rebuilds == 1"),
-    ("the overlay has no park point",
-     "ui", "      if (g_wake_park && g_wake_park())\n         first = 1;\n", "",
-     "qdown hold qup rebuild"),
+    ("the overlay parks from inside itself (e0a6f66)",
+     "main", YIELD_FN,
+     "static int wake_overlay_yield(void)\n{\n   (void)loop_park();\n"
+     "   loop_unpark(\"overlay\");\n   return 0;\n}",
+     "no park inside the overlay"),
+    ("the overlay never yields",
+     "ui", "      if (g_wake_yield && g_wake_yield())\n         return UI_WAKE_YIELD;\n",
+     "", "the overlay never answered"),
+    ("a yield is not reopened after the park",
+     "main", "         g_wake_menu = 1;\n         fe_evt(\"wake_menu yield",
+     "         fe_evt(\"wake_menu yield", "g_wake_menu == 1"),
+    ("the present reads a yield as a quit",
+     "main", "            if (w == WAKE_QUIT)\n               exit_reason = \"game_list\";\n            continue;",
+     "            exit_reason = \"game_list\";\n            continue;",
+     "exit_reason == NULL"),
+    ("the present runs the frame after a yield",
+     "main", "            if (w == WAKE_QUIT)\n               exit_reason = \"game_list\";\n            continue;",
+     "            if (w == WAKE_QUIT)\n            {\n               exit_reason = \"game_list\";\n               continue;\n            }",
+     "game_iteration() == 0"),
+    ("Continue's X reaches the core (the e0a6f66 hardware bug, and 4.1.0's)",
+     "main", "      pad_swallow_arm();\n", "", "core_seen[3] == 0"),
+    ("the iteration that answered still runs on its stale pad",
+     "main", "      g_pad = 0;                 /* nor this iteration's", "      (void)0;                 /* nor this iteration's",
+     "core_seen[1] == 0"),
+    ("a swallowed button never comes back",
+     "main", "   g_pad_swallow &= pad;         /* a released", "   /* g_pad_swallow &= pad; a released",
+     "core_seen[3] == PSP_CTRL_UP"),
     ("the overlay reads the wake's held X as the answer",
-     "ui", "      if (g_wake_park && g_wake_park())\n         first = 1;\n",
-     "      if (g_wake_park) (void)g_wake_park();\n", "ov_frames == 5"),
+     "ui", "      if (first)\n         { edges = 0; first = 0; }\n",
+     "      first = 0;\n", "ov_frames == 5"),
 )
 for label, which, old, new, expect in MUTANTS:
     src = MAIN if which == "main" else UI
@@ -434,11 +573,14 @@ for label, which, old, new, expect in MUTANTS:
 
 for label, old, new in (
         ("hook never registered",
-         "   ui_set_wake_park(wake_overlay_park);", "   /* none */"),
+         "   ui_set_wake_yield(wake_overlay_yield);", "   /* none */"),
         ("in-game present loses the wake",
-         "      if (wake_service())\n      {\n         exit_reason = "
-         "\"game_list\";\n         continue;\n      }\n      FE_LP_SET",
-         "      FE_LP_SET")):
+         PRESENT_HEAD, "      {\n         int w = 0;\n         if (w)\n"),
+        ("the pad read skips the swallow",
+         "      g_pad = pad_swallow(g_pad);", "      (void)0;"),
+        ("a second park point inside the overlay",
+         YIELD_FN, YIELD_FN.replace("   return g_pwr_park_req;",
+                                    "   return loop_park();"))):
     bad_src = MAIN.replace(old, new, 1)
     assert bad_src != MAIN, label
     assert wiring(bad_src), label

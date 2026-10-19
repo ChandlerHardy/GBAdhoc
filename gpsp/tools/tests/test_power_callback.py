@@ -19,40 +19,90 @@ stub = r'''
 #define PSP_POWER_CB_RESUMING 0x00020000u
 #define PSP_POWER_CB_RESUME_COMPLETE 0x00040000u
 #define PWR_PARK_WAIT_US 250000u
+#define PWR_QUIESCE_WAIT_US 1500000u
 #define FE_EVT_ONLY(x) ((void)(x))
 #define fe_evt(...) ((void)0)
 static struct { int standby; } g_pcfg = { 1 };
 static int g_pwr_slept, g_pwr_parked = 1, g_pwr_park_req;
+static int g_pwr_park_ack, g_pwr_cb_done, g_pwr_sleep_pending;
 static int g_pwr_suspend, g_pwr_resume, g_pwr_rebuild, g_pwr_gb_flush_req;
-static int down_calls, notes, scan_calls, wakes, disarms;
+static int down_calls, notes, scan_calls, wakes, disarms, delays;
+static int lock_drops;
 static unsigned clock_us;
 static void home_host_disarm(void) { disarms++; }
 static void fe_host_sram_request_scan(void) { scan_calls++; }
 static void standby_note(const char *fmt, ...) { (void)fmt; notes++; }
 static void io_wake(void) { wakes++; }
-static void sceKernelDelayThread(unsigned us) { clock_us += us; }
+static void play_lock_drop(const char *who) { (void)who; lock_drops++; }
+static void sceKernelDelayThread(unsigned us) { clock_us += us; delays++; }
 static unsigned sceKernelGetSystemTimeLow(void) { return ++clock_us; }
 static int me_host_loaded(void) { return 0; }
 static int me_host_idle(void) { return 1; }
 static int me_rend_active(void) { return 1; }
 static int me_rend_release_vmem(void) { return 1; }
-static void me_standby_down(void) { down_calls++; g_pwr_slept = 1; }
+static int stub_retain;   /* me_standby_down kept the partition: slept stays 0 */
+static void me_standby_down(void) { down_calls++; if (!stub_retain) g_pwr_slept = 1; }
 @CALLBACK@
 int main(void)
 {
+    unsigned t0;
+    int d0;
     power_cb(0, PSP_POWER_CB_POWER_SWITCH, NULL);
     assert(down_calls == 1 && g_pwr_slept == 1);
     assert(scan_calls == 1 && g_pwr_suspend == 1);
+    /* The parked loop is NOT released; it is told the callback is done,
+     * and it (not the callback) drops the power lock. */
+    assert(g_pwr_park_req == 1 && g_pwr_cb_done == 1);
+    assert(g_pwr_sleep_pending == 1 && lock_drops == 0);
+    /* The SUSPENDING that follows returns at once: no delay, no teardown. */
+    d0 = delays;
     power_cb(0, PSP_POWER_CB_SUSPENDING, NULL);
     assert(down_calls == 1 && scan_calls == 1); /* duplicate event */
+    assert(delays == d0);
     power_cb(0, PSP_POWER_CB_RESUMING, NULL);
     power_cb(0, PSP_POWER_CB_RESUME_COMPLETE, NULL);
     assert(g_pwr_rebuild == 1 && g_pwr_resume == 1);
+    assert(g_pwr_park_req == 0 && g_pwr_cb_done == 0);   /* hold released */
+    assert(g_pwr_sleep_pending == 0);
     g_pwr_slept = 0;
     power_cb(0, PSP_POWER_CB_SUSPENDING, NULL);
     assert(down_calls == 2); /* inactivity-driven suspend still works */
+    power_cb(0, PSP_POWER_CB_RESUME_COMPLETE, NULL);
     assert(notes >= 5 && wakes >= 3 && disarms == 2);
-    puts("power callback: switch-only, duplicate, resume and suspending-only pass");
+
+    /* A teardown that could not release the partition leaves slept = 0;
+     * the held sleep must still answer the SUSPENDING at once. */
+    stub_retain = 1;
+    g_pwr_slept = 0;
+    power_cb(0, PSP_POWER_CB_POWER_SWITCH, NULL);
+    assert(down_calls == 3 && g_pwr_slept == 0 && g_pwr_cb_done == 1);
+    d0 = delays;
+    power_cb(0, PSP_POWER_CB_SUSPENDING, NULL);
+    assert(down_calls == 3 && delays == d0);   /* held: no second pass */
+    power_cb(0, PSP_POWER_CB_RESUME_COMPLETE, NULL);
+    stub_retain = 0;
+
+    /* No park point (browser, a menu): the callback waits the old 250 ms,
+     * not the quiesce budget, releases nothing it does not own and drops
+     * the gameplay lock itself. */
+    g_pwr_parked = 0;
+    g_pwr_slept = 0;
+    t0 = clock_us;
+    power_cb(0, PSP_POWER_CB_POWER_SWITCH, NULL);
+    assert(clock_us - t0 < PWR_PARK_WAIT_US + 60000u + 80000u + 20000u);
+    assert(down_calls == 3 && lock_drops == 1);
+    assert(g_pwr_park_req == 0 && g_pwr_cb_done == 0);
+    power_cb(0, PSP_POWER_CB_RESUME_COMPLETE, NULL);
+
+    /* Acknowledged but the quiesce never finishes: bounded by the budget. */
+    g_pwr_park_ack = 1;
+    t0 = clock_us;
+    power_cb(0, PSP_POWER_CB_POWER_SWITCH, NULL);
+    assert(clock_us - t0 >= PWR_PARK_WAIT_US + PWR_QUIESCE_WAIT_US);
+    assert(clock_us - t0 < PWR_PARK_WAIT_US + PWR_QUIESCE_WAIT_US + 200000u);
+    assert(down_calls == 3 && g_pwr_park_req == 0 && lock_drops == 2);
+    puts("power callback: switch-only, duplicate, resume, suspending-only, "
+         "hold, no-park and quiesce-timeout pass");
     return 0;
 }
 '''
@@ -80,3 +130,19 @@ assert mutant != callback
 bad = run(mutant, False)
 assert "down_calls == 1" in bad.stderr, bad.stderr
 print("mutant (manual-switch branch removed): down_calls assertion failed")
+
+# The dedupe must cover a sleep whose teardown is done but held: without
+# g_pwr_cb_done in it, the SUSPENDING after the switch would wait again.
+mutant = callback.replace("(g_pwr_slept || g_pwr_cb_done)", "g_pwr_slept", 1)
+assert mutant != callback
+bad = run(mutant, False)
+assert "held: no second pass" in bad.stderr or "down_calls == 3 && delays" in bad.stderr, bad.stderr
+print("mutant (dedupe without cb_done): held-sleep assertion failed")
+
+# Stage 2 of the wait must depend on the acknowledgement: a loop with no
+# park point must not cost the callback the whole quiesce budget.
+mutant = callback.replace("if (g_pwr_park_ack)\n            while", "while", 1)
+assert mutant != callback
+bad = run(mutant, False)
+assert "PWR_PARK_WAIT_US + 60000u" in bad.stderr, bad.stderr
+print("mutant (quiesce wait without acknowledgement): no-park timing failed")

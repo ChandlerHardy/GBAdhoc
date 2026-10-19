@@ -83,6 +83,7 @@
 #include "mgift_cart.h"
 #include "me_host.h"
 #include "home_host.h"
+#include "sleep_q.h"
 #include "me/me_mbox.h"   /* me_render_desc, ME_UNCACHED — for the render bench */
 #include "config_psp.h"
 #include "video_prof.h"   /* ADR-0034 renderer path profile (core-side) */
@@ -582,19 +583,26 @@ static void io_thread_start(void)
  * other thread can touch the .sav or the SRAM buffer, which is what makes
  * fe_host_shutdown()'s flush/sync/close and retro_unload_game() safe.  It
  * must therefore run BEFORE fe_host_shutdown(), not after. */
-static void io_thread_stop(void)
+/* Returns 0 = the thread was joined, 1 = there was no thread, < 0 = the
+ * join timed out and the thread was terminated (the kernel's rc). */
+static int io_thread_stop(void)
 {
    int had_thread = (g_io_thid >= 0);
+   int rc = 1;
 
    if (had_thread)
    {
       SceUInt tmo = 5000000;   /* the last pass may be flushing 128 KiB */
       g_io_run = 0;
       sceKernelSignalSema(g_io_sema, 1);
-      if (sceKernelWaitThreadEnd(g_io_thid, &tmo) < 0)
+      rc = sceKernelWaitThreadEnd(g_io_thid, &tmo);
+      if (rc < 0)
          sceKernelTerminateDeleteThread(g_io_thid);
       else
+      {
          sceKernelDeleteThread(g_io_thid);
+         rc = 0;
+      }
       g_io_thid = -1;
    }
    if (g_io_sema >= 0)
@@ -612,6 +620,7 @@ static void io_thread_stop(void)
        * traded for smoothness — this is the line that guarantees it. */
       fe_host_sram_sync();
    }
+   return rc;
 }
 
 /* Every exit path funnels through here so the log is always closed with the
@@ -958,20 +967,28 @@ static void audio_ring_reset(void)
    in_rate = 32768;
 }
 
-static void audio_stop(void)
+/* Returns 0 = joined (the worker released its channel on the way out),
+ * 1 = there was no worker, < 0 = the join timed out and it was terminated. */
+static int audio_stop(void)
 {
+   int rc = 1;
    audio_running = 0;
    if (audio_thid >= 0)
    {
       /* Bounded: one chunk is ~23 ms, so a worker that has not returned from
        * sceAudioOutputBlocking in a second never will -- do not hang exit. */
       SceUInt tmo = 1000000;
-      if (sceKernelWaitThreadEnd(audio_thid, &tmo) < 0)
+      rc = sceKernelWaitThreadEnd(audio_thid, &tmo);
+      if (rc < 0)
          sceKernelTerminateDeleteThread(audio_thid);
       else
+      {
          sceKernelDeleteThread(audio_thid);
+         rc = 0;
+      }
       audio_thid = -1;
    }
+   return rc;
 }
 
 /* Report audio-device failures from the main thread, never the high-priority
@@ -1977,6 +1994,30 @@ static volatile int g_pwr_rebuild;   /* main loop: rebuild it now */
  * power_cb for why the teardown must not run while a frame is in flight. */
 static volatile int g_pwr_park_req;
 static volatile int g_pwr_parked;
+/* THE SLEEP QUIESCE (psp/sleep_q.h).  The park point does real work before
+ * it reports `parked`: it stops the audio thread, the writer, the long-lived
+ * files, the HOME module and the radio.  So the handshake has two answers:
+ *   g_pwr_park_ack  the loop has SEEN the request (it is at its park point and
+ *                   quiescing) -- awaited for PWR_PARK_WAIT_US, as before, so
+ *                   a loop that has no park point (browser, menus) still costs
+ *                   the callback 250 ms and no more;
+ *   g_pwr_parked    the quiesce is finished -- awaited for a further
+ *                   PWR_QUIESCE_WAIT_US once acknowledged.
+ * Everything blocking runs on the EMULATION thread, never here: it owns the
+ * ROM handle and the core, and joining the audio and writer threads from it
+ * cannot deadlock against this callback thread (0x11), which outranks them.
+ * The callback only waits, bounded, which is what makes its return prompt.
+ *
+ * g_pwr_cb_done      the callback finished its part (the ME teardown); a
+ *                    loop held in the park may now let the suspend proceed.
+ * g_pwr_sleep_pending a switch/suspend was seen and RESUME_COMPLETE has not
+ *                    come yet: the gameplay power lock stays down, and the
+ *                    quiesce stays in force, until it does. */
+static volatile int g_pwr_park_ack;
+static volatile int g_pwr_cb_done;
+static volatile int g_pwr_sleep_pending;
+#define PWR_QUIESCE_WAIT_US 1500000u
+static void play_lock_drop(const char *who);
 #ifdef REWIND
 /* When the callback asked (it waits PWR_PARK_WAIT_US for the answer): what
  * the park point may spend landing a rewind first (psp_rewind_land). */
@@ -2008,9 +2049,16 @@ static int power_cb(int unknown, int pwrflags, void *common)
                    (unsigned)pwrflags,
                    !!(pwrflags & PSP_POWER_CB_POWER_SWITCH),
                    !!(pwrflags & PSP_POWER_CB_SUSPENDING), g_pwr_slept);
+   if (pwrflags & (PSP_POWER_CB_POWER_SWITCH | PSP_POWER_CB_SUSPENDING))
+      g_pwr_sleep_pending = 1;
+   /* Once the work is done for this sleep (the switch normally arrives first
+    * and the SUSPENDING ~0.1 s later), a repeat returns at once: the firmware
+    * is about to take the machine and nothing here would add anything. */
    if ((pwrflags & (PSP_POWER_CB_POWER_SWITCH | PSP_POWER_CB_SUSPENDING)) &&
-       !(g_pcfg.standby && g_pwr_slept))
+       !(g_pcfg.standby && (g_pwr_slept || g_pwr_cb_done)))
    {
+      unsigned cb_t0 = (unsigned)sceKernelGetSystemTimeLow();
+      int held = 0;
       /* Menu = HOME: HOME is the system's across a sleep.  The module turns
        * the popup back on within one poll (16 ms), well inside the 60 ms
        * delay below; the wake overlay keeps it there until Continue. */
@@ -2063,9 +2111,17 @@ static int power_cb(int unknown, int pwrflags, void *common)
          g_pwr_park_t0 = t0;
 #endif
          g_pwr_park_req = 1;
-         while (!g_pwr_parked &&
+         /* Stage 1: has the loop seen it?  Stage 2, only if it has: wait
+          * out its quiesce (see g_pwr_park_ack).  A loop with no park point
+          * costs exactly what it always did. */
+         while (!g_pwr_park_ack && !g_pwr_parked &&
                 (unsigned)sceKernelGetSystemTimeLow() - t0 < PWR_PARK_WAIT_US)
             sceKernelDelayThread(2000);
+         if (g_pwr_park_ack)
+            while (!g_pwr_parked &&
+                   (unsigned)sceKernelGetSystemTimeLow() - t0 <
+                      PWR_PARK_WAIT_US + PWR_QUIESCE_WAIT_US)
+               sceKernelDelayThread(2000);
          park_us = (unsigned)sceKernelGetSystemTimeLow() - t0;
          if (g_pwr_parked)
          {
@@ -2117,22 +2173,42 @@ static int power_cb(int unknown, int pwrflags, void *common)
             fe_evt("power teardown_skipped reason=park_timeout park_us=%u",
                    park_us);
          }
-         /* Release the parked loop in either case; a suspend that never
-          * completes must not leave it waiting forever. */
-         g_pwr_park_req = 0;
+         if (g_pwr_parked)
+            held = 1;      /* answered below, once this callback is done */
+         else
+            /* Release the loop in any case; a suspend that never completes
+             * must not leave it waiting forever. */
+            g_pwr_park_req = 0;
       }
+      /* Nobody parked will drop the gameplay power lock (a menu, standby
+       * = 0): drop it here, or the suspend would wait for it forever. */
+      if (!g_pwr_parked)
+         play_lock_drop("cb");
       /* Give the writer a real chance to land the .sav and this line before
        * the kernel takes the machine away.  Not a guarantee -- the window is
        * the kernel's to grant -- but it is the difference between usually
        * losing progress and usually not. */
       sceKernelDelayThread(80000);
+      standby_note("cb out us=%u parked=%d hold=%d",
+                   (unsigned)sceKernelGetSystemTimeLow() - cb_t0,
+                   g_pwr_parked, held);
+      /* Our part is done -- and only now, after the last line this callback
+       * writes, so the loop's own notes never share the file with ours.  As
+       * in TYL, the game stays paused until the wake: the loop stays in its
+       * park, asleep, until RESUME_COMPLETE clears park_req; seeing
+       * g_pwr_cb_done it drops the gameplay power lock and the suspend
+       * proceeds. */
+      if (held)
+         g_pwr_cb_done = 1;
    }
    if (pwrflags & PSP_POWER_CB_RESUMING)
       fe_evt("power resuming");
    if (pwrflags & PSP_POWER_CB_RESUME_COMPLETE)
    {
       g_pwr_resume++;
-      g_pwr_park_req = 0;
+      g_pwr_park_req = 0;      /* releases a loop held in its park */
+      g_pwr_cb_done = 0;
+      g_pwr_sleep_pending = 0;
       standby_note("resume_complete flags=0x%08X slept=%d",
                    (unsigned)pwrflags, g_pwr_slept);
       fe_evt("power resume_complete slept=%d", g_pwr_slept);
@@ -2206,6 +2282,7 @@ static void pwr_release_all(void)
       g_pwr_hold = 1;
       pwr_release();
    }
+   play_lock_drop("exit");   /* the gameplay lock too */
 }
 
 /* No process exit may leave the switch held: handoff_run (the USB handoff),
@@ -3070,6 +3147,252 @@ static void me_standby_up(void)
    /* A failed rebuild is not fatal: g_me_rend stays 0 and the loop falls back
     * to CPU rendering exactly as it does when the ME never boots.  Slow, but
     * the game keeps running and the save is intact. */
+}
+
+/* ---- THE SLEEP QUIESCE (psp/sleep_q.h) ----------------------------------
+ *
+ * A PSP-3001 (ARK-4 6.61) powered OFF when the switch was slid in game: the
+ * teardown completed, then the LED blinked, went solid and the next start was
+ * a cold boot.  From the ROM list the same console sleeps and wakes, with the
+ * ME never started (me_boot = 0) it fails identically, and Snes9xTYLme sleeps
+ * on the same console and card.
+ *
+ * Until this, the in-game sleep was entered with everything in the game
+ * still running: the teardown released the parked loop again, so the core
+ * kept emulating (and reading ROM pages) into the suspend, the audio thread
+ * kept a channel reserved and sat in sceAudioOutputBlocking with real sound,
+ * the .sav writer thread and its held-open handle were live, and so was the
+ * paged ROM's handle.  TYL (psp/psp.cpp:2545-2575, 3986-3993, 1841-1882) holds
+ * scePowerLock through play; its callback only flags the pause; the MAIN loop
+ * then stops and JOINS the sound thread (before_pause -> StopSoundThread),
+ * kills the ME, and only then calls scePowerUnlock -- so the deferred suspend
+ * runs while the main thread sleeps in sceKernelDelayThread and no other
+ * thread of the game is inside a driver.  It keeps no file open across play.
+ * The steps below reproduce that. */
+#include <streams/file_stream.h>
+extern RFILE *gamepak_file_large;                 /* gba_memory.c */
+static void net_teardown_io(void);                /* defined below */
+static sleep_q g_sq;
+/* The gameplay scePowerLock (TYL's scheme).  Taken at the
+ * top of the loop while a game is being played; dropped by whoever lets a
+ * suspend proceed: the parked loop once the callback is done, the callback
+ * itself when nothing is parked, and every exit (pwr_release_all).  Separate
+ * from g_pwr_hold's nesting count: the kernel counts locks, so the two
+ * cannot unbalance each other. */
+static volatile int g_pwr_play_lock;
+
+static void play_lock_take(void)
+{
+   if (g_pwr_play_lock || g_pwr_sleep_pending || g_pwr_park_req ||
+       g_wake_hold)
+      return;
+   {
+      int rc = scePowerLock(0);
+      if (rc >= 0)
+         g_pwr_play_lock = 1;
+      else
+      {
+         static int told;
+         if (!told)
+         {
+            told = 1;
+            standby_note("q play_lock rc=%d", rc);
+         }
+      }
+   }
+}
+
+static void play_lock_drop(const char *who)
+{
+   int rc;
+   if (!g_pwr_play_lock)
+      return;
+   g_pwr_play_lock = 0;
+   rc = scePowerUnlock(0);
+   standby_note("q play_unlock by=%s rc=%d", who, rc);
+   FE_EVT_ONLY(rc);
+   FE_EVT_ONLY(who);
+}
+
+static int sq_audio_stop(void *c)
+{
+   int rc;
+   (void)c;
+   if (audio_thid < 0)
+      return SQ_NONE;
+   if (!audio_running)
+   {
+      (void)audio_stop();       /* a worker that already died: just reap it */
+      return SQ_NONE;
+   }
+   rc = audio_stop();
+   ring_r = ring_w;             /* nothing from before the sleep is replayed */
+   return rc;
+}
+
+static int sq_audio_start(void *c)
+{
+   (void)c;
+   ring_r = ring_w;
+   audio_start();
+   if (audio_thid >= 0 && audio_running)
+      return SQ_DONE;
+   return audio_output_error < 0 ? audio_output_error : -1;
+}
+
+static int sq_writer_stop(void *c)
+{
+   (void)c;
+   return io_thread_stop();     /* lands the .sav on this thread on the way */
+}
+
+static int sq_writer_start(void *c)
+{
+   (void)c;
+   io_thread_start();
+   return g_io_thid >= 0 ? SQ_DONE : -1;
+}
+
+/* After sq_writer_stop: the .sav and the event log are the writer's while
+ * it runs, and it is gone now. */
+static int sq_files_close(void *c, char *d, size_t n)
+{
+   int sav, rom = 0, evt, closed = 0;
+   (void)c;
+   sav = fe_host_sram_sleep_close();
+   closed += sav;
+   /* The paged ROM's handle is this thread's own (load_gamepak_page runs
+    * here), and the loader reopens it by path on the next page miss -- the
+    * PSP-1000 wake fix in gba_memory.c.  A whole-cart console never reads it
+    * again at all. */
+   if (gamepak_file_large)
+   {
+      filestream_close(gamepak_file_large);
+      gamepak_file_large = NULL;
+      rom = 1;
+      closed++;
+   }
+   evt = fe_evt_is_open();
+   if (evt)
+      fe_evt_close();
+   closed += evt;
+   snprintf(d, n, "sav=%d rom=%d evt=%d", sav, rom, evt);
+   return closed;
+}
+
+static int sq_files_reopen(void *c, char *d, size_t n)
+{
+   int evt = 1;
+   (void)c;
+#if !defined(GPSP_PLAYABLE) || defined(GPSP_KEEP_TELEMETRY)
+   evt = fe_evt_reopen_append(LOG_PATH);
+#endif
+   snprintf(d, n, "evt=%d sav=lazy rom=lazy", evt);
+   return evt;
+}
+
+static int sq_home_stop(void *c)
+{
+   (void)c;
+   if (!home_host_loaded())
+      return SQ_NONE;
+   home_host_stop();
+   return home_host_loaded() ? -1 : SQ_DONE;
+}
+
+static int sq_home_rearm(void *c)
+{
+   (void)c;
+   /* The loop's next frame loads it again, as at a game's first frame
+    * (home_host_start under `menu_home && !home_host_tried()`). */
+   home_host_forget();
+   return SQ_DONE;
+}
+
+static int sq_net_term(void *c)
+{
+   (void)c;
+   if (!g_net_up)
+      return SQ_NONE;
+   net_teardown_io();           /* BYE, adhoc term, modules unloaded */
+   return g_net_up ? -1 : SQ_DONE;
+}
+
+static void sq_note(void *c, const char *line)
+{
+   (void)c;
+   standby_note("%s", line);
+   fe_evt("sleep %s", line);
+}
+
+static const sleep_q_ops g_sq_ops = {
+   NULL,
+   sq_audio_stop, sq_audio_start,
+   sq_writer_stop, sq_writer_start,
+   sq_files_close, sq_files_reopen,
+   sq_home_stop, sq_home_rearm,
+   sq_net_term,
+   sq_note
+};
+
+/* Emulation thread, at the park point, before it reports `parked`. */
+static void sleep_quiesce_down(void)
+{
+   unsigned t0;
+   if (g_sq.down || !g_pcfg.standby)
+      return;
+   t0 = (unsigned)sceKernelGetSystemTimeLow();
+   (void)sleep_q_down(&g_sq, &g_sq_ops);
+   standby_note("q down us=%u stopped=0x%X",
+                (unsigned)sceKernelGetSystemTimeLow() - t0, g_sq.stopped);
+}
+
+/* Emulation thread, once the wake has come (RESUME_COMPLETE), or at a hold's
+ * timeout, or when the loop ends with the quiesce still in force. */
+static void sleep_quiesce_up(const char *why)
+{
+   if (!g_sq.down)
+      return;
+   standby_note("q up why=%s stopped=0x%X", why, g_sq.stopped);
+   (void)sleep_q_up(&g_sq, &g_sq_ops);
+}
+
+/* The loop's park, held the way TYL's main loop sits in
+ * sceKernelDelayThread while the console sleeps: no frame, no ROM read, no
+ * GE list, nothing of ours inside a driver.  When the callback has done its
+ * part, the gameplay power lock is dropped HERE -- the suspend then proceeds
+ * with this thread already asleep.  RESUME_COMPLETE clears park_req and ends
+ * the hold.  Bounded by a count of 5 ms naps rather than the clock: the naps
+ * stop while the CPU is suspended, so only a suspend that never came can run
+ * the count out. */
+#define SLEEP_HOLD_NAPS 1000u            /* 5 s awake without a suspend */
+static void sleep_park_hold(void)
+{
+   unsigned naps = 0;
+   while ((g_pwr_park_req || SLEEP_SIM_ASLEEP()) && g_running)
+   {
+      if (g_pwr_cb_done)
+         play_lock_drop("park");
+      sceKernelDelayThread(5000);
+      if (g_pwr_cb_done && ++naps >= SLEEP_HOLD_NAPS && !SLEEP_SIM_ASLEEP())
+      {
+         /* The switch was seen and nothing followed it.  Do not hold the
+          * game forever: resume, and if the engine was torn down let the
+          * wake overlay rebuild it as after a real sleep. */
+         standby_note("q hold_timeout naps=%u slept=%d", naps, g_pwr_slept);
+         g_pwr_sleep_pending = 0;
+         g_pwr_cb_done = 0;
+         if (g_pwr_slept)
+            g_pwr_rebuild = 1;
+         g_pwr_park_req = 0;
+         break;
+      }
+   }
+   /* Left with a sleep still pending (the game is exiting, or the callback
+    * released a loop it did not park in time): it is this thread that must
+    * now let the suspend through. */
+   if (g_pwr_sleep_pending)
+      play_lock_drop("park_exit");
 }
 
 /* Heap fallback only: give the work area back to malloc.  0 = freed (or there
@@ -10879,6 +11202,62 @@ static int psp_rewind_tick(int ff)
 }
 #endif /* REWIND */
 
+/* THE PARK POINT (the suspend handshake's main-thread half), between two
+ * frames: nothing is being emulated, captured or posted, so this is where
+ * the power callback may take the renderer's memory.  Quiesce, report
+ * `parked`, stay held until the wake (loop_unpark undoes the quiesce).
+ *
+ * Called at the top of the game loop and nowhere else (the in-game menu's
+ * pages are drawn by the loop, so it parks here too). */
+static int loop_park(void)
+{
+   if (!g_pwr_park_req)
+      return 0;
+   {
+#ifdef REWIND
+      /* A rewind in progress LANDS before the history is taken away (the
+       * callback suspends the rewind once this loop is parked, and play
+       * would go on from wherever the machine stood: possibly the middle
+       * of an old save sequence, replayed over a newer save).  It gets
+       * what is left of the callback's wait, less a margin for the
+       * engine to go idle; what cannot land in that is decided by
+       * fe_host_rewind_suspend (vetted frame, or the game is reset). */
+      if (g_rw_on && fe_host_rewind_busy())
+      {
+         unsigned used = (unsigned)sceKernelGetSystemTimeLow() - g_pwr_park_t0;
+         unsigned room = used + 60000u < PWR_PARK_WAIT_US
+                       ? PWR_PARK_WAIT_US - 60000u - used : 0u;
+#ifdef GPSP_PERF_RIG
+         if (g_ss_no_land)
+            room = 0;
+#endif
+         if (room >= 10000u)
+            (void)psp_rewind_land("sleep", room);
+         else
+            fe_evt("rewind_land_psp why=sleep ok=0 budget_us=0 (no room)");
+      }
+#endif
+      /* Seen: the callback now waits for the quiesce, not the 250 ms. */
+      g_pwr_park_ack = 1;
+      sleep_quiesce_down();
+      g_pwr_parked = 1;
+      sleep_park_hold();
+      g_pwr_parked = 0;
+      g_pwr_park_ack = 0;
+   }
+   return 1;
+}
+
+/* The wake has come (or a hold ran out): undo the quiesce -- reopen what
+ * reopens, restart the writer, then sound -- before anything else, the wake
+ * overlay included.  A loop the callback let go before the wake runs on
+ * without its sound until then, as TYL's does. */
+static void loop_unpark(const char *why)
+{
+   if (g_sq.down && !g_pwr_sleep_pending)
+      sleep_quiesce_up(why);
+}
+
 int main(int argc, char *argv[])
 {
    char rom_path[PSP_FILE_PATH_CAP];
@@ -13238,36 +13617,10 @@ session_top:
             sceKernelDelayThread(5000);
       }
       else
-      if (g_pwr_park_req)
-      {
-#ifdef REWIND
-         /* A rewind in progress LANDS before the history is taken away (the
-          * callback suspends the rewind once this loop is parked, and play
-          * would go on from wherever the machine stood: possibly the middle
-          * of an old save sequence, replayed over a newer save).  It gets
-          * what is left of the callback's wait, less a margin for the
-          * engine to go idle; what cannot land in that is decided by
-          * fe_host_rewind_suspend (vetted frame, or the game is reset). */
-         if (g_rw_on && fe_host_rewind_busy())
-         {
-            unsigned used = (unsigned)sceKernelGetSystemTimeLow() - g_pwr_park_t0;
-            unsigned room = used + 60000u < PWR_PARK_WAIT_US
-                          ? PWR_PARK_WAIT_US - 60000u - used : 0u;
-#ifdef GPSP_PERF_RIG
-            if (g_ss_no_land)
-               room = 0;
-#endif
-            if (room >= 10000u)
-               (void)psp_rewind_land("sleep", room);
-            else
-               fe_evt("rewind_land_psp why=sleep ok=0 budget_us=0 (no room)");
-         }
-#endif
-         g_pwr_parked = 1;
-         while ((g_pwr_park_req || SLEEP_SIM_ASLEEP()) && g_running)
-            sceKernelDelayThread(5000);
-         g_pwr_parked = 0;
-      }
+         (void)loop_park();
+      loop_unpark("resume");
+      /* TYL holds scePowerLock through play. */
+      play_lock_take();
 #ifdef REWIND
       if (g_rw_pool_suspect)
       {
@@ -14732,6 +15085,11 @@ session_top:
     * flush, the ME and HOME modules, the radio, the core's unload, the
     * in-process return's census): the switch waits (pwr_hold, see power_cb).
     * Released before the browser (goto session_top) or by the exit itself. */
+   /* The loop ended with a sleep's quiesce still in force (HOME or an exit
+    * while held): put back what it stopped, so the teardown below finds the
+    * state it was written for.  The gameplay power lock is play's only. */
+   sleep_quiesce_up("loop_exit");
+   play_lock_drop("loop_exit");
    pwr_hold("teardown");
    /* "Quit to game list": the menu goes, the frame it sat on stays with a
     * "Returning to game list..." chip, and the teardown below runs under it

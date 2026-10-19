@@ -3270,8 +3270,17 @@ static int sq_audio_start(void *c)
 
 static int sq_writer_stop(void *c)
 {
+   int rc;
    (void)c;
-   return io_thread_stop();     /* lands the .sav on this thread on the way */
+   rc = io_thread_stop();       /* its last pass lands what it had */
+   /* The callback asked for its scan 60-80 ms before this park, and the
+    * game may have written SRAM since.  The writer gone, scan and drain once
+    * more here, so the .sav on the stick is SRAM as it stands at the
+    * suspend: also with no writer thread (sram_thread = 0: io_thread_stop
+    * syncs nothing) or one terminated before its last pass. */
+   (void)fe_host_sram_flush(0);
+   fe_host_sram_sync();
+   return rc;
 }
 
 static int sq_writer_start(void *c)

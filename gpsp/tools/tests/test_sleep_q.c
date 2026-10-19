@@ -110,16 +110,18 @@ static void test_only_restart_what_stopped(void)
    sleep_q q;
    memset(&q, 0, sizeof(q));
    reset();
-   rc_audio_stop = SQ_NONE;     /* no audio worker */
-   rc_writer_stop = -5;         /* join timed out: terminated */
+   rc_audio_stop = -3;          /* join timed out: terminated */
+   rc_writer_stop = -5;         /* the same */
    rc_home_stop = SQ_NONE;      /* module never loaded */
    rc_net_term = SQ_NONE;       /* no session */
-   CHECK(sleep_q_down(&q, &ops) == 1);   /* files only */
+   CHECK(sleep_q_down(&q, &ops) == 3);   /* audio, writer, files */
    CHECK(sav_open == 0);        /* a terminated writer is gone too */
    CHECK(strstr(notes, "q writer_stop rc=-5") != NULL);
    trace[0] = '\0';
    sleep_q_up(&q, &ops);
-   CHECK(strcmp(trace, "F+ ") == 0);
+   /* A terminated thread is gone all the same: it is started again, or the
+    * game stays silent and its saves synchronous for the session. */
+   CHECK(strcmp(trace, "F+ W+ A+ ") == 0);
 }
 
 int main(void)

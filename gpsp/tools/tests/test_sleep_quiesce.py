@@ -115,6 +115,8 @@ static int io_thread_stop(void)
    g_io_thid = -1; return 0;
 }
 static void io_thread_start(void) { SQ_TRACE("io_start"); g_io_thid = 9; }
+static int fe_host_sram_flush(int force) { (void)force; SQ_TRACE("sav_scan"); return 0; }
+static void fe_host_sram_sync(void) { SQ_TRACE("sav_sync"); }
 static int fe_host_sram_sleep_close(void) { int w = sav_open; SQ_TRACE("sav_close"); sav_open = 0; return w; }
 static void filestream_close(RFILE *f) { (void)f; SQ_TRACE("rom_close"); }
 static int fe_evt_is_open(void) { return evt_open; }
@@ -154,8 +156,11 @@ int main(void)
    assert(locks == 1 && g_pwr_play_lock == 1);
    g_pwr_sleep_pending = 1; g_pwr_park_req = 1;   /* the switch */
    sleep_quiesce_down();                      /* the park point */
-   assert(strstr(trace, "lock audio_stop io_stop sav_close rom_close "
-                        "home_stop net_term ") != NULL);
+   /* The writer gone, a last scan and drain on this thread: SRAM written
+    * since the callback's scan request reaches the stick before the
+    * suspend, with or without a writer thread. */
+   assert(strstr(trace, "lock audio_stop io_stop sav_scan sav_sync sav_close "
+                        "rom_close home_stop net_term ") != NULL);
    assert(gamepak_file_large == NULL && sav_open == 0);
    assert(strstr(notes, "q audio_stop rc=0") && strstr(notes, "q fd_close n=2"));
    assert(strstr(notes, "q home_stop rc=0") && strstr(notes, "q net_term rc=0"));
@@ -297,6 +302,12 @@ MUTANTS = (
     ("the held loop never drops the gameplay lock",
      '         play_lock_drop("park");\n', "",
      "unlocked_while_held"),
+    ("the park lands no SRAM written since the callback's scan",
+     "   (void)fe_host_sram_flush(0);\n", "",
+     "sav_scan sav_sync"),
+    ("the park scans but leaves the blocks undrained",
+     "   fe_host_sram_sync();\n   return rc;", "   return rc;",
+     "sav_scan sav_sync"),
     ("the paged ROM handle is left open",
      "gamepak_file_large = NULL;\n      rom = 1;", "rom = 1;",
      "gamepak_file_large == NULL"),

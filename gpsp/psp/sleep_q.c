@@ -29,21 +29,23 @@ int sleep_q_down(sleep_q *q, const sleep_q_ops *ops)
    q->stopped = 0;
 
    /* 1. Sound.  TYL before_pause: StopSoundThread (join + delete).  The
-    *    channel is released by the thread on its way out. */
+    *    channel is released by the thread on its way out.  Terminated
+    *    (rc < 0, the join timed out) the thread is gone all the same, and
+    *    is started again on the way up. */
    rc = ops->audio_stop(ops->ctx);
    sq_notef_rc(ops, "audio_stop", rc);
-   if (rc == SQ_DONE)
+   if (rc == SQ_DONE || rc < 0)
    {
       q->stopped |= SQ_STEP_AUDIO;
       n++;
    }
 
-   /* 2. The writer.  Its last pass lands the .sav (the callback asked for a
-    *    scan before parking us), then the sink goes synchronous.  Terminated
-    *    (rc < 0) still means the thread is gone. */
+   /* 2. The writer.  It is stopped, then the .sav is landed on this thread
+    *    (a last scan and drain), and the sink stays synchronous.  Terminated
+    *    (rc < 0) still means the thread is gone: restarted, as joined. */
    rc = ops->writer_stop(ops->ctx);
    sq_notef_rc(ops, "writer_stop", rc);
-   if (rc == SQ_DONE)
+   if (rc == SQ_DONE || rc < 0)
    {
       q->stopped |= SQ_STEP_WRITER;
       n++;

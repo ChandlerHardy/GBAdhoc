@@ -7,6 +7,7 @@
 
 #include "fe_console.h"
 #include "ctl_map.h"
+#include "sleep_q.h"
 
 /* REWIND LENGTH (Settings > "Rewind length"): Short = 1 MB, Medium = 2 MB,
  * Long = 4 MB of history.  Medium is the default, as 2 MB always was (the
@@ -372,6 +373,13 @@ typedef struct
     * console that cannot do that falls back to single-core rendering -- slow,
     * but it will never hard-reset when someone closes the lid. */
    int  standby;
+   /* The in-game "quiesce for sleep" pieces (psp/sleep_q.h), each a
+    * CONFIG.INI key of its own, 0/1, default 1: sleep_stop_audio,
+    * sleep_stop_writer, sleep_close_files, sleep_stop_home, sleep_net_term,
+    * sleep_hold_loop, sleep_power_lock, sleep_inventory.  Read, never
+    * written back: they exist to bisect a hardware failure by editing the
+    * file, not as settings a player sees. */
+   sleep_cfg sleep;
    /* "Quit to game list" returns to the browser IN THIS PROCESS when the
     * unload is proven exact (docs/INPROC-RETURN.md).  1 = yes (default);
     * 0 = the kill switch: always relaunch the EBOOT, the 3.1 behaviour. */

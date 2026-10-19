@@ -280,6 +280,24 @@ void pcfg_load_doc(const char *ini_path, fe_ini_doc *doc)
    g_pcfg.nd_rto_min_us =
       (int)fe_ini_get_int(cfg_path, "nd_rto_min_us", 50000);
    g_pcfg.standby = (int)fe_ini_get_int(cfg_path, "standby", 1);
+   /* psp/sleep_q.h: one key per quiesce piece, all ON unless set to 0
+    * (any other value reads as on). */
+   g_pcfg.sleep.stop_audio =
+      fe_ini_get_int(cfg_path, "sleep_stop_audio", 1) != 0;
+   g_pcfg.sleep.stop_writer =
+      fe_ini_get_int(cfg_path, "sleep_stop_writer", 1) != 0;
+   g_pcfg.sleep.close_files =
+      fe_ini_get_int(cfg_path, "sleep_close_files", 1) != 0;
+   g_pcfg.sleep.stop_home =
+      fe_ini_get_int(cfg_path, "sleep_stop_home", 1) != 0;
+   g_pcfg.sleep.net_term =
+      fe_ini_get_int(cfg_path, "sleep_net_term", 1) != 0;
+   g_pcfg.sleep.hold_loop =
+      fe_ini_get_int(cfg_path, "sleep_hold_loop", 1) != 0;
+   g_pcfg.sleep.power_lock =
+      fe_ini_get_int(cfg_path, "sleep_power_lock", 1) != 0;
+   g_pcfg.sleep.inventory =
+      fe_ini_get_int(cfg_path, "sleep_inventory", 1) != 0;
    g_pcfg.quick_return =
       (int)fe_ini_get_int(cfg_path, "quick_return", 1) ? 1 : 0;
    g_pcfg.me_boot = (int)fe_ini_get_int(cfg_path, "me_boot", 1) ? 1 : 0;
@@ -380,6 +398,14 @@ static int pcfg_validate(const char *when)
    PCFG_CHK(net_session_fps_force, 0, 1, 0);
    PCFG_CHK(nd_rto_min_us,        0, 2000000, 50000);
    PCFG_CHK(standby,              0, 3, 1);   /* ON: see me_standby_down */
+   PCFG_CHK(sleep.stop_audio,     0, 1, 1);   /* psp/sleep_q.h */
+   PCFG_CHK(sleep.stop_writer,    0, 1, 1);
+   PCFG_CHK(sleep.close_files,    0, 1, 1);
+   PCFG_CHK(sleep.stop_home,      0, 1, 1);
+   PCFG_CHK(sleep.net_term,       0, 1, 1);
+   PCFG_CHK(sleep.hold_loop,      0, 1, 1);
+   PCFG_CHK(sleep.power_lock,     0, 1, 1);
+   PCFG_CHK(sleep.inventory,      0, 1, 1);
    PCFG_CHK(quick_return,         0, 1, 1);
    PCFG_CHK(me_boot,              0, 1, 1);
    PCFG_CHK(osd_wireless,         0, 1, 1);

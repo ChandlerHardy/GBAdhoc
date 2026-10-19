@@ -166,9 +166,25 @@ profile_flags() {   # sets CORE_FLAGS, FE_DEFS, TITLE, KIND
       FE_DEFS="-DGPSP_PLAYABLE -DVID_TRIPLE -DGPSP_PROFILE_DIAGNOSTIC=1"
       TITLE="GBAdhoc DIAG"
       ;;
+    sleeptest)
+      # The RELEASE, byte for byte in what it emulates and links (release core
+      # flags, release frontend defines, ME_CATCH=1 so gbadhoc_me.prx is the
+      # release's), plus ONE instrument: GPSP_STANDBY_NOTES, the close-per-line
+      # log/standby.log trail of the sleep path and its quiesce (psp/sleep_q.h).
+      # For a PSP-3001 that powers off instead of sleeping in game
+      # (.codex-handoff/REPORT_SLEEP3.md).  Not `diagnostic`: that profile adds
+      # three core instruments, and the 2026-10-19 diagnostic EBOOT (built
+      # without GBA_LINK/REWIND, unlike 4.1.0) dropped to the XMB when the
+      # in-game Save States page opened, which the release does not.  Build it
+      # as the release is built: GBA_LINK=1 REWIND=1 tools/build.sh sleeptest.
+      CORE_FLAGS="$CORE_COMMON GPSP_PROFILE=release"
+      FE_DEFS="-DGPSP_PLAYABLE -DVID_TRIPLE -DGPSP_PROFILE_RELEASE=1 -DGPSP_STANDBY_NOTES"
+      TITLE="GBAdhoc SLEEPTEST"
+      PSP_MAKE_FLAGS="ME_CATCH=1"
+      ;;
     *)
       echo "unknown profile '$1'"
-      echo "usage: tools/build.sh [release|harness|harness64|diagnostic|soak] [--no-clean] [--out DIR] [--expect TOK]"
+      echo "usage: tools/build.sh [release|harness|harness64|diagnostic|soak|sleeptest] [--no-clean] [--out DIR] [--expect TOK]"
       exit 2 ;;
   esac
   KIND="$1"
@@ -381,6 +397,11 @@ case "$KIND" in
     ;;
   harness|harness64)
     REQUIRE=(".gpsp-harness.ini")
+    ;;
+  sleeptest)
+    # A release plus the standby trail, and nothing else that writes.
+    FORBIDDEN=("badjump.txt" "smchisto.txt" "irqchk.txt" "home_stall_frame")
+    REQUIRE=(".playable-no-harness" "standby.log")
     ;;
   diagnostic)
     # The instruments are the point; assert they are really in.

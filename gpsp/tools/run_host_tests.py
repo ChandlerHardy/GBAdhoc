@@ -516,7 +516,10 @@ def suites(env: Env, baseline: Path | None):
           "-I%s -Ifrontend-common -Ipsp tools/test_video_geometry.c "
           "-Wl,--gc-sections -o /tmp/t_vgeo565 && /tmp/t_vgeo565 && "
           "python3 tools/tests/test_psp_runtime.py && "
-          "python3 tools/tests/test_power_callback.py")
+          "python3 tools/tests/test_power_callback.py && "
+          # The in-game sleep quiesce (psp/sleep_q.h): the production park
+          # side of the handshake, extracted from main_psp.c, plus mutants.
+          "python3 tools/tests/test_sleep_quiesce.py")
          % (sdk, sdk, sdk)),
 
         ("perf_loop", False, lambda: None,
@@ -600,6 +603,14 @@ def suites(env: Env, baseline: Path | None):
           "-fsanitize=address,undefined -Ifrontend-common -Ipsp "
           "-o /tmp/t_state_delete tools/tests/test_state_delete.c && "
           "ASAN_OPTIONS=detect_leaks=0 /tmp/t_state_delete && "
+          # The sleep quiesce's order/toggles (psp/sleep_q.c) and its
+          # CONFIG.INI keys, read by the production pcfg_load and never
+          # written back.  Here for the suite cap; it shares config_psp.c.
+          "gcc -std=gnu99 -O1 -g -Wall -Wextra -Werror "
+          "-fsanitize=address,undefined -Ifrontend-common -Ipsp "
+          "-o /tmp/t_sleep_q tools/tests/test_sleep_q.c psp/sleep_q.c "
+          "psp/ctl_map.c psp/config_psp.c frontend-common/fe_util.c && "
+          "ASAN_OPTIONS=detect_leaks=0 /tmp/t_sleep_q && "
           # Share game data (docs/SAVE-SHARE.md): the protocol with both ends
           # in one process over a lossy fake radio, hostile requests, mixed
           # versions and the temp/verify/swap commit.  Here for the same

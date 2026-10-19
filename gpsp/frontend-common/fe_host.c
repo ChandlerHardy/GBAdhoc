@@ -1783,6 +1783,18 @@ static void sram_close(void)
    }
 }
 
+int fe_host_sram_sleep_close(void)
+{
+   int was_open = sram_fp != NULL;
+   sram_close();
+   return was_open;
+}
+
+int fe_host_sram_is_open(void)
+{
+   return sram_fp != NULL;
+}
+
 #ifdef GPSP_PERF_RIG
 int fe_host_sram_test_kill_handle(void)
 {

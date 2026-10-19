@@ -2025,8 +2025,9 @@ static volatile int g_pwr_parked;
  *                   up to PWR_QUIESCE_WAIT_US: the quiesce's own worst
  *                   case, so the callback never gives up on a loop that is
  *                   only slow.  A loop still quiescing past even that keeps
- *                   the gameplay lock and drops it itself once parked
- *                   (sleep_park_hold), so the suspend never lands mid-I/O.
+ *                   the gameplay lock, parked, until the SUSPENDING that
+ *                   follows has torn down (sleep_park_hold), so the suspend
+ *                   never lands mid-I/O or with the renderer up.
  * Everything blocking runs on the EMULATION thread, never here: it owns the
  * ROM handle and the core, and joining the audio and writer threads from it
  * cannot deadlock against this callback thread (0x11), which outranks them.
@@ -2222,9 +2223,10 @@ static int power_cb(int unknown, int pwrflags, void *common)
       }
       /* Nobody parked will drop the gameplay power lock (a menu, standby
        * = 0): drop it here, or the suspend would wait for it forever.  A
-       * loop that acknowledged and is still quiescing drops it itself once
-       * parked (sleep_park_hold): dropped here, the suspend would land with
-       * it inside a join, a .sav write or the radio's teardown. */
+       * loop that acknowledged and is still quiescing drops it itself, once
+       * parked and torn down (sleep_park_hold): dropped here, the suspend
+       * would land with it inside a join, a .sav write or the radio's
+       * teardown. */
       if (!g_pwr_parked && !g_pwr_park_ack)
          play_lock_drop("cb");
       /* Give the writer a real chance to land the .sav and this line before
@@ -3437,7 +3439,13 @@ static void sleep_park_hold(void)
       /* The callback is done with us: it held us (cb_done), or gave up and
        * left the lock to us (park_req cleared). */
       int cb_over = g_pwr_cb_done || !g_pwr_park_req;
-      if (cb_over)
+      /* Dropped only once a teardown has run for this sleep.  A callback
+       * that gave up tore nothing down: the lock is kept until the
+       * SUSPENDING that follows (delivered with it held) finds us parked
+       * and does, or the hold runs out and play resumes.  Dropped at once,
+       * the suspend would land with the renderer in the volatile
+       * partition. */
+      if (g_pwr_cb_done)
       {
          play_lock_drop("park");
 #ifdef REWIND

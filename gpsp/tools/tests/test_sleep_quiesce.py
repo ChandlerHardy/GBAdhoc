@@ -11,8 +11,10 @@ with the real psp/sleep_q.c against stubs that record every call.  Checked:
      the loop is held, i.e. BEFORE the resume; after it, everything comes
      back in reverse with sound last.
   2. A hold that no suspend follows ends on its own and asks for the wake
-     overlay; a loop released before the wake lets the suspend through on
-     its way out.
+     overlay; a loop the callback gave up on keeps the lock until a
+     teardown has run (the SUSPENDING that follows), or ends on its own; a
+     loop released before the wake lets the suspend through on its way
+     out.
   3. The lock is never re-taken while a sleep is pending, is held over the
      wake overlay (which yields to the park), and is taken once, not per
      frame.
@@ -75,7 +77,7 @@ static int audio_thid = -1, audio_running, audio_output_error;
 static unsigned ring_r, ring_w;
 static int g_io_thid = -1, sav_open, evt_open, home_mod, g_net_up;
 static RFILE *gamepak_file_large;
-static int naps, resume_at_nap;
+static int naps, resume_at_nap, teardown_at_nap;
 static int rw_hold, rw_unvetted;   /* the rewind's own power hold */
 static sleep_q g_sq;
 static volatile int g_pwr_play_lock;
@@ -99,7 +101,13 @@ static int scePowerUnlock(int u)
 static void sceKernelDelayThread(unsigned us)
 {
    (void)us;
-   if (++naps == resume_at_nap)
+   assert(naps < 100000);                     /* held forever */
+   if (++naps == teardown_at_nap)
+   {  /* the SUSPENDING after a give-up: it finds the loop parked */
+      SQ_TRACE("teardown");
+      g_pwr_park_req = 1; g_pwr_cb_done = 1; g_pwr_slept = 1;
+   }
+   if (naps == resume_at_nap)
    {  /* the callback's RESUME_COMPLETE */
       SQ_TRACE("resume");
       g_pwr_park_req = 0; g_pwr_cb_done = 0; g_pwr_sleep_pending = 0;
@@ -140,7 +148,7 @@ static void machine(void)
    audio_thid = 7; audio_running = 1; g_io_thid = 9;
    sav_open = 1; evt_open = 0; home_mod = 1; g_net_up = 1;
    gamepak_file_large = (RFILE *)&naps;
-   naps = 0; resume_at_nap = 0; locks = unlocks = 0;
+   naps = 0; resume_at_nap = teardown_at_nap = 0; locks = unlocks = 0;
    unlocked_while_held = holding = 0;
    g_pwr_play_lock = 0; g_wake_hold = 0;
    g_pwr_park_req = g_pwr_cb_done = g_pwr_sleep_pending = 0;
@@ -198,31 +206,39 @@ int main(void)
    assert(g_pwr_sleep_pending == 0 && g_pwr_rebuild == 1 && unlocks == 1);
    assert(strstr(notes, "q hold_timeout"));
 
-   /* 2b. Released before it could hold (a quiesce that overran the
-    *     callback's budget): the loop, parked at last, drops the lock the
-    *     callback left it and stays held through the suspend; the quiesce
-    *     is undone only once the wake has come. */
+   /* 2b. Given up on before it parked (a quiesce that overran the
+    *     callback's budget): that callback tore nothing down, so the loop,
+    *     parked at last, keeps the lock -- dropped now, the suspend would
+    *     land with the renderer up -- until the SUSPENDING that follows
+    *     finds it parked and tears down.  Then it drops it, stays held
+    *     through the suspend, and the quiesce is undone only once the wake
+    *     has come. */
    machine();
    play_lock_take();
    g_pwr_sleep_pending = 1; g_pwr_park_req = 1;
    sleep_quiesce_down();
    g_pwr_park_req = 0;                        /* the callback gave up */
-   resume_at_nap = 4;
+   teardown_at_nap = 3;
+   resume_at_nap = 6;
+   holding = 1;
    sleep_park_hold();
-   assert(unlocks == 1 && strstr(trace, "unlock resume") != NULL);
-   assert(naps == 4 && g_sq.down);
+   holding = 0;
+   assert(unlocks == 1 && unlocked_while_held);
+   assert(strstr(trace, "teardown unlock resume") != NULL);
+   assert(naps == 6 && g_sq.down);
    loop_unpark("resume");
    assert(!g_sq.down && audio_running == 1 && g_io_thid == 9);
 
-   /* 2c. ...and if no suspend follows, it ends by itself and puts the game
-    *     back: nothing was torn down, so no overlay. */
+   /* 2c. ...and if nothing follows, it ends by itself and puts the game
+    *     back with the lock still held: nothing was torn down, so no
+    *     overlay, and no suspend let through with the renderer up. */
    machine();
    play_lock_take();
    g_pwr_sleep_pending = 1; g_pwr_park_req = 1;
    sleep_quiesce_down();
    g_pwr_park_req = 0;
    sleep_park_hold();
-   assert(naps == SLEEP_HOLD_NAPS && unlocks == 1);
+   assert(naps == SLEEP_HOLD_NAPS && unlocks == 0 && g_pwr_play_lock == 1);
    assert(g_pwr_sleep_pending == 0 && g_pwr_rebuild == 0);
    loop_unpark("resume");
    assert(!g_sq.down && audio_running == 1 && g_io_thid == 9);
@@ -272,7 +288,7 @@ int main(void)
    sleep_quiesce_down();
    assert(trace[0] == '\0' && !g_sq.down);
 
-    puts("sleep quiesce: TYL lifecycle, hold timeout, overrun release, "
+    puts("sleep quiesce: TYL lifecycle, hold timeout, overrun hold, "
         "unpark gating, lock gating, rewind hold, standby = 0 pass");
    return 0;
 }
@@ -320,10 +336,18 @@ MUTANTS = (
     ("the loop let go before the wake does not hold",
      "while ((g_pwr_park_req || g_pwr_sleep_pending || SLEEP_SIM_ASLEEP())",
      "while ((g_pwr_park_req || SLEEP_SIM_ASLEEP())",
-     "unlock resume"),
+     "unlocks == 1 && unlocked_while_held"),
     ("the quiesce is undone while the sleep is pending",
      "if (g_sq.down && !g_pwr_sleep_pending)", "if (g_sq.down)",
      "g_sq.down && trace[0]"),
+    ("a loop given up on drops the lock with nothing torn down",
+     "      if (g_pwr_cb_done)\n      {\n         play_lock_drop(\"park\");",
+     "      if (cb_over)\n      {\n         play_lock_drop(\"park\");",
+     "unlocks == 1 && unlocked_while_held"),
+    ("a loop given up on is held until the wake, however long",
+     "int cb_over = g_pwr_cb_done || !g_pwr_park_req;",
+     "int cb_over = g_pwr_cb_done;",
+     "naps < 100000"),
     ("the held loop keeps the rewind's hold",
      "         psp_rewind_pwr();\n", "",
      "rw_hold == 0"),

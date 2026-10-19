@@ -34,7 +34,7 @@ NAMES = ("play_lock_take", "play_lock_drop", "sq_audio_stop", "sq_audio_start",
          "sq_writer_stop", "sq_writer_start", "sq_files_close",
          "sq_files_reopen", "sq_home_stop", "sq_home_rearm", "sq_net_term",
          "sq_note", "sleep_quiesce_down", "sleep_quiesce_up",
-         "sleep_park_hold")
+         "sleep_park_hold", "loop_unpark")
 
 
 def production(source):
@@ -60,6 +60,7 @@ STUB = r'''
 #include <string.h>
 #include "sleep_q.h"
 #define GPSP_PLAYABLE 1
+#define REWIND 1
 #define FE_EVT_ONLY(x) ((void)(x))
 #define fe_evt(...) ((void)0)
 #define SLEEP_SIM_ASLEEP() 0
@@ -75,6 +76,7 @@ static unsigned ring_r, ring_w;
 static int g_io_thid = -1, sav_open, evt_open, home_mod, g_net_up;
 static RFILE *gamepak_file_large;
 static int naps, resume_at_nap;
+static int rw_hold, rw_unvetted;   /* the rewind's own power hold */
 static sleep_q g_sq;
 static volatile int g_pwr_play_lock;
 static void standby_note(const char *fmt, ...)
@@ -121,6 +123,10 @@ static int home_host_loaded(void) { return home_mod; }
 static void home_host_stop(void) { SQ_TRACE("home_stop"); home_mod = 0; }
 static void home_host_forget(void) { SQ_TRACE("home_forget"); }
 static void net_teardown_io(void) { SQ_TRACE("net_term"); g_net_up = 0; }
+static void psp_rewind_pwr(void)
+{  /* as production: the hold follows fe_host_rewind_unvetted() */
+   if (rw_hold && !rw_unvetted) { rw_hold = 0; SQ_TRACE("rw_release"); }
+}
 
 @FUNCTIONS@
 
@@ -137,6 +143,7 @@ static void machine(void)
    g_pwr_play_lock = 0; g_wake_hold = 0;
    g_pwr_park_req = g_pwr_cb_done = g_pwr_sleep_pending = 0;
    g_pwr_slept = g_pwr_rebuild = 0;
+   rw_hold = rw_unvetted = 0;
 }
 
 int main(void)
@@ -186,16 +193,46 @@ int main(void)
    assert(g_pwr_sleep_pending == 0 && g_pwr_rebuild == 1 && unlocks == 1);
    assert(strstr(notes, "q hold_timeout"));
 
-   /* 2b. Released before it could hold (the callback timed the park out):
-    *     the lock goes on the way out, and the quiesce stays until the
-    *     resume. */
+   /* 2b. Released before it could hold (a quiesce that overran the
+    *     callback's budget): the loop, parked at last, drops the lock the
+    *     callback left it and stays held through the suspend; the quiesce
+    *     is undone only once the wake has come. */
    machine();
    play_lock_take();
    g_pwr_sleep_pending = 1; g_pwr_park_req = 1;
    sleep_quiesce_down();
-   g_pwr_cb_done = 1; g_pwr_park_req = 0;
+   g_pwr_park_req = 0;                        /* the callback gave up */
+   resume_at_nap = 4;
    sleep_park_hold();
-   assert(naps == 0 && unlocks == 1 && g_sq.down);
+   assert(unlocks == 1 && strstr(trace, "unlock resume") != NULL);
+   assert(naps == 4 && g_sq.down);
+   loop_unpark("resume");
+   assert(!g_sq.down && audio_running == 1 && g_io_thid == 9);
+
+   /* 2c. ...and if no suspend follows, it ends by itself and puts the game
+    *     back: nothing was torn down, so no overlay. */
+   machine();
+   play_lock_take();
+   g_pwr_sleep_pending = 1; g_pwr_park_req = 1;
+   sleep_quiesce_down();
+   g_pwr_park_req = 0;
+   sleep_park_hold();
+   assert(naps == SLEEP_HOLD_NAPS && unlocks == 1);
+   assert(g_pwr_sleep_pending == 0 && g_pwr_rebuild == 0);
+   loop_unpark("resume");
+   assert(!g_sq.down && audio_running == 1 && g_io_thid == 9);
+
+   /* 2d. The quiesce is not undone while the sleep is still pending (the
+    *     loop let go before the wake). */
+   machine();
+   g_pwr_sleep_pending = 1; g_pwr_park_req = 1;
+   sleep_quiesce_down();
+   trace[0] = '\0';
+   loop_unpark("resume");
+   assert(g_sq.down && trace[0] == '\0');     /* pending: not yet */
+   g_pwr_sleep_pending = 0;
+   loop_unpark("resume");
+   assert(!g_sq.down && strstr(trace, "audio_start") != NULL);
 
    /* 3. Never re-taken while pending. */
    machine();
@@ -207,14 +244,31 @@ int main(void)
    play_lock_take();
    assert(locks == 1);                        /* once, not per frame */
 
+   /* 3b. A rewind standing inside an old save holds the switch with its
+    *     own lock (psp_rewind_pwr).  The callback's teardown suspends the
+    *     rewind, which ends that state; the held loop must let that hold
+    *     go too, or the suspend waits for it and the hold times out with
+    *     no sleep. */
+   machine();
+   play_lock_take();
+   rw_hold = 1; rw_unvetted = 1;
+   g_pwr_sleep_pending = 1; g_pwr_park_req = 1;
+   sleep_quiesce_down();
+   g_pwr_cb_done = 1; g_pwr_slept = 1;
+   rw_unvetted = 0;                           /* fe_host_rewind_suspend */
+   resume_at_nap = 3;
+   sleep_park_hold();
+   assert(rw_hold == 0 && strstr(trace, "rw_release") != NULL);
+   assert(strstr(trace, "resume") > strstr(trace, "rw_release"));
+
    /* 4. standby = 0: the park does nothing at all. */
    machine();
    g_pcfg.standby = 0;
    sleep_quiesce_down();
    assert(trace[0] == '\0' && !g_sq.down);
 
-   puts("sleep quiesce: TYL lifecycle, hold timeout, early release, lock "
-        "gating, standby = 0 pass");
+    puts("sleep quiesce: TYL lifecycle, hold timeout, overrun release, "
+        "unpark gating, lock gating, rewind hold, standby = 0 pass");
    return 0;
 }
 '''
@@ -241,7 +295,7 @@ print(run(good, True).stdout.strip())
 
 MUTANTS = (
     ("the held loop never drops the gameplay lock",
-     'if (g_pwr_cb_done)\n         play_lock_drop("park");', ";",
+     '         play_lock_drop("park");\n', "",
      "unlocked_while_held"),
     ("the paged ROM handle is left open",
      "gamepak_file_large = NULL;\n      rom = 1;", "rom = 1;",
@@ -252,6 +306,16 @@ MUTANTS = (
     ("the lock is re-taken while a sleep is pending",
      "g_pwr_play_lock || g_pwr_sleep_pending ||", "g_pwr_play_lock ||",
      "locks =="),
+    ("the loop let go before the wake does not hold",
+     "while ((g_pwr_park_req || g_pwr_sleep_pending || SLEEP_SIM_ASLEEP())",
+     "while ((g_pwr_park_req || SLEEP_SIM_ASLEEP())",
+     "unlock resume"),
+    ("the quiesce is undone while the sleep is pending",
+     "if (g_sq.down && !g_pwr_sleep_pending)", "if (g_sq.down)",
+     "g_sq.down && trace[0]"),
+    ("the held loop keeps the rewind's hold",
+     "         psp_rewind_pwr();\n", "",
+     "rw_hold == 0"),
     ("the wake overlay runs without the lock",
      "g_pwr_sleep_pending || g_pwr_park_req)",
      "g_pwr_sleep_pending || g_pwr_park_req || g_wake_hold)",

@@ -484,6 +484,7 @@ static void setup_exit_callback(void)
 #define IO_PRIO        0x22
 #define IO_STACK       0x1000
 #define IO_WAIT_US     250000     /* only bounds teardown latency */
+#define IO_JOIN_US     5000000u   /* the last pass may be flushing 128 KiB */
 #define IO_SEMA_MAX    64
 
 static SceUID g_io_thid = -1, g_io_sema = -1;
@@ -592,7 +593,7 @@ static int io_thread_stop(void)
 
    if (had_thread)
    {
-      SceUInt tmo = 5000000;   /* the last pass may be flushing 128 KiB */
+      SceUInt tmo = IO_JOIN_US;
       g_io_run = 0;
       sceKernelSignalSema(g_io_sema, 1);
       rc = sceKernelWaitThreadEnd(g_io_thid, &tmo);
@@ -969,6 +970,7 @@ static void audio_ring_reset(void)
 
 /* Returns 0 = joined (the worker released its channel on the way out),
  * 1 = there was no worker, < 0 = the join timed out and it was terminated. */
+#define AUDIO_JOIN_US 1000000u
 static int audio_stop(void)
 {
    int rc = 1;
@@ -977,7 +979,7 @@ static int audio_stop(void)
    {
       /* Bounded: one chunk is ~23 ms, so a worker that has not returned from
        * sceAudioOutputBlocking in a second never will -- do not hang exit. */
-      SceUInt tmo = 1000000;
+      SceUInt tmo = AUDIO_JOIN_US;
       rc = sceKernelWaitThreadEnd(audio_thid, &tmo);
       if (rc < 0)
          sceKernelTerminateDeleteThread(audio_thid);
@@ -2001,8 +2003,12 @@ static volatile int g_pwr_parked;
  *                   quiescing) -- awaited for PWR_PARK_WAIT_US, as before, so
  *                   a loop that has no park point (browser, menus) still costs
  *                   the callback 250 ms and no more;
- *   g_pwr_parked    the quiesce is finished -- awaited for a further
- *                   PWR_QUIESCE_WAIT_US once acknowledged.
+ *   g_pwr_parked    the quiesce is finished -- awaited, once acknowledged,
+ *                   up to PWR_QUIESCE_WAIT_US: the quiesce's own worst
+ *                   case, so the callback never gives up on a loop that is
+ *                   only slow.  A loop still quiescing past even that keeps
+ *                   the gameplay lock and drops it itself once parked
+ *                   (sleep_park_hold), so the suspend never lands mid-I/O.
  * Everything blocking runs on the EMULATION thread, never here: it owns the
  * ROM handle and the core, and joining the audio and writer threads from it
  * cannot deadlock against this callback thread (0x11), which outranks them.
@@ -2016,7 +2022,15 @@ static volatile int g_pwr_parked;
 static volatile int g_pwr_park_ack;
 static volatile int g_pwr_cb_done;
 static volatile int g_pwr_sleep_pending;
-#define PWR_QUIESCE_WAIT_US 1500000u
+/* Each step at its bound: the audio join, the writer's join, the .sav it
+ * may leave to finish on the loop's thread (4 s: SRAM_SYNC_MAX_SPINS' "a
+ * stick that has not taken 128 KiB in that is broken"), the radio
+ * (adhoc_transport_term: two 1.5 s joins, a 0.2 s drain, a 2 s spin), and a
+ * second for the rest (the HOME module's stop, the handles). */
+#define SQ_SAV_LAND_US 4000000u
+#define SQ_NET_TERM_US 5500000u
+#define PWR_QUIESCE_WAIT_US (AUDIO_JOIN_US + IO_JOIN_US + SQ_SAV_LAND_US + \
+                             SQ_NET_TERM_US + 1000000u)
 static void play_lock_drop(const char *who);
 #ifdef REWIND
 /* When the callback asked (it waits PWR_PARK_WAIT_US for the answer): what
@@ -2189,8 +2203,11 @@ static int power_cb(int unknown, int pwrflags, void *common)
             g_pwr_park_req = 0;
       }
       /* Nobody parked will drop the gameplay power lock (a menu, standby
-       * = 0): drop it here, or the suspend would wait for it forever. */
-      if (!g_pwr_parked)
+       * = 0): drop it here, or the suspend would wait for it forever.  A
+       * loop that acknowledged and is still quiescing drops it itself once
+       * parked (sleep_park_hold): dropped here, the suspend would land with
+       * it inside a join, a .sav write or the radio's teardown. */
+      if (!g_pwr_parked && !g_pwr_park_ack)
          play_lock_drop("cb");
       /* Give the writer a real chance to land the .sav and this line before
        * the kernel takes the machine away.  Not a guarantee -- the window is
@@ -3377,15 +3394,34 @@ static void sleep_quiesce_up(const char *why)
  * stop while the CPU is suspended, so only a suspend that never came can run
  * the count out. */
 #define SLEEP_HOLD_NAPS 1000u            /* 5 s awake without a suspend */
+#ifdef REWIND
+static void psp_rewind_pwr(void);         /* defined with the rewind */
+#endif
 static void sleep_park_hold(void)
 {
    unsigned naps = 0;
-   while ((g_pwr_park_req || SLEEP_SIM_ASLEEP()) && g_running)
+   /* Held until the wake, also when the callback let go before we parked
+    * (a quiesce that overran its budget): the suspend still comes, and it
+    * should find this thread asleep here, not running frames half
+    * quiesced. */
+   while ((g_pwr_park_req || g_pwr_sleep_pending || SLEEP_SIM_ASLEEP()) &&
+          g_running)
    {
-      if (g_pwr_cb_done)
+      /* The callback is done with us: it held us (cb_done), or gave up and
+       * left the lock to us (park_req cleared). */
+      int cb_over = g_pwr_cb_done || !g_pwr_park_req;
+      if (cb_over)
+      {
          play_lock_drop("park");
+#ifdef REWIND
+         /* A rewind inside an old save holds the switch too; the teardown
+          * has suspended it, so that hold is over -- but only this thread
+          * looks (every loop), and it is here. */
+         psp_rewind_pwr();
+#endif
+      }
       sceKernelDelayThread(5000);
-      if (g_pwr_cb_done && ++naps >= SLEEP_HOLD_NAPS && !SLEEP_SIM_ASLEEP())
+      if (cb_over && ++naps >= SLEEP_HOLD_NAPS && !SLEEP_SIM_ASLEEP())
       {
          /* The switch was seen and nothing followed it.  Do not hold the
           * game forever: resume, and if the engine was torn down let the
@@ -3399,9 +3435,8 @@ static void sleep_park_hold(void)
          break;
       }
    }
-   /* Left with a sleep still pending (the game is exiting, or the callback
-    * released a loop it did not park in time): it is this thread that must
-    * now let the suspend through. */
+   /* Left with a sleep still pending (the game is exiting): it is this
+    * thread that must now let the suspend through. */
    if (g_pwr_sleep_pending)
       play_lock_drop("park_exit");
 }

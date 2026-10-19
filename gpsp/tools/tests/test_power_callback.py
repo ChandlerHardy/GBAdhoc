@@ -213,7 +213,7 @@ print("mutant (dedupe on slept): sleep-from-overlay assertion failed")
 mutant = callback.replace("if (g_pwr_parked && g_pwr_slept)", "if (0)", 1)
 assert mutant != callback
 bad = run(mutant, False)
-assert "(down_calls == 1)" in bad.stderr, bad.stderr
+assert re.search(r"[(`]down_calls == 1[)']", bad.stderr), bad.stderr
 print("mutant (second teardown from the overlay): already-down assertion failed")
 
 # Stage 2 of the wait must depend on the acknowledgement: a loop with no
@@ -239,7 +239,7 @@ mutant = callback.replace("if (!g_pwr_parked && !g_pwr_park_ack)",
                           "if (!g_pwr_parked)", 1)
 assert mutant != callback
 bad = run(mutant, False)
-assert "not by the callback" in bad.stderr or "(lock_drops == 1)" in bad.stderr, bad.stderr
+assert re.search(r"[(`]lock_drops == 1[)']", bad.stderr), bad.stderr
 print("mutant (callback drops the lock mid-quiesce): lock assertion failed")
 
 # The old budget (1.5 s) is shorter than the writer's join alone.

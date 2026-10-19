@@ -11350,6 +11350,152 @@ static int psp_rewind_tick(int ff)
 }
 #endif /* REWIND */
 
+/* THE PARK POINT (the suspend handshake's main-thread half), between two
+ * frames: nothing is being emulated, captured or posted, so this is where
+ * the power callback may take the renderer's memory.  Quiesce, report
+ * `parked`, stay held until the wake (loop_unpark undoes the quiesce).
+ *
+ * Called at the top of the game loop (which covers the in-game menu: its
+ * pages are drawn by the loop) and, through ui_set_wake_park, by the wake
+ * overlay's own modal loop -- the SELECT+TRIANGLE pause screen, which used
+ * to have no park point at all: a switch there timed the park out with the
+ * renderer live (power_cb's park_timeout branch, nothing torn down). */
+static int loop_park(void)
+{
+   if (!g_pwr_park_req)
+      return 0;
+   {
+#ifdef REWIND
+      /* A rewind in progress LANDS before the history is taken away (the
+       * callback suspends the rewind once this loop is parked, and play
+       * would go on from wherever the machine stood: possibly the middle
+       * of an old save sequence, replayed over a newer save).  It gets
+       * what is left of the callback's wait, less a margin for the
+       * engine to go idle; what cannot land in that is decided by
+       * fe_host_rewind_suspend (vetted frame, or the game is reset). */
+      if (g_rw_on && fe_host_rewind_busy())
+      {
+         unsigned used = (unsigned)sceKernelGetSystemTimeLow() - g_pwr_park_t0;
+         unsigned room = used + 60000u < PWR_PARK_WAIT_US
+                       ? PWR_PARK_WAIT_US - 60000u - used : 0u;
+#ifdef GPSP_PERF_RIG
+         if (g_ss_no_land)
+            room = 0;
+#endif
+         if (room >= 10000u)
+            (void)psp_rewind_land("sleep", room);
+         else
+            fe_evt("rewind_land_psp why=sleep ok=0 budget_us=0 (no room)");
+      }
+#endif
+      /* Seen: the callback now waits for the quiesce, not the 250 ms. */
+      g_pwr_park_ack = 1;
+      sleep_quiesce_down();
+      g_pwr_parked = 1;
+      sleep_park_hold();
+      g_pwr_parked = 0;
+      g_pwr_park_ack = 0;
+   }
+   return 1;
+}
+
+/* The wake has come (or a hold ran out): undo the quiesce -- reopen what
+ * reopens, restart the writer, then sound -- before anything else, the wake
+ * overlay included.  With sleep_hold_loop = 0 the loop runs on until then
+ * without its sound, as TYL's does. */
+static void loop_unpark(const char *why)
+{
+   if (g_sq.down && !g_pwr_sleep_pending)
+      sleep_quiesce_up(why);
+}
+
+/* The wake overlay's park hook (ui_set_wake_park), once a frame: 1 when it
+ * parked, so the overlay swallows what is held as the console wakes. */
+static int wake_overlay_park(void)
+{
+   int parked = loop_park();
+   loop_unpark("overlay");
+   return parked;
+}
+
+/* THE WAKE: one rebuild, after the overlay's answer, on this thread.
+ * Returns 1 when the player chose `Quit to game list` (g_running is 0 and
+ * the caller must `continue` to the loop's end), else 0.
+ *
+ * Called where the game loop presents, and FIRST THING in the in-game
+ * menu's branch.  That branch ends its iteration with `continue`, so it
+ * never reached the call below it: a sleep taken with the menu open (it
+ * parks, at the loop's top, like play) came back with g_pwr_rebuild set
+ * forever -- g_wake_hold up, so the menu drew every frame and never swapped
+ * onto the screen me_standby_down had blanked, and the renderer and the
+ * volatile partition stayed down.  Black screen, menu live underneath
+ * (PSP-3001, ARK-4, sleeptest 62a1d12: `q up why=resume` and no
+ * `wake begin`).  Now the overlay comes up over the menu, and Continue
+ * rebuilds and returns to the menu where it was. */
+static int wake_service(void)
+{
+   if (g_pwr_rebuild)
+   {
+      /* The rebuild itself waits for the overlay's answer (me_standby_up):
+       * g_pwr_slept stays 1 until then, which is also what keeps
+       * g_wake_hold up and makes a second resume ask again. */
+      g_pwr_rebuild = 0;
+      ring_r = ring_w;              /* sound from before the sleep */
+      g_wake_menu = 1;
+      fe_evt("standby wake overlay_first slept=%d rend=%d vmem=%d",
+             g_pwr_slept, me_rend_active(), me_rend_vmem_held());
+   }
+   /* THE WAKE OVERLAY.  Modal, and deliberately so: nothing needs to be
+    * emulated while it is up (the frame is a still and any link is long
+    * gone), so it owns the pad and the swap chain until the player picks.
+    * `Quit to game list` relaunches the EBOOT, which is how this build
+    * returns to the browser everywhere else -- the core cannot unload a
+    * ROM cleanly, and a relaunch flushes SRAM on the way out. */
+   if (g_wake_menu)
+   {
+      g_wake_menu = 0;
+      home_host_disarm();   /* the overlay is not the game: HOME is the system's */
+      ctl_turbo_stop(&g_turbo);   /* the console slept: auto-fire is over */
+      if (ui_wake_menu(g_wake_have ? g_wake_frame : NULL,
+                       (int)g_wake_w, (int)g_wake_h, g_pcfg.last_rom))
+      {
+         /* The same quit the menu's "Quit to game list" makes: through
+          * the teardown (SRAM flushed) to the browser.  It used to
+          * relaunch from here directly, skipping both. */
+         fe_evt("wake_menu choice=game_list slept=%d", g_pwr_slept);
+         /* Nothing is rebuilt for a game that is being left: the
+          * teardown below stops the engine and the next game starts it
+          * as a boot does.  Only the flags must not outlive the game
+          * (g_wake_hold would keep its swaps suppressed). */
+         g_pwr_slept = 0;
+         g_pwr_rebuild = 0;
+         g_relaunch = RELAUNCH_GAMELIST;
+         g_running = 0;
+         return 1;
+      }
+      fe_evt("wake_menu choice=continue frame=%d slept=%d running=%d",
+             g_wake_have, g_pwr_slept, g_running);
+      g_wake_have = 0;
+      if (!g_running)
+      {
+         /* HOME / exit while the overlay was up: leaving, as above. */
+         g_pwr_slept = 0;
+         g_pwr_rebuild = 0;
+      }
+      else if (g_pwr_slept || g_pwr_rebuild)
+      {
+         unsigned up_t0 = (unsigned)sceKernelGetSystemTimeLow();
+         pwr_hold("wake");          /* renderer rebuild: me_rend_init */
+         me_standby_up();
+         pwr_release();
+         fe_evt("standby up_us=%u",
+                (unsigned)sceKernelGetSystemTimeLow() - up_t0);
+         FE_EVT_ONLY(up_t0);
+      }
+   }
+   return 0;
+}
+
 int main(int argc, char *argv[])
 {
    char rom_path[PSP_FILE_PATH_CAP];
@@ -13668,6 +13814,7 @@ session_top:
    rig_cfg_audit_report();   /* every harness key has been read by now */
 
    pwr_release();            /* the boot's hold: the loop can park from here */
+   ui_set_wake_park(wake_overlay_park);   /* the pause screen parks too */
    while (g_running)
    {
       unsigned frames;
@@ -13709,45 +13856,8 @@ session_top:
             sceKernelDelayThread(5000);
       }
       else
-      if (g_pwr_park_req)
-      {
-#ifdef REWIND
-         /* A rewind in progress LANDS before the history is taken away (the
-          * callback suspends the rewind once this loop is parked, and play
-          * would go on from wherever the machine stood: possibly the middle
-          * of an old save sequence, replayed over a newer save).  It gets
-          * what is left of the callback's wait, less a margin for the
-          * engine to go idle; what cannot land in that is decided by
-          * fe_host_rewind_suspend (vetted frame, or the game is reset). */
-         if (g_rw_on && fe_host_rewind_busy())
-         {
-            unsigned used = (unsigned)sceKernelGetSystemTimeLow() - g_pwr_park_t0;
-            unsigned room = used + 60000u < PWR_PARK_WAIT_US
-                          ? PWR_PARK_WAIT_US - 60000u - used : 0u;
-#ifdef GPSP_PERF_RIG
-            if (g_ss_no_land)
-               room = 0;
-#endif
-            if (room >= 10000u)
-               (void)psp_rewind_land("sleep", room);
-            else
-               fe_evt("rewind_land_psp why=sleep ok=0 budget_us=0 (no room)");
-         }
-#endif
-         /* Seen: the callback now waits for the quiesce, not the 250 ms. */
-         g_pwr_park_ack = 1;
-         sleep_quiesce_down();
-         g_pwr_parked = 1;
-         sleep_park_hold();
-         g_pwr_parked = 0;
-         g_pwr_park_ack = 0;
-      }
-      /* The wake has come (or a hold ran out): undo the quiesce -- reopen
-       * what reopens, restart the writer, then sound -- before anything else
-       * in this iteration, the wake overlay included.  With sleep_hold_loop
-       * = 0 the loop runs on until then without its sound, as TYL's does. */
-      if (g_sq.down && !g_pwr_sleep_pending)
-         sleep_quiesce_up("resume");
+         (void)loop_park();
+      loop_unpark("resume");
       /* TYL holds scePowerLock through play (sleep_power_lock). */
       play_lock_take();
 #ifdef REWIND
@@ -14261,6 +14371,19 @@ session_top:
          /* Core paused; wireless keeps pumping; UI draws + acts. */
          ui_action act;
          LOOP_PHASE(5);
+         /* A sleep taken with the menu open: the wake overlay, and on
+          * Continue the rebuild, before the menu draws again (see
+          * wake_service).  Then a fresh iteration, so the pad is read
+          * after the answer -- and the answer's X, still down, is not read
+          * by the menu as a press of its own. */
+         if (g_pwr_rebuild || g_wake_menu)
+         {
+            if (wake_service())
+               exit_reason = "game_list";
+            else
+               ui_swallow_pad();
+            continue;
+         }
          /* The menu is open: auto-fire stops, and no menu key (X is a
           * likely turbo button) can start or toggle one from in here. */
          if (g_turbo.live)
@@ -14503,65 +14626,10 @@ session_top:
        * suppressed while a wake is pending (see g_wake_hold), otherwise the
        * loop iteration that was in flight when the machine suspended finishes
        * and puts the stale frame up first, which reads as a flicker. */
-      if (g_pwr_rebuild)
+      if (wake_service())
       {
-         /* The rebuild itself waits for the overlay's answer (me_standby_up):
-          * g_pwr_slept stays 1 until then, which is also what keeps
-          * g_wake_hold up and makes a second resume ask again. */
-         g_pwr_rebuild = 0;
-         ring_r = ring_w;              /* sound from before the sleep */
-         g_wake_menu = 1;
-         fe_evt("standby wake overlay_first slept=%d rend=%d vmem=%d",
-                g_pwr_slept, me_rend_active(), me_rend_vmem_held());
-      }
-      /* THE WAKE OVERLAY.  Modal, and deliberately so: nothing needs to be
-       * emulated while it is up (the frame is a still and any link is long
-       * gone), so it owns the pad and the swap chain until the player picks.
-       * `Quit to game list` relaunches the EBOOT, which is how this build
-       * returns to the browser everywhere else -- the core cannot unload a
-       * ROM cleanly, and a relaunch flushes SRAM on the way out. */
-      if (g_wake_menu)
-      {
-         g_wake_menu = 0;
-         home_host_disarm();   /* the overlay is not the game: HOME is the system's */
-         ctl_turbo_stop(&g_turbo);   /* the console slept: auto-fire is over */
-         if (ui_wake_menu(g_wake_have ? g_wake_frame : NULL,
-                          (int)g_wake_w, (int)g_wake_h, g_pcfg.last_rom))
-         {
-            /* The same quit the menu's "Quit to game list" makes: through
-             * the teardown (SRAM flushed) to the browser.  It used to
-             * relaunch from here directly, skipping both. */
-            fe_evt("wake_menu choice=game_list slept=%d", g_pwr_slept);
-            /* Nothing is rebuilt for a game that is being left: the
-             * teardown below stops the engine and the next game starts it
-             * as a boot does.  Only the flags must not outlive the game
-             * (g_wake_hold would keep its swaps suppressed). */
-            g_pwr_slept = 0;
-            g_pwr_rebuild = 0;
-            g_relaunch = RELAUNCH_GAMELIST;
-            exit_reason = "game_list";
-            g_running = 0;
-            continue;
-         }
-         fe_evt("wake_menu choice=continue frame=%d slept=%d running=%d",
-                g_wake_have, g_pwr_slept, g_running);
-         g_wake_have = 0;
-         if (!g_running)
-         {
-            /* HOME / exit while the overlay was up: leaving, as above. */
-            g_pwr_slept = 0;
-            g_pwr_rebuild = 0;
-         }
-         else if (g_pwr_slept || g_pwr_rebuild)
-         {
-            unsigned up_t0 = (unsigned)sceKernelGetSystemTimeLow();
-            pwr_hold("wake");          /* renderer rebuild: me_rend_init */
-            me_standby_up();
-            pwr_release();
-            fe_evt("standby up_us=%u",
-                   (unsigned)sceKernelGetSystemTimeLow() - up_t0);
-            FE_EVT_ONLY(up_t0);
-         }
+         exit_reason = "game_list";
+         continue;
       }
       FE_LP_SET(FELP_L_PRES0);
       me_video_present();
@@ -15217,6 +15285,7 @@ session_top:
    /* The loop ended with a sleep's quiesce still in force (HOME or an exit
     * while held): put back what it stopped, so the teardown below finds the
     * state it was written for.  The gameplay power lock is play's only. */
+   ui_set_wake_park(NULL);   /* no game loop: nothing to park */
    sleep_quiesce_up("loop_exit");
    play_lock_drop("loop_exit");
    pwr_hold("teardown");

@@ -880,6 +880,10 @@ void ui_wake_inject(int choice) { (void)choice; }
 void ui_wake_inject_frame(int frame) { (void)frame; }
 #endif
 
+static int (*g_wake_park)(void);
+void ui_set_wake_park(int (*park)(void)) { g_wake_park = park; }
+void ui_swallow_pad(void) { g_prev_pad = 0xFFFFFFFFu; }
+
 int ui_wake_menu(const uint16_t *frame, int frame_w, int frame_h,
                  const char *game)
 {
@@ -921,6 +925,12 @@ int ui_wake_menu(const uint16_t *frame, int frame_w, int frame_h,
       unsigned now, edges;
       int i;
 
+      /* The power switch, slid while this screen is up: park as the game
+       * loop does (the pause screen used to have no park point, so the
+       * suspend found the renderer live).  A sleep came and went: what is
+       * held now was held as the console woke. */
+      if (g_wake_park && g_wake_park())
+         first = 1;
       sceCtrlPeekBufferPositive(&pad, 1);
       now   = pad.Buttons;
       edges = now & ~prev;

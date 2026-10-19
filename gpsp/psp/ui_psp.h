@@ -250,6 +250,14 @@ static inline size_t ui_rom_stem_length(const char *name)
  * on the theme background.  Returns 0 to resume, 1 for the game list. */
 int ui_wake_menu(const uint16_t *frame, int frame_w, int frame_h,
                  const char *game);
+/* The game loop's park point, run by the wake overlay once a frame: the
+ * overlay is modal (the SELECT+TRIANGLE pause screen, the post-wake screen),
+ * so without it a power switch slid there found nothing to park.  Returns 1
+ * when it parked (a sleep came and went).  NULL = none. */
+void ui_set_wake_park(int (*park)(void));
+/* The menu reads the next frame's held buttons as already seen (as at
+ * ui_open): the wake overlay's answer, still down, is not a menu press. */
+void ui_swallow_pad(void);
 /* Harness `wake_shot = N`: the next wake overlay dumps log/ge_wake.bmp on
  * its third frame and continues on its own. */
 void ui_wake_shot_arm(void);

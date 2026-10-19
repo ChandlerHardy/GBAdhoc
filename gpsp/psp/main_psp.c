@@ -10502,10 +10502,17 @@ static void *psp_rewind_pool_offer(size_t *bytes)
 }
 
 /* The pool is about to go back to the OS (a sleep).  The main loop is
- * parked between frames, or is not emulating at all. */
+ * parked between frames, or is not emulating at all.
+ *
+ * A heap-backed rewind keeps its history across the sleep -- unless the
+ * machine stands inside an old save: its hold (psp_rewind_pwr) would then
+ * keep the suspend off until the park's hold gave up, and the slide would
+ * be lost.  With the loop parked it is ended here as the pool's is, and
+ * fe_host_rewind_suspend decides it (vetted frame, or the game is reset). */
 static void psp_rewind_pool_lost(void)
 {
-   if (!g_rw_pool)
+   if (!g_rw_pool &&
+       !(g_pwr_parked && g_rw_on && fe_host_rewind_unvetted()))
       return;
    if (g_rw_on)
    {

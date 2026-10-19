@@ -19,6 +19,11 @@ with the real psp/sleep_q.c against stubs that record every call.  Checked:
      wake overlay (which yields to the park), and is taken once, not per
      frame.
   4. standby = 0: the park does nothing at all.
+  5. The teardown and the rewind (psp_rewind_pool_lost, psp_rewind_pwr):
+     one in the volatile pool is ended; a heap-backed one is kept, unless
+     the machine stands inside an old save with the loop parked -- then its
+     hold would keep the suspend off, so it is ended as in the pool and its
+     hold let go.
 
 Then mutants of the production text, each of which must fail.
 """
@@ -360,5 +365,117 @@ for label, old, new, expect in MUTANTS:
     bad_src = SOURCE.replace(old, new, 1)
     assert bad_src != SOURCE, label
     bad = run(production(bad_src), False)
+    assert expect in bad.stderr, (label, bad.stderr)
+    print("mutant (%s): failed as it must" % label)
+
+
+# 5. The teardown and the rewind.
+RW_STUB = r"""
+#include <assert.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+#define REWIND 1
+static volatile int g_pwr_parked;
+static int g_rw_on, g_rw_pool, g_rw_asleep, g_rw_showing;
+static const uint16_t *g_rw_show;
+static uint16_t *g_rw_slot, pic[4];
+static int unvetted, suspends, holds;
+static void fe_host_rewind_suspend(void) { suspends++; }
+static int fe_host_rewind_unvetted(void) { return unvetted; }
+static void pwr_hold(const char *why) { (void)why; holds++; }
+static void pwr_release(void) { holds--; }
+
+@FUNCTIONS@
+
+static void standing(int pool, int unv)
+{
+   g_rw_on = 1; g_rw_pool = pool; g_rw_asleep = 0; unvetted = unv;
+   g_rw_showing = 1; g_rw_show = pic; g_rw_slot = pic;
+   suspends = 0;
+   psp_rewind_pwr();               /* the loop, before the switch */
+}
+
+int main(void)
+{
+   /* In the pool: the pool goes, and so does the history. */
+   standing(1, 0);
+   g_pwr_parked = 1;
+   psp_rewind_pool_lost();
+   assert(suspends == 1 && !g_rw_on && g_rw_asleep && !g_rw_pool);
+   assert(!g_rw_showing && !g_rw_show && !g_rw_slot);
+
+   /* On the heap, standing on a vetted frame: it survives the sleep. */
+   standing(0, 0);
+   psp_rewind_pool_lost();
+   assert(suspends == 0 && g_rw_on && !g_rw_asleep && g_rw_showing);
+
+   /* On the heap, inside an old save, the loop parked: its hold would keep
+    * the suspend off, so it is ended as in the pool, and the held loop's
+    * next look lets the hold go. */
+   standing(0, 1);
+   assert(holds == 1);
+   psp_rewind_pool_lost();
+   assert(suspends == 1 && !g_rw_on && g_rw_asleep);
+   assert(!g_rw_showing && !g_rw_show && !g_rw_slot);
+   psp_rewind_pwr();               /* sleep_park_hold */
+   assert(holds == 0);
+
+   /* ...but not with the loop running (the callback's unparked branch):
+    * the frame may be inside the rewind this very moment. */
+   g_pwr_parked = 0;
+   standing(0, 1);
+   psp_rewind_pool_lost();
+   assert(suspends == 0 && g_rw_on && holds == 1);
+
+   puts("rewind teardown: pool ended, heap kept, heap unvetted ended when "
+        "parked, not when running pass");
+   return 0;
+}
+"""
+
+
+def rw_production(source):
+    m = re.search(r"^static int g_rw_pwr;$", source, re.M)
+    assert m, "g_rw_pwr not found"
+    return "\n\n".join((m.group(0), function(source, "psp_rewind_pwr"),
+                        function(source, "psp_rewind_pool_lost")))
+
+
+def rw_run(functions, expect_pass):
+    with tempfile.TemporaryDirectory(prefix="gbadhoc-rwsleep-") as folder:
+        cfile = Path(folder) / "rw.c"
+        binary = Path(folder) / "rw"
+        cfile.write_text(RW_STUB.replace("@FUNCTIONS@", functions))
+        subprocess.run(["cc", "-std=gnu99", "-Wall", "-Wextra", "-Werror",
+                        "-Wno-unused-function", str(cfile), "-o", str(binary)],
+                       check=True)
+        result = subprocess.run([str(binary)], capture_output=True, text=True)
+        if (result.returncode == 0) != expect_pass:
+            raise AssertionError("expect_pass=%s\n%s%s" % (
+                expect_pass, result.stdout, result.stderr))
+        return result
+
+
+print(rw_run(rw_production(SOURCE), True).stdout.strip())
+
+RW_MUTANTS = (
+    ("a heap-backed rewind inside an old save is left standing",
+     "   if (!g_rw_pool &&\n       !(g_pwr_parked && g_rw_on && fe_host_rewind_unvetted()))",
+     "   if (!g_rw_pool)",
+     "suspends == 1 && !g_rw_on && g_rw_asleep"),
+    ("a heap-backed rewind is ended with the loop running",
+     "!(g_pwr_parked && g_rw_on && fe_host_rewind_unvetted())",
+     "!(g_rw_on && fe_host_rewind_unvetted())",
+     "suspends == 0 && g_rw_on && holds == 1"),
+    ("every heap-backed rewind is ended",
+     "!(g_pwr_parked && g_rw_on && fe_host_rewind_unvetted())",
+     "!(g_pwr_parked && g_rw_on)",
+     "suspends == 0 && g_rw_on && !g_rw_asleep"),
+)
+for label, old, new, expect in RW_MUTANTS:
+    bad_src = SOURCE.replace(old, new, 1)
+    assert bad_src != SOURCE, label
+    bad = rw_run(rw_production(bad_src), False)
     assert expect in bad.stderr, (label, bad.stderr)
     print("mutant (%s): failed as it must" % label)

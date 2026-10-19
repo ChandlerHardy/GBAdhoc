@@ -2053,9 +2053,12 @@ static int power_cb(int unknown, int pwrflags, void *common)
       g_pwr_sleep_pending = 1;
    /* Once the work is done for this sleep (the switch normally arrives first
     * and the SUSPENDING ~0.1 s later), a repeat returns at once: the firmware
-    * is about to take the machine and nothing here would add anything. */
+    * is about to take the machine and nothing here would add anything.
+    * Per sleep, not per teardown: a switch slid on the wake overlay (the
+    * engine still down, g_pwr_slept 1) is a new sleep, and the loop must
+    * park and quiesce for it like any other. */
    if ((pwrflags & (PSP_POWER_CB_POWER_SWITCH | PSP_POWER_CB_SUSPENDING)) &&
-       !(g_pcfg.standby && (g_pwr_slept || g_pwr_cb_done)))
+       !(g_pcfg.standby && g_pwr_cb_done))
    {
       unsigned cb_t0 = (unsigned)sceKernelGetSystemTimeLow();
       int held = 0;
@@ -2123,7 +2126,12 @@ static int power_cb(int unknown, int pwrflags, void *common)
                       PWR_PARK_WAIT_US + PWR_QUIESCE_WAIT_US)
                sceKernelDelayThread(2000);
          park_us = (unsigned)sceKernelGetSystemTimeLow() - t0;
-         if (g_pwr_parked)
+         if (g_pwr_parked && g_pwr_slept)
+            /* Slid again on the wake overlay: the engine is still down from
+             * the last sleep (Continue rebuilds it), so the loop's quiesce
+             * is all there is to do. */
+            standby_note("suspend parked=1 park_us=%u already_down=1", park_us);
+         else if (g_pwr_parked)
          {
             t0 = (unsigned)sceKernelGetSystemTimeLow();
             if (me_host_loaded())
@@ -3100,8 +3108,9 @@ static void me_standby_down(void)
  *
  * While the overlay is up the machine now stays exactly as the suspend left
  * it: renderer down, partition released, g_pwr_slept still 1.  A second
- * suspend finds nothing to tear down (power_cb's renderer=off branch) and
- * its resume asks for the same single rebuild.  `Quit to game list` never
+ * suspend parks the loop (the overlay yields to it) but finds nothing to tear
+ * down (power_cb's already_down branch), and its resume asks for the same
+ * single rebuild.  `Quit to game list` never
  * rebuilds at all: the teardown it goes through shuts the engine down anyway.
  *
  * Every step is logged: if resume ever fails on a model we do not own, this
@@ -3183,8 +3192,10 @@ static volatile int g_pwr_play_lock;
 
 static void play_lock_take(void)
 {
-   if (g_pwr_play_lock || g_pwr_sleep_pending || g_pwr_park_req ||
-       g_wake_hold)
+   /* Held over the wake overlay too: it yields to the park
+    * (wake_overlay_yield), so a second sleep slid on it waits for the
+    * park like one slid in play. */
+   if (g_pwr_play_lock || g_pwr_sleep_pending || g_pwr_park_req)
       return;
    {
       int rc = scePowerLock(0);

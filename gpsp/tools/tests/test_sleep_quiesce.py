@@ -13,8 +13,9 @@ with the real psp/sleep_q.c against stubs that record every call.  Checked:
   2. A hold that no suspend follows ends on its own and asks for the wake
      overlay; a loop released before the wake lets the suspend through on
      its way out.
-  3. The lock is never re-taken while a sleep is pending or in the wake
-     overlay, and is taken once, not per frame.
+  3. The lock is never re-taken while a sleep is pending, is held over the
+     wake overlay (which yields to the park), and is taken once, not per
+     frame.
   4. standby = 0: the park does nothing at all.
 
 Then mutants of the production text, each of which must fail.
@@ -160,16 +161,18 @@ int main(void)
                                                    * with the loop held */
    assert(strstr(trace, "unlock resume") != NULL);
    assert(naps == 3 && g_pwr_park_req == 0);
-   g_wake_hold = 1;                           /* the wake overlay: not yet */
+   /* The wake overlay holds the lock too: it yields to the park, so a
+    * second sleep slid on it waits for the park like one slid in play. */
+   g_wake_hold = 1;
    play_lock_take();
-   assert(locks == 1);
+   assert(locks == 2 && g_pwr_play_lock == 1);
    trace[0] = '\0';
    sleep_quiesce_up("resume");
    assert(strcmp(trace, "home_forget io_start audio_start ") == 0);
    assert(audio_running == 1 && g_io_thid == 9 && !g_sq.down);
    g_wake_hold = 0;
    play_lock_take();                          /* Continue: play again */
-   assert(locks == 2 && g_pwr_play_lock == 1);
+   assert(locks == 2 && g_pwr_play_lock == 1);   /* still the one lock */
 
    /* 2a. A switch that no suspend follows: the hold ends by itself and the
     *     wake overlay is asked for, so the rebuild still happens. */
@@ -249,6 +252,10 @@ MUTANTS = (
     ("the lock is re-taken while a sleep is pending",
      "g_pwr_play_lock || g_pwr_sleep_pending ||", "g_pwr_play_lock ||",
      "locks =="),
+    ("the wake overlay runs without the lock",
+     "g_pwr_sleep_pending || g_pwr_park_req)",
+     "g_pwr_sleep_pending || g_pwr_park_req || g_wake_hold)",
+     "locks == 2 && g_pwr_play_lock == 1"),
 )
 for label, old, new, expect in MUTANTS:
     bad_src = SOURCE.replace(old, new, 1)

@@ -64,11 +64,25 @@ int main(void)
     assert(g_pwr_rebuild == 1 && g_pwr_resume == 1);
     assert(g_pwr_park_req == 0 && g_pwr_cb_done == 0);   /* hold released */
     assert(g_pwr_sleep_pending == 0);
+    /* Slid again on the wake overlay, before Continue: g_pwr_slept is still
+     * 1 (the engine stays down until the overlay's answer).  The loop must
+     * park and quiesce again -- the overlay yields to the park -- but the
+     * engine is not torn down twice, and the wake asks for the overlay. */
+    g_pwr_rebuild = 0;
+    power_cb(0, PSP_POWER_CB_POWER_SWITCH, NULL);
+    assert(scan_calls == 2 && g_pwr_suspend == 2);   /* again, from the overlay */
+    assert(down_calls == 1);                         /* already down */
+    assert(g_pwr_park_req == 1 && g_pwr_cb_done == 1 && lock_drops == 0);
+    d0 = delays;
+    power_cb(0, PSP_POWER_CB_SUSPENDING, NULL);
+    assert(delays == d0 && scan_calls == 2);
+    power_cb(0, PSP_POWER_CB_RESUME_COMPLETE, NULL);
+    assert(g_pwr_rebuild == 1 && g_pwr_park_req == 0 && g_pwr_cb_done == 0);
     g_pwr_slept = 0;
     power_cb(0, PSP_POWER_CB_SUSPENDING, NULL);
     assert(down_calls == 2); /* inactivity-driven suspend still works */
     power_cb(0, PSP_POWER_CB_RESUME_COMPLETE, NULL);
-    assert(notes >= 5 && wakes >= 3 && disarms == 2);
+    assert(notes >= 5 && wakes >= 3 && disarms == 3);
 
     /* A teardown that could not release the partition leaves slept = 0;
      * the held sleep must still answer the SUSPENDING at once. */
@@ -101,8 +115,8 @@ int main(void)
     assert(clock_us - t0 >= PWR_PARK_WAIT_US + PWR_QUIESCE_WAIT_US);
     assert(clock_us - t0 < PWR_PARK_WAIT_US + PWR_QUIESCE_WAIT_US + 200000u);
     assert(down_calls == 3 && g_pwr_park_req == 0 && lock_drops == 2);
-    puts("power callback: switch-only, duplicate, resume, suspending-only, "
-         "hold, no-park and quiesce-timeout pass");
+    puts("power callback: switch-only, duplicate, resume, again-from-overlay, "
+         "suspending-only, hold, no-park and quiesce-timeout pass");
     return 0;
 }
 '''
@@ -133,11 +147,28 @@ print("mutant (manual-switch branch removed): down_calls assertion failed")
 
 # The dedupe must cover a sleep whose teardown is done but held: without
 # g_pwr_cb_done in it, the SUSPENDING after the switch would wait again.
-mutant = callback.replace("(g_pwr_slept || g_pwr_cb_done)", "g_pwr_slept", 1)
+mutant = callback.replace("!(g_pcfg.standby && g_pwr_cb_done)", "1", 1)
 assert mutant != callback
 bad = run(mutant, False)
-assert "held: no second pass" in bad.stderr or "down_calls == 3 && delays" in bad.stderr, bad.stderr
-print("mutant (dedupe without cb_done): held-sleep assertion failed")
+assert "down_calls == 1 && scan_calls == 1" in bad.stderr, bad.stderr
+print("mutant (no dedupe): duplicate-event assertion failed")
+
+# ...and only that: deduping on g_pwr_slept as well skips the park for a
+# second sleep taken from the wake overlay, which then suspends with the
+# overlay drawing and the audio thread and the writer live.
+mutant = callback.replace("!(g_pcfg.standby && g_pwr_cb_done)",
+                          "!(g_pcfg.standby && (g_pwr_slept || g_pwr_cb_done))", 1)
+assert mutant != callback
+bad = run(mutant, False)
+assert "scan_calls == 2 && g_pwr_suspend == 2" in bad.stderr, bad.stderr
+print("mutant (dedupe on slept): sleep-from-overlay assertion failed")
+
+# The engine torn down by the first sleep is not torn down again by the second.
+mutant = callback.replace("if (g_pwr_parked && g_pwr_slept)", "if (0)", 1)
+assert mutant != callback
+bad = run(mutant, False)
+assert "(down_calls == 1)" in bad.stderr, bad.stderr
+print("mutant (second teardown from the overlay): already-down assertion failed")
 
 # Stage 2 of the wait must depend on the acknowledgement: a loop with no
 # park point must not cost the callback the whole quiesce budget.

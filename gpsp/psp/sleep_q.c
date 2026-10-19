@@ -30,8 +30,8 @@ int sleep_q_down(sleep_q *q, const sleep_q_ops *ops)
 
    /* 1. Sound.  TYL before_pause: StopSoundThread (join + delete).  The
     *    channel is released by the thread on its way out.  Terminated
-    *    (rc < 0, the join timed out) the thread is gone all the same, and
-    *    is started again on the way up. */
+    *    (rc < 0, the join timed out) the thread is gone all the same (the
+    *    stop releases its channel), and is started again on the way up. */
    rc = ops->audio_stop(ops->ctx);
    sq_notef_rc(ops, "audio_stop", rc);
    if (rc == SQ_DONE || rc < 0)

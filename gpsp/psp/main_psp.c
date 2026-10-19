@@ -702,6 +702,11 @@ static volatile int audio_output_error;
  * ratio anywhere else. */
 unsigned in_rate = 32768;
 static SceUID audio_thid = -1;
+/* The worker's sceAudio channel while it holds one.  It gives the channel
+ * back on its way out; a worker terminated in its output (audio_stop) never
+ * gets there, so the stop does, or each restart would take another of the
+ * eight until the game went silent. */
+static volatile int audio_ch = -1;
 
 /* Resampler phase increment, 16.16, read fresh by the audio thread on every
  * output chunk.  Normally (in_rate << 16) / OUT_RATE.  ADR-0027 lowers it in
@@ -843,6 +848,7 @@ static int audio_thread(SceSize args, void *argp)
       audio_running = 0;
       return 0;
    }
+   audio_ch = ch;
 
    while (audio_running)
    {
@@ -930,6 +936,9 @@ static int audio_thread(SceSize args, void *argp)
       }
    }
 
+   /* Cleared first: a stop that terminates us from here on finds nothing
+    * left to release. */
+   audio_ch = -1;
    sceAudioChRelease(ch);
    return 0;
 }
@@ -969,7 +978,8 @@ static void audio_ring_reset(void)
 }
 
 /* Returns 0 = joined (the worker released its channel on the way out),
- * 1 = there was no worker, < 0 = the join timed out and it was terminated. */
+ * 1 = there was no worker, < 0 = the join timed out and it was terminated
+ * (its channel released here). */
 #define AUDIO_JOIN_US 1000000u
 static int audio_stop(void)
 {
@@ -982,7 +992,15 @@ static int audio_stop(void)
       SceUInt tmo = AUDIO_JOIN_US;
       rc = sceKernelWaitThreadEnd(audio_thid, &tmo);
       if (rc < 0)
+      {
          sceKernelTerminateDeleteThread(audio_thid);
+         /* Terminated in its output, it still holds its channel. */
+         if (audio_ch >= 0)
+         {
+            sceAudioChRelease(audio_ch);
+            audio_ch = -1;
+         }
+      }
       else
       {
          sceKernelDeleteThread(audio_thid);

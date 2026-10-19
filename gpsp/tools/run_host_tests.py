@@ -519,7 +519,11 @@ def suites(env: Env, baseline: Path | None):
           "python3 tools/tests/test_power_callback.py && "
           # The in-game sleep quiesce (psp/sleep_q.h): the production park
           # side of the handshake, extracted from main_psp.c, plus mutants.
-          "python3 tools/tests/test_sleep_quiesce.py")
+          "python3 tools/tests/test_sleep_quiesce.py && "
+          # A sleep from the in-game menu / pause screen: the menu branch's
+          # wake and the overlay's yield to the loop-top park (main_psp.c +
+          # ui_psp.c), mutants.
+          "python3 tools/tests/test_sleep_menu.py")
          % (sdk, sdk, sdk)),
 
         ("perf_loop", False, lambda: None,

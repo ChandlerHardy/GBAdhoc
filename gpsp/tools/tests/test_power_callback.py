@@ -145,7 +145,16 @@ int main(void)
     assert(clock_us - t0 < PWR_PARK_WAIT_US + PWR_QUIESCE_WAIT_US + 200000u);
     assert(down_calls == 3 && g_pwr_park_req == 0 && g_pwr_cb_done == 0);
     assert(lock_drops == 1);                  /* not by the callback */
+    /* The loop parks at last and keeps the lock: nothing was torn down
+     * (sleep_park_hold).  The SUSPENDING that follows is no repeat, and
+     * finds it parked: the teardown runs now, and the loop is held. */
+    g_pwr_parked = 1;
+    d0 = down_calls;
+    power_cb(0, PSP_POWER_CB_SUSPENDING, NULL);
+    assert(down_calls == d0 + 1 && g_pwr_cb_done == 1 && g_pwr_park_req == 1);
+    assert(lock_drops == 1);
     power_cb(0, PSP_POWER_CB_RESUME_COMPLETE, NULL);
+    g_pwr_parked = 0;
 
     /* Acknowledged at once, parked once a quiesce longer than the first
      * stage is done: the callback waits for it, tears down, holds the loop,
@@ -156,12 +165,12 @@ int main(void)
     park_in = 200;                            /* 6 ms, then 400 ms more */
     t0 = clock_us;
     power_cb(0, PSP_POWER_CB_POWER_SWITCH, NULL);
-    assert(down_calls == 4 && g_pwr_cb_done == 1 && g_pwr_park_req == 1);
+    assert(down_calls == 5 && g_pwr_cb_done == 1 && g_pwr_park_req == 1);
     assert(clock_us - t0 < 60000u + 6000u + 400000u + 80000u + 20000u);
     assert(lock_drops == 1);                  /* the parked loop drops it */
     puts("power callback: switch-only, duplicate, resume, again-from-overlay, "
-         "suspending-only, hold, no-park, quiesce-timeout and slow-quiesce "
-         "pass");
+         "suspending-only, hold, no-park, quiesce-timeout, teardown-after-"
+         "give-up and slow-quiesce pass");
     return 0;
 }
 '''
@@ -248,3 +257,13 @@ bad_src = source.replace(m.group(0), "#define PWR_QUIESCE_WAIT_US 1500000u", 1)
 bad = run(callback, False, bad_src)
 assert "AUDIO_JOIN_US + IO_JOIN_US" in bad.stderr, bad.stderr
 print("mutant (budget below the quiesce's bounds): budget assertion failed")
+
+# A callback that gave up tore nothing down: the SUSPENDING after it must not
+# be taken for a repeat, or the loop -- which keeps the lock until a teardown
+# has run -- waits out its hold and the slide is lost.
+mutant = callback.replace("      if (held)\n         g_pwr_cb_done = 1;",
+                          "      g_pwr_cb_done = 1;", 1)
+assert mutant != callback
+bad = run(mutant, False)
+assert "g_pwr_cb_done == 0" in bad.stderr, bad.stderr
+print("mutant (give-up marked done): cb_done assertion failed")

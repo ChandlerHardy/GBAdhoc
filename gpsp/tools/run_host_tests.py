@@ -520,6 +520,8 @@ def suites(env: Env, baseline: Path | None):
           # The in-game sleep quiesce (psp/sleep_q.h): the production park
           # side of the handshake, extracted from main_psp.c, plus mutants.
           "python3 tools/tests/test_sleep_quiesce.py && "
+          # The audio worker's channel across a terminate-and-restart.
+          "python3 tools/tests/test_audio_channel.py && "
           # A sleep from the in-game menu / pause screen: the menu branch's
           # wake and the overlay's yield to the loop-top park (main_psp.c +
           # ui_psp.c), mutants.

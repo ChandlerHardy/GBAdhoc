@@ -11,12 +11,19 @@ with the real psp/sleep_q.c against stubs that record every call.  Checked:
      the loop is held, i.e. BEFORE the resume; after it, everything comes
      back in reverse with sound last.
   2. A hold that no suspend follows ends on its own and asks for the wake
-     overlay; a loop released before the wake lets the suspend through on
-     its way out.
+     overlay; a loop the callback gave up on keeps the lock until a
+     teardown has run (the SUSPENDING that follows), or ends on its own; a
+     loop released before the wake lets the suspend through on its way
+     out.
   3. The lock is never re-taken while a sleep is pending, is held over the
      wake overlay (which yields to the park), and is taken once, not per
      frame.
   4. standby = 0: the park does nothing at all.
+  5. The teardown and the rewind (psp_rewind_pool_lost, psp_rewind_pwr):
+     one in the volatile pool is ended; a heap-backed one is kept, unless
+     the machine stands inside an old save with the loop parked -- then its
+     hold would keep the suspend off, so it is ended as in the pool and its
+     hold let go.
 
 Then mutants of the production text, each of which must fail.
 """
@@ -75,7 +82,7 @@ static int audio_thid = -1, audio_running, audio_output_error;
 static unsigned ring_r, ring_w;
 static int g_io_thid = -1, sav_open, evt_open, home_mod, g_net_up;
 static RFILE *gamepak_file_large;
-static int naps, resume_at_nap;
+static int naps, resume_at_nap, teardown_at_nap;
 static int rw_hold, rw_unvetted;   /* the rewind's own power hold */
 static sleep_q g_sq;
 static volatile int g_pwr_play_lock;
@@ -99,7 +106,13 @@ static int scePowerUnlock(int u)
 static void sceKernelDelayThread(unsigned us)
 {
    (void)us;
-   if (++naps == resume_at_nap)
+   assert(naps < 100000);                     /* held forever */
+   if (++naps == teardown_at_nap)
+   {  /* the SUSPENDING after a give-up: it finds the loop parked */
+      SQ_TRACE("teardown");
+      g_pwr_park_req = 1; g_pwr_cb_done = 1; g_pwr_slept = 1;
+   }
+   if (naps == resume_at_nap)
    {  /* the callback's RESUME_COMPLETE */
       SQ_TRACE("resume");
       g_pwr_park_req = 0; g_pwr_cb_done = 0; g_pwr_sleep_pending = 0;
@@ -140,7 +153,7 @@ static void machine(void)
    audio_thid = 7; audio_running = 1; g_io_thid = 9;
    sav_open = 1; evt_open = 0; home_mod = 1; g_net_up = 1;
    gamepak_file_large = (RFILE *)&naps;
-   naps = 0; resume_at_nap = 0; locks = unlocks = 0;
+   naps = 0; resume_at_nap = teardown_at_nap = 0; locks = unlocks = 0;
    unlocked_while_held = holding = 0;
    g_pwr_play_lock = 0; g_wake_hold = 0;
    g_pwr_park_req = g_pwr_cb_done = g_pwr_sleep_pending = 0;
@@ -198,31 +211,39 @@ int main(void)
    assert(g_pwr_sleep_pending == 0 && g_pwr_rebuild == 1 && unlocks == 1);
    assert(strstr(notes, "q hold_timeout"));
 
-   /* 2b. Released before it could hold (a quiesce that overran the
-    *     callback's budget): the loop, parked at last, drops the lock the
-    *     callback left it and stays held through the suspend; the quiesce
-    *     is undone only once the wake has come. */
+   /* 2b. Given up on before it parked (a quiesce that overran the
+    *     callback's budget): that callback tore nothing down, so the loop,
+    *     parked at last, keeps the lock -- dropped now, the suspend would
+    *     land with the renderer up -- until the SUSPENDING that follows
+    *     finds it parked and tears down.  Then it drops it, stays held
+    *     through the suspend, and the quiesce is undone only once the wake
+    *     has come. */
    machine();
    play_lock_take();
    g_pwr_sleep_pending = 1; g_pwr_park_req = 1;
    sleep_quiesce_down();
    g_pwr_park_req = 0;                        /* the callback gave up */
-   resume_at_nap = 4;
+   teardown_at_nap = 3;
+   resume_at_nap = 6;
+   holding = 1;
    sleep_park_hold();
-   assert(unlocks == 1 && strstr(trace, "unlock resume") != NULL);
-   assert(naps == 4 && g_sq.down);
+   holding = 0;
+   assert(unlocks == 1 && unlocked_while_held);
+   assert(strstr(trace, "teardown unlock resume") != NULL);
+   assert(naps == 6 && g_sq.down);
    loop_unpark("resume");
    assert(!g_sq.down && audio_running == 1 && g_io_thid == 9);
 
-   /* 2c. ...and if no suspend follows, it ends by itself and puts the game
-    *     back: nothing was torn down, so no overlay. */
+   /* 2c. ...and if nothing follows, it ends by itself and puts the game
+    *     back with the lock still held: nothing was torn down, so no
+    *     overlay, and no suspend let through with the renderer up. */
    machine();
    play_lock_take();
    g_pwr_sleep_pending = 1; g_pwr_park_req = 1;
    sleep_quiesce_down();
    g_pwr_park_req = 0;
    sleep_park_hold();
-   assert(naps == SLEEP_HOLD_NAPS && unlocks == 1);
+   assert(naps == SLEEP_HOLD_NAPS && unlocks == 0 && g_pwr_play_lock == 1);
    assert(g_pwr_sleep_pending == 0 && g_pwr_rebuild == 0);
    loop_unpark("resume");
    assert(!g_sq.down && audio_running == 1 && g_io_thid == 9);
@@ -272,7 +293,7 @@ int main(void)
    sleep_quiesce_down();
    assert(trace[0] == '\0' && !g_sq.down);
 
-    puts("sleep quiesce: TYL lifecycle, hold timeout, overrun release, "
+    puts("sleep quiesce: TYL lifecycle, hold timeout, overrun hold, "
         "unpark gating, lock gating, rewind hold, standby = 0 pass");
    return 0;
 }
@@ -320,10 +341,18 @@ MUTANTS = (
     ("the loop let go before the wake does not hold",
      "while ((g_pwr_park_req || g_pwr_sleep_pending || SLEEP_SIM_ASLEEP())",
      "while ((g_pwr_park_req || SLEEP_SIM_ASLEEP())",
-     "unlock resume"),
+     "unlocks == 1 && unlocked_while_held"),
     ("the quiesce is undone while the sleep is pending",
      "if (g_sq.down && !g_pwr_sleep_pending)", "if (g_sq.down)",
      "g_sq.down && trace[0]"),
+    ("a loop given up on drops the lock with nothing torn down",
+     "      if (g_pwr_cb_done)\n      {\n         play_lock_drop(\"park\");",
+     "      if (cb_over)\n      {\n         play_lock_drop(\"park\");",
+     "unlocks == 1 && unlocked_while_held"),
+    ("a loop given up on is held until the wake, however long",
+     "int cb_over = g_pwr_cb_done || !g_pwr_park_req;",
+     "int cb_over = g_pwr_cb_done;",
+     "naps < 100000"),
     ("the held loop keeps the rewind's hold",
      "         psp_rewind_pwr();\n", "",
      "rw_hold == 0"),
@@ -336,5 +365,117 @@ for label, old, new, expect in MUTANTS:
     bad_src = SOURCE.replace(old, new, 1)
     assert bad_src != SOURCE, label
     bad = run(production(bad_src), False)
+    assert expect in bad.stderr, (label, bad.stderr)
+    print("mutant (%s): failed as it must" % label)
+
+
+# 5. The teardown and the rewind.
+RW_STUB = r"""
+#include <assert.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+#define REWIND 1
+static volatile int g_pwr_parked;
+static int g_rw_on, g_rw_pool, g_rw_asleep, g_rw_showing;
+static const uint16_t *g_rw_show;
+static uint16_t *g_rw_slot, pic[4];
+static int unvetted, suspends, holds;
+static void fe_host_rewind_suspend(void) { suspends++; }
+static int fe_host_rewind_unvetted(void) { return unvetted; }
+static void pwr_hold(const char *why) { (void)why; holds++; }
+static void pwr_release(void) { holds--; }
+
+@FUNCTIONS@
+
+static void standing(int pool, int unv)
+{
+   g_rw_on = 1; g_rw_pool = pool; g_rw_asleep = 0; unvetted = unv;
+   g_rw_showing = 1; g_rw_show = pic; g_rw_slot = pic;
+   suspends = 0;
+   psp_rewind_pwr();               /* the loop, before the switch */
+}
+
+int main(void)
+{
+   /* In the pool: the pool goes, and so does the history. */
+   standing(1, 0);
+   g_pwr_parked = 1;
+   psp_rewind_pool_lost();
+   assert(suspends == 1 && !g_rw_on && g_rw_asleep && !g_rw_pool);
+   assert(!g_rw_showing && !g_rw_show && !g_rw_slot);
+
+   /* On the heap, standing on a vetted frame: it survives the sleep. */
+   standing(0, 0);
+   psp_rewind_pool_lost();
+   assert(suspends == 0 && g_rw_on && !g_rw_asleep && g_rw_showing);
+
+   /* On the heap, inside an old save, the loop parked: its hold would keep
+    * the suspend off, so it is ended as in the pool, and the held loop's
+    * next look lets the hold go. */
+   standing(0, 1);
+   assert(holds == 1);
+   psp_rewind_pool_lost();
+   assert(suspends == 1 && !g_rw_on && g_rw_asleep);
+   assert(!g_rw_showing && !g_rw_show && !g_rw_slot);
+   psp_rewind_pwr();               /* sleep_park_hold */
+   assert(holds == 0);
+
+   /* ...but not with the loop running (the callback's unparked branch):
+    * the frame may be inside the rewind this very moment. */
+   g_pwr_parked = 0;
+   standing(0, 1);
+   psp_rewind_pool_lost();
+   assert(suspends == 0 && g_rw_on && holds == 1);
+
+   puts("rewind teardown: pool ended, heap kept, heap unvetted ended when "
+        "parked, not when running pass");
+   return 0;
+}
+"""
+
+
+def rw_production(source):
+    m = re.search(r"^static int g_rw_pwr;$", source, re.M)
+    assert m, "g_rw_pwr not found"
+    return "\n\n".join((m.group(0), function(source, "psp_rewind_pwr"),
+                        function(source, "psp_rewind_pool_lost")))
+
+
+def rw_run(functions, expect_pass):
+    with tempfile.TemporaryDirectory(prefix="gbadhoc-rwsleep-") as folder:
+        cfile = Path(folder) / "rw.c"
+        binary = Path(folder) / "rw"
+        cfile.write_text(RW_STUB.replace("@FUNCTIONS@", functions))
+        subprocess.run(["cc", "-std=gnu99", "-Wall", "-Wextra", "-Werror",
+                        "-Wno-unused-function", str(cfile), "-o", str(binary)],
+                       check=True)
+        result = subprocess.run([str(binary)], capture_output=True, text=True)
+        if (result.returncode == 0) != expect_pass:
+            raise AssertionError("expect_pass=%s\n%s%s" % (
+                expect_pass, result.stdout, result.stderr))
+        return result
+
+
+print(rw_run(rw_production(SOURCE), True).stdout.strip())
+
+RW_MUTANTS = (
+    ("a heap-backed rewind inside an old save is left standing",
+     "   if (!g_rw_pool &&\n       !(g_pwr_parked && g_rw_on && fe_host_rewind_unvetted()))",
+     "   if (!g_rw_pool)",
+     "suspends == 1 && !g_rw_on && g_rw_asleep"),
+    ("a heap-backed rewind is ended with the loop running",
+     "!(g_pwr_parked && g_rw_on && fe_host_rewind_unvetted())",
+     "!(g_rw_on && fe_host_rewind_unvetted())",
+     "suspends == 0 && g_rw_on && holds == 1"),
+    ("every heap-backed rewind is ended",
+     "!(g_pwr_parked && g_rw_on && fe_host_rewind_unvetted())",
+     "!(g_pwr_parked && g_rw_on)",
+     "suspends == 0 && g_rw_on && !g_rw_asleep"),
+)
+for label, old, new, expect in RW_MUTANTS:
+    bad_src = SOURCE.replace(old, new, 1)
+    assert bad_src != SOURCE, label
+    bad = rw_run(rw_production(bad_src), False)
     assert expect in bad.stderr, (label, bad.stderr)
     print("mutant (%s): failed as it must" % label)

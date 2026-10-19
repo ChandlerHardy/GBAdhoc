@@ -702,6 +702,11 @@ static volatile int audio_output_error;
  * ratio anywhere else. */
 unsigned in_rate = 32768;
 static SceUID audio_thid = -1;
+/* The worker's sceAudio channel while it holds one.  It gives the channel
+ * back on its way out; a worker terminated in its output (audio_stop) never
+ * gets there, so the stop does, or each restart would take another of the
+ * eight until the game went silent. */
+static volatile int audio_ch = -1;
 
 /* Resampler phase increment, 16.16, read fresh by the audio thread on every
  * output chunk.  Normally (in_rate << 16) / OUT_RATE.  ADR-0027 lowers it in
@@ -843,6 +848,7 @@ static int audio_thread(SceSize args, void *argp)
       audio_running = 0;
       return 0;
    }
+   audio_ch = ch;
 
    while (audio_running)
    {
@@ -930,6 +936,9 @@ static int audio_thread(SceSize args, void *argp)
       }
    }
 
+   /* Cleared first: a stop that terminates us from here on finds nothing
+    * left to release. */
+   audio_ch = -1;
    sceAudioChRelease(ch);
    return 0;
 }
@@ -969,7 +978,8 @@ static void audio_ring_reset(void)
 }
 
 /* Returns 0 = joined (the worker released its channel on the way out),
- * 1 = there was no worker, < 0 = the join timed out and it was terminated. */
+ * 1 = there was no worker, < 0 = the join timed out and it was terminated
+ * (its channel released here). */
 #define AUDIO_JOIN_US 1000000u
 static int audio_stop(void)
 {
@@ -982,7 +992,15 @@ static int audio_stop(void)
       SceUInt tmo = AUDIO_JOIN_US;
       rc = sceKernelWaitThreadEnd(audio_thid, &tmo);
       if (rc < 0)
+      {
          sceKernelTerminateDeleteThread(audio_thid);
+         /* Terminated in its output, it still holds its channel. */
+         if (audio_ch >= 0)
+         {
+            sceAudioChRelease(audio_ch);
+            audio_ch = -1;
+         }
+      }
       else
       {
          sceKernelDeleteThread(audio_thid);
@@ -2027,8 +2045,9 @@ static volatile int g_pwr_parked;
  *                   up to PWR_QUIESCE_WAIT_US: the quiesce's own worst
  *                   case, so the callback never gives up on a loop that is
  *                   only slow.  A loop still quiescing past even that keeps
- *                   the gameplay lock and drops it itself once parked
- *                   (sleep_park_hold), so the suspend never lands mid-I/O.
+ *                   the gameplay lock, parked, until the SUSPENDING that
+ *                   follows has torn down (sleep_park_hold), so the suspend
+ *                   never lands mid-I/O or with the renderer up.
  * Everything blocking runs on the EMULATION thread, never here: it owns the
  * ROM handle and the core, and joining the audio and writer threads from it
  * cannot deadlock against this callback thread (0x11), which outranks them.
@@ -2224,9 +2243,10 @@ static int power_cb(int unknown, int pwrflags, void *common)
       }
       /* Nobody parked will drop the gameplay power lock (a menu, standby
        * = 0): drop it here, or the suspend would wait for it forever.  A
-       * loop that acknowledged and is still quiescing drops it itself once
-       * parked (sleep_park_hold): dropped here, the suspend would land with
-       * it inside a join, a .sav write or the radio's teardown. */
+       * loop that acknowledged and is still quiescing drops it itself, once
+       * parked and torn down (sleep_park_hold): dropped here, the suspend
+       * would land with it inside a join, a .sav write or the radio's
+       * teardown. */
       if (!g_pwr_parked && !g_pwr_park_ack)
          play_lock_drop("cb");
       /* Give the writer a real chance to land the .sav and this line before
@@ -3439,7 +3459,13 @@ static void sleep_park_hold(void)
       /* The callback is done with us: it held us (cb_done), or gave up and
        * left the lock to us (park_req cleared). */
       int cb_over = g_pwr_cb_done || !g_pwr_park_req;
-      if (cb_over)
+      /* Dropped only once a teardown has run for this sleep.  A callback
+       * that gave up tore nothing down: the lock is kept until the
+       * SUSPENDING that follows (delivered with it held) finds us parked
+       * and does, or the hold runs out and play resumes.  Dropped at once,
+       * the suspend would land with the renderer in the volatile
+       * partition. */
+      if (g_pwr_cb_done)
       {
          play_lock_drop("park");
 #ifdef REWIND
@@ -10496,10 +10522,17 @@ static void *psp_rewind_pool_offer(size_t *bytes)
 }
 
 /* The pool is about to go back to the OS (a sleep).  The main loop is
- * parked between frames, or is not emulating at all. */
+ * parked between frames, or is not emulating at all.
+ *
+ * A heap-backed rewind keeps its history across the sleep -- unless the
+ * machine stands inside an old save: its hold (psp_rewind_pwr) would then
+ * keep the suspend off until the park's hold gave up, and the slide would
+ * be lost.  With the loop parked it is ended here as the pool's is, and
+ * fe_host_rewind_suspend decides it (vetted frame, or the game is reset). */
 static void psp_rewind_pool_lost(void)
 {
-   if (!g_rw_pool)
+   if (!g_rw_pool &&
+       !(g_pwr_parked && g_rw_on && fe_host_rewind_unvetted()))
       return;
    if (g_rw_on)
    {

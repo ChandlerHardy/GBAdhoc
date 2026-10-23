@@ -316,7 +316,7 @@ mutant(MAIN, "else if (g_pwr_parked && !g_pwr_park_browser)",
 mutant(MAIN, "   audio = sq_audio_stop(NULL);\n",
        "   audio = SQ_NONE;\n", "sound left running", "audio_running == 0")
 # Sound not given back after the wake.
-mutant(MAIN, "      (void)sq_audio_start(NULL);\n", "      ;\n",
+mutant(MAIN, "      (void)sq_audio_start(NULL);\n", "      (void)0;\n",
        "no sound after the wake", "audio_running == 1")
 # The hook left registered after the list returns (a game loop would then
 # have a stale hook in ui_psp.c).

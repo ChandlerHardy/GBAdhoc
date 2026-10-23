@@ -1995,6 +1995,20 @@ static int psp_rewind_pool_tenant(void);   /* the pool's second tenant */
 #endif
 static int me_rend_release_vmem(void);
 static void standby_note(const char *fmt, ...);   /* defined below */
+/* SLEEPDIAG (diag/A2+B2-notes only): where the main thread is, for the
+ * standby trail -- a sleep that powers the console off is told apart by this
+ * more than by anything else.  Noted only when it changes, so the game loop's
+ * per-frame set costs a pointer compare.  Compiled out with the notes. */
+#if !defined(GPSP_NO_TELEMETRY) || defined(GPSP_STANDBY_NOTES)
+static const char *volatile g_diag_where = "boot";
+static void sleep_inventory(const char *tag);      /* defined below */
+#define DIAG_WHERE(s_) do { if (g_diag_where != (s_)) { g_diag_where = (s_); \
+                                standby_note("where %s", (s_)); } } while (0)
+#define DIAG_INVENTORY(t_) sleep_inventory(t_)
+#else
+#define DIAG_WHERE(s_)     ((void)0)
+#define DIAG_INVENTORY(t_) ((void)0)
+#endif
 static int  me_rend_active(void);                 /* renderer, defined below */
 static volatile int g_pwr_slept;     /* we tore the engine down for a sleep */
 static volatile int g_pwr_had_host;  /* the ME module was up when we slept */
@@ -2106,6 +2120,8 @@ static int power_cb(int unknown, int pwrflags, void *common)
                    (unsigned)pwrflags,
                    !!(pwrflags & PSP_POWER_CB_POWER_SWITCH),
                    !!(pwrflags & PSP_POWER_CB_SUSPENDING), g_pwr_slept);
+   if (pwrflags & (PSP_POWER_CB_POWER_SWITCH | PSP_POWER_CB_SUSPENDING))
+      DIAG_INVENTORY("cb_in");
    if (pwrflags & (PSP_POWER_CB_POWER_SWITCH | PSP_POWER_CB_SUSPENDING))
       g_pwr_sleep_pending = 1;
    /* Once the work is done for this sleep (the switch normally arrives first
@@ -2260,6 +2276,7 @@ static int power_cb(int unknown, int pwrflags, void *common)
        * the kernel's to grant -- but it is the difference between usually
        * losing progress and usually not. */
       sceKernelDelayThread(80000);
+      DIAG_INVENTORY("cb_out");
       standby_note("cb out us=%u parked=%d hold=%d",
                    (unsigned)sceKernelGetSystemTimeLow() - cb_t0,
                    g_pwr_parked, held);
@@ -2274,6 +2291,8 @@ static int power_cb(int unknown, int pwrflags, void *common)
    }
    if (pwrflags & PSP_POWER_CB_RESUMING)
       fe_evt("power resuming");
+   if (pwrflags & PSP_POWER_CB_RESUMING)
+      standby_note("resuming flags=0x%08X", (unsigned)pwrflags);
    if (pwrflags & PSP_POWER_CB_RESUME_COMPLETE)
    {
       g_pwr_resume++;
@@ -2344,6 +2363,7 @@ void pwr_release(void)
       FE_EVT_ONLY(ms);
       scePowerUnlock(0);
       fe_evt("pwr_hold why=%s ms=%u", g_pwr_hold_why, ms);
+      standby_note("pwr_release why=%s ms=%u", g_pwr_hold_why, ms);
    }
 }
 static void pwr_release_all(void)
@@ -3070,6 +3090,17 @@ static void standby_note(const char *fmt, ...)
    va_end(ap);
    if (n < 0)
       return;
+   {
+      /* SLEEPDIAG: the trail never made its own directory; one mkdir per
+       * boot (an existing one just fails). */
+      static int made;
+      if (!made)
+      {
+         made = 1;
+         snprintf(path, sizeof(path), "%s/log", g_dir_base);
+         sceIoMkdir(path, 0777);
+      }
+   }
    snprintf(path, sizeof(path), "%s/log/standby.log", g_dir_base);
    fh = fopen(path, "a");
    if (!fh)
@@ -3417,6 +3448,127 @@ static const sleep_q_ops g_sq_ops = {
    sq_net_term,
    sq_note
 };
+
+#if !defined(GPSP_NO_TELEMETRY) || defined(GPSP_STANDBY_NOTES)
+/* SLEEPDIAG: A CENSUS OF WHAT IS LIVE, at the callback's entry and again
+ * just before it returns (what the suspend that follows lands on): where the
+ * main thread is, the handshake's flags, our threads with state / wait type /
+ * priority, our handles and modules.  Ported from 6ac303a's sleep_inventory,
+ * every sleep rather than once.  One open/close for the whole block, so it
+ * is on the stick (FAT commits on close) before anything is torn down.
+ * Static buffers: this runs on the callback thread, whose stack is 4000
+ * bytes; the callback is never re-entered. */
+static void sleep_inventory(const char *tag)
+{
+   static SceUID ids[128];
+   static char text[3072];
+   static SceKernelThreadInfo ti;
+   static SceKernelModuleInfo mi;
+   unsigned now = (unsigned)sceKernelGetSystemTimeLow();
+   size_t len = 0, line0;
+   int cnt = 0, i, rc, vml = -1;
+   char path[160];
+   FILE *fh;
+
+#define INV_ADD(...)                                                          \
+   do {                                                                       \
+      if (len < sizeof(text))                                                 \
+      {                                                                       \
+         int w_ = snprintf(text + len, sizeof(text) - len, __VA_ARGS__);      \
+         if (w_ > 0)                                                          \
+            len = len + (size_t)w_ < sizeof(text) ? len + (size_t)w_          \
+                                                  : sizeof(text) - 1;         \
+      }                                                                       \
+   } while (0)
+
+#ifdef REWIND
+   vml = g_vm_locked;
+#endif
+   INV_ADD("%u inv %s where=%s park_req=%d ack=%d parked=%d cb_done=%d "
+           "pending=%d slept=%d rebuild=%d sq_down=%d stopped=0x%X "
+           "park_browser=%d\n",
+           now, tag, g_diag_where, g_pwr_park_req, g_pwr_park_ack,
+           g_pwr_parked, g_pwr_cb_done, g_pwr_sleep_pending, g_pwr_slept,
+           g_pwr_rebuild, g_sq.down, g_sq.stopped, g_pwr_park_browser);
+   INV_ADD("%u inv %s audio_thid=%d audio_run=%d audio_ch=%d io_thid=%d "
+           "rom_open=%d evt_open=%d home_mod=%d me_loaded=%d me_up=%d "
+           "me_dead=%d me_rend=%d mer_vmem=%d vm_locked=%d rw_pool=%d "
+           "net_up=%d play_lock=%d pwr_hold=%d hold_why=%s free=%d max=%d\n",
+           now, tag, (int)audio_thid, (int)audio_running, (int)audio_ch,
+           (int)g_io_thid, gamepak_file_large != NULL, fe_evt_is_open(),
+           home_host_loaded(), me_host_loaded(), me_host_up(),
+           me_host_was_dead(), me_rend_active(), me_rend_vmem_held(), vml,
+#ifdef REWIND
+           psp_rewind_pool_tenant(),
+#else
+           0,
+#endif
+           g_net_up, (int)g_pwr_play_lock, g_pwr_hold,
+           g_pwr_hold > 0 ? g_pwr_hold_why : "-",
+           sceKernelTotalFreeMemSize(), sceKernelMaxFreeMemSize());
+
+   rc = sceKernelGetThreadmanIdList(SCE_KERNEL_TMID_Thread, ids, 128, &cnt);
+   INV_ADD("%u inv %s threads rc=%d n=%d self=0x%X\n", now, tag, rc, cnt,
+           (unsigned)sceKernelGetThreadId());
+   if (cnt > 128)
+      cnt = 128;
+   line0 = len;
+   for (i = 0; rc >= 0 && i < cnt; i++)
+   {
+      memset(&ti, 0, sizeof(ti));
+      ti.size = sizeof(ti);
+      if (len - line0 > 150)
+      {
+         INV_ADD("\n");
+         line0 = len;
+      }
+      if (len == line0)
+         INV_ADD("%u inv %s thr", now, tag);
+      /* name:status/waitType/priority (status 1 run 2 ready 4 wait 8 susp
+       * 16 dormant; waitType 2 = delay, 3 = sema, 9 = thread end, ...) */
+      if (sceKernelReferThreadStatus(ids[i], &ti) >= 0)
+         INV_ADD(" %.24s:%X/%d/%X", ti.name, (unsigned)ti.status,
+                 ti.waitType, (unsigned)ti.currentPriority);
+      else
+         INV_ADD(" 0x%X:?", (unsigned)ids[i]);
+   }
+   if (len != line0)
+      INV_ADD("\n");
+
+   cnt = 0;
+   rc = sceKernelGetModuleIdList(ids, 128, &cnt);
+   INV_ADD("%u inv %s modules rc=%d n=%d\n", now, tag, rc, cnt);
+   if (cnt > 128)
+      cnt = 128;
+   line0 = len;
+   for (i = 0; rc >= 0 && i < cnt; i++)
+   {
+      memset(&mi, 0, sizeof(mi));
+      mi.size = sizeof(mi);
+      if (sceKernelQueryModuleInfo(ids[i], &mi) < 0)
+         continue;
+      if (len - line0 > 150)
+      {
+         INV_ADD("\n");
+         line0 = len;
+      }
+      if (len == line0)
+         INV_ADD("%u inv %s mod", now, tag);
+      INV_ADD(" %.27s", mi.name);
+   }
+   if (len != line0)
+      INV_ADD("\n");
+#undef INV_ADD
+
+   snprintf(path, sizeof(path), "%s/log/standby.log", g_dir_base);
+   fh = fopen(path, "a");
+   if (fh)
+   {
+      fputs(text, fh);
+      fclose(fh);
+   }
+}
+#endif
 
 /* Emulation thread, at the park point, before it reports `parked`. */
 static void sleep_quiesce_down(void)
@@ -12969,10 +13121,13 @@ session_top:
          boot_mark("browser");
          boot_timeline_emit();
       }
+      standby_note("browser enter inproc_n=%d", inproc_n);
+      DIAG_WHERE("browser");
       ui_set_browser_park(browser_park);   /* the list parks too */
       br = ui_browser(ROM_DIR, rom_path, sizeof(rom_path),
                           &browser_state_slot, &selected_console);
       ui_set_browser_park(NULL);
+      DIAG_WHERE("load");
       if (br > 0)
       {
          /* Settings changed Media Engine mode, which was latched above.
@@ -13895,6 +14050,7 @@ session_top:
       else
          (void)loop_park();
       loop_unpark("resume");
+      DIAG_WHERE("game");
       /* TYL holds scePowerLock through play. */
       play_lock_take();
 #ifdef REWIND
@@ -15352,6 +15508,7 @@ session_top:
     * while held): put back what it stopped, so the teardown below finds the
     * state it was written for.  The gameplay power lock is play's only. */
    ui_set_wake_yield(NULL);   /* no game loop: nothing to park */
+   DIAG_WHERE("teardown");
    sleep_quiesce_up("loop_exit");
    play_lock_drop("loop_exit");
    pwr_hold("teardown");
@@ -15473,6 +15630,9 @@ session_top:
       {
          /* A fresh boot's per-game state, then the browser again. */
          fe_evt("inproc_return n=%d", inproc_n);
+         standby_note("inproc_return n=%d me_loaded=%d me_dead=%d vmem=%d "
+                      "audio_thid=%d", inproc_n, me_host_loaded(),
+                      me_host_was_dead(), me_rend_vmem_held(), (int)audio_thid);
          inproc_n++;
 #ifdef GPSP_PERF_RIG
          if (g_ss_browser && inproc_n == g_ss_game + 1)
@@ -15511,6 +15671,7 @@ session_top:
          goto session_top;
       }
       fe_evt("inproc_refused why=%s", why);
+      standby_note("inproc_refused why=%s", why);
       g_relaunch = RELAUNCH_GAMELIST;
    }
    audio_stop();

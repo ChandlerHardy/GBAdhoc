@@ -5,9 +5,14 @@
  * the frontend is, so the sampler can split a session frame into: the
  * machines (then the running instance and ITS reg[40]), the sync hash, the
  * cartridge check, the network, the session's own bookkeeping, and the rest
- * of the loop.  Compiles to nothing unless DRPROF_HW. */
+ * of the loop.  Compiles to nothing unless DRPROF_HW, or GPSP_RUNTIME_LOG:
+ * the runtime watchdog reports the word in its stall record (FE_LP_LIVE). */
 #ifndef FE_LINKPROF_H
 #define FE_LINKPROF_H
+
+#if defined(DRPROF_HW) || defined(GPSP_RUNTIME_LOG)
+#define FE_LP_LIVE 1
+#endif
 
 enum
 {
@@ -41,7 +46,7 @@ enum
    FELP_MASK = 31
 };
 
-#ifdef DRPROF_HW
+#ifdef FE_LP_LIVE
 extern volatile unsigned fe_lp_phase;
 static inline unsigned fe_lp_swap(unsigned p)
 {

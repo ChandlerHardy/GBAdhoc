@@ -46,6 +46,14 @@ OBJS = main_psp.o usb_handoff.o icprobe.o heap_trace.o \
        ../gbcore/gbcore_tgbdual_linked.o \
        ../gbcore/gbcore_tgbdual_linked_b.o
 
+# GPSP_RUNTIME_LOG (tools/build.sh runtimelog; docs/BUILD-SWITCHES.md): the
+# runtime log writer and the watchdog's decision.  Linked ONLY when the define
+# is in EXTRA_DEFS, so every other build links exactly the objects it did
+# before -- not even an empty object file joins it.
+ifneq ($(findstring -DGPSP_RUNTIME_LOG,$(EXTRA_DEFS)),)
+OBJS += rt_log.o rt_watch.o
+endif
+
 # Vendored TGB Dual (GB/GBC; gbcore/tgbdual/, from MasterBoy).  Its flags are
 # scoped to its own objects and assigned after the build.mak include, beside
 # the other object rules: GNU89 inline semantics (it defines non-static

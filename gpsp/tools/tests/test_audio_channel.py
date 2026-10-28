@@ -56,6 +56,8 @@ typedef int SceUID;
 #define PSP_AUDIO_VOLUME_MAX 0x8000
 #define THREAD_ATTR_USER 0x80000000
 #define WAIT_TIMEOUT (-0x7FFDFE58)
+/* GPSP_RUNTIME_LOG's chunk beat, off (test_runtime_log.py runs it on). */
+#define RTW_BEAT(n) ((void)0)
 static int16_t audio_ring[RING_FRAMES * 2];
 static volatile unsigned ring_w, ring_r, g_audio_step;
 static volatile unsigned g_audio_starved, g_audio_underruns;

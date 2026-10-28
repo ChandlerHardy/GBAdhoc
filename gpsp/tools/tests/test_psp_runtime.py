@@ -43,6 +43,11 @@ typedef unsigned SceUInt;
 #define IO_WAIT_US 250000
 #define FE_EVT_ONLY(x) ((void)(x))
 #define fe_evt(...) ((void)0)
+/* GPSP_RUNTIME_LOG's beats and marks, off as in every other build
+ * (test_runtime_log.py runs them on). */
+#define RTW_BEAT(n) ((void)0)
+#define RTW_SAV(x) ((void)(x))
+#define RT_IO(on) ((void)0)
 static struct { int log_thread, sram_thread, standby; } g_pcfg;
 static int g_io_run, g_io_sema, log_calls, save_calls, free_calls;
 static int loaded, healthy, idle, sync_ok, sync_calls;

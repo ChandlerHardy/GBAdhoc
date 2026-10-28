@@ -211,6 +211,10 @@ TICK = CHECK + r'''
 #include <stdarg.h>
 #include "rt_watch.h"
 typedef int SceUID;
+#define PSP_POWER_CB_POWER_SWITCH 0x80000000u
+#define PSP_POWER_CB_SUSPENDING 0x00010000u
+#define PSP_POWER_CB_RESUMING 0x00020000u
+#define PSP_POWER_CB_RESUME_COMPLETE 0x00040000u
 /* the real words, as main_psp.c declares them */
 static volatile int g_pwr_sleep_pending, g_pwr_park_req, g_pwr_park_ack;
 static volatile int g_pwr_parked, g_pwr_slept, g_pwr_rebuild, g_wake_menu;
@@ -369,6 +373,27 @@ int main(void)
    play(1); tick();
    CHECK(strstr(last, "stall_end#1 reason=sleep slots=main") != NULL);
    CHECK(records == 1);
+
+   /* h. STEADY STATE: ten minutes of play with the .sav writer busy every
+    *    second and the battery callback chattering -- not one file write.
+    *    A wake, by contrast, is a line. */
+   fresh();
+   for (i = 0; i < 600; i++)
+   {
+      play(1);
+      g_rtw_sav_runs++; g_rtw_sav_blocks += 7;
+      if (i % 30 == 0) { g_rtw_pwr_flags = 0x000010E4u; g_rtw_pwr_n++; }
+      tick();
+   }
+   CHECK(writes == 0 && records == 0);
+   g_rtw_pwr_flags = PSP_POWER_CB_RESUME_COMPLETE; g_rtw_pwr_n++;
+   play(1); tick();
+   CHECK(writes == 1 && strstr(last, "pwr n=") != NULL);
+   /* the .sav counts ride on the lines that are written anyway */
+   for (i = 0; i < 3; i++) { play(0); tick(); }
+   CHECK(records == 1);
+   play(1); tick();
+   CHECK(strstr(last, "stall_clear#1") != NULL && strstr(last, "sav_runs=600 sav_blocks=4200") != NULL);
 
    /* g. a late watchdog says so, and the gap is capped. */
    fresh();
@@ -636,6 +661,14 @@ def main():
         ("no reset after a sleep", MAIN,
          "      rtw_reset(&g_rtw);\n   }\n   else if (dt > RTW_LATE_MS)",
          "   }\n   else if (dt > RTW_LATE_MS)"),
+        ("a .sav line every tick the writer ran", MAIN,
+         "   rtw_sample(now, expect);\n   ev = rtw_step(",
+         "   { static unsigned ss; if (g_rtw_sav_runs != ss) { ss = g_rtw_sav_runs;\n"
+         "     rt_note(\"sav_io runs=%u\", ss); } }\n"
+         "   rtw_sample(now, expect);\n   ev = rtw_step("),
+        ("battery callbacks written", MAIN,
+         "      if (g_rtw_pwr_flags & (PSP_POWER_CB_POWER_SWITCH |",
+         "      if (1 || g_rtw_pwr_flags & (PSP_POWER_CB_POWER_SWITCH |"),
         ("the game loop does not count", MAIN,
          "      LOOP_TOP();\n      FE_LP_SET(FELP_L_TOP);",
          "      FE_LP_SET(FELP_L_TOP);"),

@@ -2599,8 +2599,109 @@ static int g_pwr_hold;
 static const char *g_pwr_hold_why = "";
 static unsigned g_pwr_hold_t0;
 static void sleep_sim_window_enter(const char *why);   /* harness, below */
+
+/* ---- RTW BUSY SPANS (GPSP_RUNTIME_LOG; MAGI f-007/f-003) ------------------
+ * Some jobs are ONE long main-loop iteration by design: Host/Join's radio
+ * bring-up (up to ~15 s), a net teardown (~5 s), a link session's reloads,
+ * a state save or load on a slow stick, Mystery Gift, Share.  Every one runs
+ * under pwr_hold(why), so the hold names the span: while one is open the
+ * main loop is not expected to beat (rtw_expect), up to the span's own bound
+ * -- past that it is watched again, so a span that never ends is still a
+ * stall.  Each span writes a begin and an end line (with its length) from
+ * the main thread; one-off events.  The spans nest with the holds (a net
+ * teardown inside the exit's "teardown" hold is a span; the teardown is
+ * not), and every exit's pwr_release_all ends whatever is open. */
+#ifdef GPSP_RUNTIME_LOG
+#define RTW_BUSY_DEPTH 8
+static const char *g_rtw_busy_stack[RTW_BUSY_DEPTH];  /* per hold level */
+static unsigned g_rtw_busy_t0[RTW_BUSY_DEPTH];
+static const char *volatile g_rtw_busy_why;  /* innermost open span, or NULL */
+static volatile unsigned g_rtw_busy_us;      /* its start (SystemTimeLow)    */
+static volatile unsigned g_rtw_busy_ms;      /* its bound                    */
+
+static unsigned rtw_busy_bound(const char *why)
+{
+   static const struct { const char *why; unsigned ms; } k[] = {
+      { "net", 30000u }, { "mgift", 30000u }, { "share_net", 30000u },
+      { "session", 15000u }, { "state_save", 15000u },
+      { "state_load", 15000u }, { "ss_read", 15000u } };
+   unsigned i;
+   for (i = 0; why && i < sizeof(k) / sizeof(k[0]); i++)
+      if (strcmp(why, k[i].why) == 0)
+         return k[i].ms;
+   return 0;
+}
+
+/* The innermost open span below hold level `top`. */
+static void rtw_busy_current(int top)
+{
+   int i;
+   for (i = top - 1; i >= 0; i--)
+      if (g_rtw_busy_stack[i])
+      {
+         g_rtw_busy_us = g_rtw_busy_t0[i];
+         g_rtw_busy_ms = rtw_busy_bound(g_rtw_busy_stack[i]);
+         g_rtw_busy_why = g_rtw_busy_stack[i];
+         return;
+      }
+   g_rtw_busy_why = NULL;
+}
+
+static void rtw_busy_push(int level, const char *why)
+{
+   unsigned ms = rtw_busy_bound(why);
+   if (level < 0 || level >= RTW_BUSY_DEPTH)
+      return;
+   g_rtw_busy_stack[level] = ms ? why : NULL;
+   if (!ms)
+      return;
+   g_rtw_busy_t0[level] = (unsigned)sceKernelGetSystemTimeLow();
+   g_loop_iter++;                   /* the span starts from a beat */
+   rtw_busy_current(level + 1);     /* marked before its line is written */
+   RT_MAIN_NOTE("busy %s begin bound_ms=%u", why, ms);
+}
+
+/* Ends the span at `level` and any above it (a pwr_release_all collapses
+ * the nesting to level 0). */
+static void rtw_busy_pop(int level)
+{
+   int i, ended = 0;
+   if (level < 0)
+      return;
+   for (i = RTW_BUSY_DEPTH - 1; i >= level; i--)
+   {
+      const char *w = g_rtw_busy_stack[i];
+      if (!w)
+         continue;
+      g_rtw_busy_stack[i] = NULL;
+      ended = 1;
+      RT_MAIN_NOTE("busy %s end ms=%u", w,
+                   ((unsigned)sceKernelGetSystemTimeLow() - g_rtw_busy_t0[i]) /
+                   1000u);
+   }
+   if (ended)
+      g_loop_iter++;                /* ...and ends on one */
+   rtw_busy_current(level);
+}
+
+/* 1 while a span is open and inside its bound. */
+static int rtw_busy_now(void)
+{
+   const char *w = g_rtw_busy_why;
+   return w && ((unsigned)sceKernelGetSystemTimeLow() - g_rtw_busy_us) /
+               1000u < g_rtw_busy_ms;
+}
+#define RTW_BUSY_PUSH(lv, why) rtw_busy_push((lv), (why))
+#define RTW_BUSY_POP(lv)       rtw_busy_pop(lv)
+#else
+#define RTW_BUSY_PUSH(lv, why) ((void)0)
+#define RTW_BUSY_POP(lv)       ((void)0)
+#endif
+/* ---- end RTW BUSY SPANS */
+
 void pwr_hold(const char *why)
 {
+   RTW_BUSY_PUSH(g_pwr_hold, why);
    if (g_pwr_hold++ == 0)
    {
       g_pwr_hold_why = why;
@@ -2613,6 +2714,7 @@ void pwr_release(void)
 {
    if (g_pwr_hold <= 0)
       return;
+   RTW_BUSY_POP(g_pwr_hold - 1);
    if (--g_pwr_hold == 0)
    {
       unsigned ms = ((unsigned)sceKernelGetSystemTimeLow() - g_pwr_hold_t0) /
@@ -10325,6 +10427,9 @@ static SceUID g_rtw_sema = -1;
 static rtw_state g_rtw;
 static unsigned long long g_rtw_t;
 static int g_rtw_quiet;
+/* rtw_record stopped short because a sleep began while it ran: the episode's
+ * stall_end line says so. */
+static int g_rtw_rec_aborted;
 #define RTW_TICK_US  1000000u
 #define RTW_LATE_MS  3000u
 #define RTW_QUIET    0x80000000u      /* rtw_expect: a sleep, touch nothing */
@@ -10335,15 +10440,17 @@ static int g_rtw_quiet;
  * the watchdog then reads and writes nothing.  Main only in play (not under
  * the wake overlay, whose loop is nested in one iteration) and in the
  * teardown; the in-game menu is drawn by the game loop's own iterations, so
- * it beats and needs no exception.  The others while their thread runs. */
+ * it beats and needs no exception -- but not inside a busy span (one long
+ * iteration by design: Host/Join, a state save ...; RTW BUSY SPANS) until
+ * the span overruns its bound.  The others while their thread runs. */
 static unsigned rtw_expect(void)
 {
    unsigned m = 0;
    if (g_pwr_sleep_pending || g_pwr_park_req || g_pwr_park_ack ||
        g_pwr_parked || g_sq.down)
       return RTW_QUIET;
-   if ((g_rtw_mode == RTW_MODE_GAME && !g_wake_hold) ||
-       g_rtw_mode == RTW_MODE_EXIT)
+   if (((g_rtw_mode == RTW_MODE_GAME && !g_wake_hold) ||
+        g_rtw_mode == RTW_MODE_EXIT) && !rtw_busy_now())
       m |= RTW_BIT(RTW_MAIN);
    if (audio_thid >= 0 && audio_running)
       m |= RTW_BIT(RTW_AUDIO);
@@ -10477,19 +10584,21 @@ static void rtw_record(unsigned ev)
    const char *tag = ev == RTW_EV_STALL ? "stall" : "stall_more";
    char t[24];
 
+   g_rtw_rec_aborted = 0;
    snprintf(t, sizeof(t), "%s#%u", tag, g_rtw.episodes);
    rtw_mask_names(slots, sizeof(slots), g_rtw.fresh);
    now = (unsigned)sceKernelGetSystemTimeLow();
    len += rt_line(buf + len, cap - (size_t)len,
                   "%s slots=%s age_ms=main:%u,audio:%u,io:%u,me:%u,home:%u "
                   "mode=%s step=%s running=%d menu=%d wake_hold=%d "
-                  "felp=%u frame=%u hold=%d/%s exit_cb=%u/%u",
+                  "felp=%u frame=%u hold=%d/%s busy=%s exit_cb=%u/%u",
                   t, slots, g_rtw.age_ms[RTW_MAIN], g_rtw.age_ms[RTW_AUDIO],
                   g_rtw.age_ms[RTW_IO], g_rtw.age_ms[RTW_ME],
                   g_rtw.age_ms[RTW_HOME], k_rtw_mode[g_rtw_mode], g_rtw_step,
                   g_running, g_rtw_menu, g_wake_hold,
                   (unsigned)fe_lp_phase, (unsigned)fe_host_frame_count(),
                   g_pwr_hold, g_pwr_hold > 0 ? g_pwr_hold_why : "-",
+                  g_rtw_busy_why ? g_rtw_busy_why : "-",
                   g_rtw_exit_in, g_rtw_exit_out);
    len += rtw_threads(buf + len, cap - (size_t)len, t, me_a, me_b);
    n = stall_line(sl, sizeof(sl), g_loop_iter, &pri0);
@@ -10539,11 +10648,33 @@ static void rtw_record(unsigned ev)
                   rtw_ago(g_rt_io_since[RTIO_OTHER], now),
                   g_rtw_sav_runs, g_rtw_sav_blocks, held, hk, hb, hpop, hfb,
                   g_loop_iter, g_rtw_beat_audio, g_rtw_beat_io);
+   /* A SLEEP THAT BEGAN WHILE THIS RAN (MAGI f-009/f-010).  The tick checked
+    * the sleep words once; the sampling above took ~200 ms and the drop
+    * below takes 300 more.  So look again before main is dropped, before the
+    * write and before the display is asked, and stop -- nothing written,
+    * main as it was -- if the callback has started a sleep.  The tick ends
+    * the episode with "stall_end ... record=aborted" after the wake. */
+   if (rtw_expect() & RTW_QUIET)      /* sampled into a sleep */
+   {
+      g_rtw_rec_aborted = 1;
+      return;
+   }
    /* pri0 < 0 (g_emu_thid not set yet: before the game's boot) leaves the
     * main thread's priority alone. */
    stall_main_drop(pri0);
+   if (rtw_expect() & RTW_QUIET)      /* slid during the drop */
+   {
+      stall_main_restore(pri0);
+      g_rtw_rec_aborted = 1;
+      return;
+   }
    rt_write(buf, len);
    stall_main_restore(pri0);
+   if (rtw_expect() & RTW_QUIET)      /* the display can wait */
+   {
+      g_rtw_rec_aborted = 1;
+      return;
+   }
 
    /* The display and GE drivers, after the block is committed. */
    {
@@ -10589,8 +10720,10 @@ static void rtw_tick(void)
       if (g_rtw.stalled)
       {
          rtw_mask_names(m1, sizeof(m1), g_rtw.stalled);
-         rt_note("stall_end#%u reason=sleep slots=%s", g_rtw.episodes, m1);
+         rt_note("stall_end#%u reason=sleep slots=%s record=%s",
+                 g_rtw.episodes, m1, g_rtw_rec_aborted ? "aborted" : "written");
       }
+      g_rtw_rec_aborted = 0;
       rtw_reset(&g_rtw);
    }
    else if (dt > RTW_LATE_MS)
@@ -10715,16 +10848,20 @@ static void rtw_start(void)
 static void rtw_stop(const char *why)
 {
    SceUInt tmo = 1500000;
+   int joined;
    if (g_rtw_thid < 0)
       return;
-   rt_note("wd stop why=%s step=%s", why, g_rtw_step);
+   /* Stop and join FIRST (MAGI f-011): the exit's only bound is the join's;
+    * the line, from this (main) thread, comes after. */
    g_rtw_run = 0;
    rtw_kick();
-   if (sceKernelWaitThreadEnd(g_rtw_thid, &tmo) < 0)
+   joined = sceKernelWaitThreadEnd(g_rtw_thid, &tmo) >= 0;
+   if (!joined)
       sceKernelTerminateDeleteThread(g_rtw_thid);
    else
       sceKernelDeleteThread(g_rtw_thid);
    g_rtw_thid = -1;
+   rt_note("wd stop why=%s step=%s joined=%d", why, g_rtw_step, joined);
 }
 
 /* A teardown step: its line, and a beat of the main counter so the watchdog
@@ -18158,9 +18295,6 @@ session_top:
    ui_set_wake_yield(NULL);   /* no game loop: nothing to park */
    DIAG_WHERE("teardown");
    RTW_MODE(EXIT);
-   RT_NOTE("loop_exit reason=%s code=%d relaunch=%d frame=%u exit_cb=%u",
-           exit_reason ? exit_reason : "-", exit_code, g_relaunch,
-           fe_host_frame_count(), g_rtw_exit_in);
    sleep_quiesce_up("loop_exit");
    play_lock_drop("loop_exit");
    pwr_hold("teardown");
@@ -18180,8 +18314,12 @@ session_top:
    stall_watch_stop();   /* a clean exit is not a stall */
    /* Menu = HOME: HOME goes back to the system FIRST, before anything below
     * can block -- the handoff screen, a slow SRAM flush, a relaunch. */
-   RT_STEP_IN("home_stop");
    home_host_stop();
+   /* GPSP_RUNTIME_LOG: the exit's first lines come AFTER HOME is back with
+    * the system (MAGI f-013) -- a log write must not delay it. */
+   RT_NOTE("loop_exit reason=%s code=%d relaunch=%d frame=%u exit_cb=%u",
+           exit_reason ? exit_reason : "-", exit_code, g_relaunch,
+           fe_host_frame_count(), g_rtw_exit_in);
    RT_STEP_OUT("home_stop", home_host_loaded());
    drprof_stop(fe_host_frame_count());
    /* ADR-0080: stop the ME, then free our staging buffers (ADR-0080e: no

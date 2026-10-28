@@ -2994,7 +2994,7 @@ static void gbl_drain_bulk(void)
 /* fe_gblink_platform.wait: the platform pumps netdrv (and says whether the
  * display frame has time left); the bulk lane is drained here. */
 static uint32_t gbl_waited_us;      /* this step's absorbed wait, for core_prof */
-#ifdef DRPROF_HW
+#ifdef FE_LP_LIVE
 volatile unsigned fe_lp_phase;      /* fe_linkprof.h */
 #endif
 static int gbl_wait(void *user, uint32_t waited_us)
@@ -3002,7 +3002,7 @@ static int gbl_wait(void *user, uint32_t waited_us)
    int ok;
    unsigned was = 0;
    (void)user;
-#ifdef DRPROF_HW
+#ifdef FE_LP_LIVE
    was = fe_lp_phase;
 #endif
    FE_LP_SET(FELP_NET);
@@ -4527,7 +4527,7 @@ static void gba_cable_frame(uint64_t core_t0)
    uint32_t pad = (host.input_bitmask ? host.input_bitmask() : 0) |
                   injected_mask;
    int st = fe_gblink_state(gbl);
-#ifdef DRPROF_HW
+#ifdef FE_LP_LIVE
    unsigned lp_was = fe_lp_phase;   /* the caller's loop region */
 #endif
    FE_LP_SET(FELP_NET);
@@ -4548,7 +4548,7 @@ static void gba_cable_frame(uint64_t core_t0)
                 (unsigned)fe_np_ack_ride_now());
       }
    }
-#ifdef DRPROF_HW
+#ifdef FE_LP_LIVE
    FE_LP_SET(lp_was);
 #endif
    if (gbl_last != FE_GBLINK_FRAME)

@@ -37,6 +37,8 @@ stub = r'''
 #define fe_evt(...) ((void)0)
 /* SLEEPDIAG's census (main_psp.c sleep_inventory): a no-op here. */
 #define DIAG_INVENTORY(t) ((void)(t))
+/* GPSP_RUNTIME_LOG's flag stamp, off (test_runtime_log.py runs it on). */
+#define RTW_PWR(f) ((void)(f))
 static struct { int standby; } g_pcfg = { 1 };
 static int g_pwr_slept, g_pwr_parked = 1, g_pwr_park_req;
 static int g_pwr_park_ack, g_pwr_cb_done, g_pwr_sleep_pending;

@@ -17,6 +17,7 @@
 #include "lab_ffpace.h"
 #include "ambient_look.h"
 #include "text_fold.h"   /* UTF-8 names drawn folded to ASCII (issue #19) */
+#include "rt_log.h"      /* RT_NOTE: empty without GPSP_RUNTIME_LOG */
 
 /* Callers lay out with VID_LOGO_W/H; the sprite is drawn LOGO_W x LOGO_H. */
 typedef char vid_logo_size_matches_atlas[
@@ -51,6 +52,20 @@ static unsigned int __attribute__((aligned(64))) gu_list[2][8192];
 static int g_gu_cur;       /* index handed out by the last gu_next_list() */
 static int g_gu_queued;    /* finished lists not yet synced, 0..2 */
 static int g_gu_defer;     /* config.ini gu_defer; OFF unless asked */
+
+/* GPSP_RUNTIME_LOG: where the presenting path last was (vid_rt_diag).  An
+ * unbounded sceGuSync is one of the ways the emulation thread can stop, so
+ * the time it went in and came out is kept; a store or two a frame. */
+#ifdef GPSP_RUNTIME_LOG
+static volatile unsigned g_rt_gusync_in, g_rt_gusync_out;
+static volatile unsigned g_rt_swap_us, g_rt_swaps, g_rt_swap_fails;
+static volatile int g_rt_swap_rc;
+#define RTV_GUSYNC_IN(t)  (g_rt_gusync_in = (t) | 1u)
+#define RTV_GUSYNC_OUT()  (g_rt_gusync_out = sceKernelGetSystemTimeLow() | 1u)
+#else
+#define RTV_GUSYNC_IN(t)  ((void)0)
+#define RTV_GUSYNC_OUT()  ((void)0)
+#endif
 
 typedef struct
 {
@@ -413,7 +428,9 @@ void vid_gu_flush(void)
    if (!g_gu_queued)
       return;
    t0 = sceKernelGetSystemTimeLow();
+   RTV_GUSYNC_IN(t0);
    sceGuSync(0, 0);
+   RTV_GUSYNC_OUT();
    d  = sceKernelGetSystemTimeLow() - t0;
    /* Same accumulator the inline sync uses: `wait` means "CPU stalled on the
     * GE" wherever the stall happened, so the A/B is a straight comparison of
@@ -441,7 +458,11 @@ static void gu_end_list(void)
    if (g_gu_defer)
       g_gu_queued++;
    else
+   {
+      RTV_GUSYNC_IN(sceKernelGetSystemTimeLow());
       sceGuSync(0, 0);
+      RTV_GUSYNC_OUT();
+   }
 }
 
 int vid_gu_defer(void) { return g_gu_defer; }
@@ -524,10 +545,13 @@ void vid_init(void)
    sceGuDisplay(GU_TRUE);
 
    g_draw_off = 0;
+   RT_NOTE("display init bufs=%u stride=%d fmt=5650 disp=0x%X", (unsigned)VID_NBUF,
+           FB_STRIDE, (unsigned)FB_BYTES);
 }
 
 void vid_term(void)
 {
+   RT_NOTE("display term queued=%d", g_gu_queued);
    sceGuTerm();
 }
 
@@ -1715,10 +1739,29 @@ int vid_swap(void)
     * NEXTFRAME latches at vblank exactly as it did before -- the change is
     * WHICH buffer we start drawing into next, not when the flip happens. */
    LAB_FFP(lab_ffpace_flip((unsigned)(edram + g_fb_off[g_fb_cur])); __asm__ __volatile__("nop");)  /* nop: vid_swap keeps its hot.ord size */
+#ifdef GPSP_RUNTIME_LOG
+   {
+      int rc = sceDisplaySetFrameBuf((void *)(edram + g_fb_off[g_fb_cur]),
+                                     FB_STRIDE, PSP_DISPLAY_PIXEL_FORMAT_565,
+                                     PSP_DISPLAY_SETBUF_NEXTFRAME);
+      if (rc < 0)
+      {
+         /* Rare by construction; the first few are worth a line each. */
+         g_rt_swap_rc = rc;
+         if (++g_rt_swap_fails <= 8u)
+            RT_NOTE("display setframebuf_failed rc=0x%08X n=%u buf=%u",
+                    (unsigned)rc, g_rt_swap_fails, g_fb_cur);
+         return 0;                    /* retain the complete frame for retry */
+      }
+      g_rt_swap_us = sceKernelGetSystemTimeLow() | 1u;
+      g_rt_swaps++;
+   }
+#else
    if (sceDisplaySetFrameBuf((void *)(edram + g_fb_off[g_fb_cur]),
                          FB_STRIDE, PSP_DISPLAY_PIXEL_FORMAT_565,
                          PSP_DISPLAY_SETBUF_NEXTFRAME) < 0)
       return 0;                       /* retain the complete frame for retry */
+#endif
    g_flip_addr = (edram + g_fb_off[g_fb_cur]) & 0x1fffffffu;
 
    /* Read AFTER submitting: an older pending frame can latch until the
@@ -1754,6 +1797,30 @@ int vid_swap(void)
    return 1;
 #endif
 }
+
+#ifdef GPSP_RUNTIME_LOG
+void vid_rt_diag(vid_rt_info *o)
+{
+   uintptr_t edram = (uintptr_t)sceGeEdramGetAddr();
+   unsigned i;
+   o->gu_queued  = g_gu_queued;
+   o->gusync_in  = g_rt_gusync_in;
+   o->gusync_out = g_rt_gusync_out;
+   o->swap_us    = g_rt_swap_us;
+   o->swaps      = g_rt_swaps;
+   o->swap_fails = g_rt_swap_fails;
+   o->swap_rc    = g_rt_swap_rc;
+#ifdef VID_TRIPLE
+   o->fb_cur     = g_fb_cur;
+   for (i = 0; i < 3u; i++)
+      o->fb_addr[i] = (unsigned)(edram + g_fb_off[i]);
+#else
+   o->fb_cur     = g_draw_off ? 1u : 0u;
+   for (i = 0; i < 3u; i++)
+      o->fb_addr[i] = (unsigned)(edram + (i < 2u ? i * FB_BYTES : 0u));
+#endif
+}
+#endif
 
 int vid_dump_ge(const char *path)
 {

@@ -166,3 +166,14 @@ int home_host_imp_rc(void)
 {
    return g_link.imp_rc;
 }
+
+#ifdef GPSP_RUNTIME_LOG
+void home_host_diag(unsigned *kbeat, unsigned *beat, unsigned *popup_off,
+                    unsigned *fallbacks)
+{
+   if (kbeat)     *kbeat     = g_link.kbeat;
+   if (beat)      *beat      = g_link.beat;
+   if (popup_off) *popup_off = g_link.popup_off;
+   if (fallbacks) *fallbacks = g_link.fallbacks;
+}
+#endif

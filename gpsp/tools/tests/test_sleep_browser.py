@@ -110,6 +110,8 @@ STUB = r'''
 /* SLEEPDIAG's breadcrumbs (main_psp.c DIAG_WHERE / sleep_inventory). */
 #define DIAG_WHERE(s) ((void)(s))
 #define DIAG_INVENTORY(t) ((void)(t))
+/* GPSP_RUNTIME_LOG's flag stamp, off (test_runtime_log.py runs it on). */
+#define RTW_PWR(f) ((void)(f))
 static int inproc_n;
 static struct { int standby; } g_pcfg = { 1 };
 static volatile int g_running = 1;

@@ -576,7 +576,11 @@ def suites(env: Env, baseline: Path | None):
           "python3 tools/tests/test_sleep_menu.py && "
           # A sleep from the game list (after a game was left): the list
           # parks like the game loop (browser_park + ui_browser), mutants.
-          "python3 tools/tests/test_sleep_browser.py")
+          "python3 tools/tests/test_sleep_browser.py && "
+          # GPSP_RUNTIME_LOG: the watchdog's decision (psp/rt_watch.c), its
+          # suppression from the real sleep handshake (main_psp.c), the call
+          # sites that feed it, and mutants (diag/runtime-log).
+          "python3 tools/tests/test_runtime_log.py")
          % (sdk, sdk, sdk)),
 
         ("perf_loop", False, lambda: None,

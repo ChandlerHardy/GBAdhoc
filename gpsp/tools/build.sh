@@ -186,9 +186,28 @@ profile_flags() {   # sets CORE_FLAGS, FE_DEFS, TITLE, KIND
       TITLE="GBAdhoc SLEEPDIAG"
       PSP_MAKE_FLAGS="ME_CATCH=1 PSP_EBOOT_ICON1=assets/gbadhoc_icon1.pmf"
       ;;
+    runtimelog)
+      # sleepdiag, plus a trail of the RUN and a watchdog (2026-10-28): the
+      # PSP-3001 froze in play after a BetterBright brightness change, HOME
+      # still opened, "exit to XMB" hung, and nothing was on the card.
+      #   GPSP_STALL_RECORDER  the loop's iteration/phase words and its 6 s
+      #                        log/stall.txt record (the watchdog reuses it)
+      #   GPSP_RUNTIME_LOG     log/runtime.log: boot (wall clock, plugins),
+      #                        ROM load, states, menu, ME, display, every
+      #                        teardown step, and the 1 s / 2 s watchdog's
+      #                        once-per-episode stall record (psp/rt_log.h)
+      # Without both it IS the sleepdiag build, byte for byte.  Build it as
+      # the release is built (tools/release.sh; a beta sets RFU_SCHED=1):
+      #   RFU_SCHED=1 bash tools/build.sh runtimelog
+      CORE_FLAGS="GPSP_PROFILE=release"
+      FE_DEFS="-DGPSP_PLAYABLE -DGPSP_PROFILE_RELEASE=1 -DGPSP_STANDBY_NOTES
+-DGPSP_STALL_RECORDER -DGPSP_RUNTIME_LOG"
+      TITLE="GBAdhoc RUNTIMELOG"
+      PSP_MAKE_FLAGS="ME_CATCH=1 PSP_EBOOT_ICON1=assets/gbadhoc_icon1.pmf"
+      ;;
     *)
       echo "unknown profile '$1'"
-      echo "usage: tools/build.sh [release|harness|harness64|lab|diagnostic|soak|sleepdiag] [--no-clean] [--out DIR] [--expect TOK]"
+      echo "usage: tools/build.sh [release|harness|harness64|lab|diagnostic|soak|sleepdiag|runtimelog] [--no-clean] [--out DIR] [--expect TOK]"
       exit 2 ;;
   esac
   KIND="$1"
@@ -499,7 +518,8 @@ FORBIDDEN=(); REQUIRE=()
 case "$KIND" in
   release)
     FORBIDDEN=("badjump.txt" "smchisto.txt" "irqchk.txt"
-               "home_stall_frame")   # Menu = HOME stall rig: GPSP_PERF_RIG only
+               "home_stall_frame"    # Menu = HOME stall rig: GPSP_PERF_RIG only
+               "runtime.log" "stall.txt")   # GPSP_RUNTIME_LOG / _STALL_RECORDER
     # ADR-0067: proof the harness ini was pointed at an impossible path, so a
     # leftover .gpsp-harness.ini on a player's card cannot drive their console.
     REQUIRE=(".playable-no-harness")
@@ -512,8 +532,16 @@ case "$KIND" in
     ;;
   sleepdiag)
     # A release plus the standby trail, and nothing else that writes.
-    FORBIDDEN=("badjump.txt" "smchisto.txt" "irqchk.txt" "home_stall_frame")
+    FORBIDDEN=("badjump.txt" "smchisto.txt" "irqchk.txt" "home_stall_frame"
+               "runtime.log" "stall.txt")
     REQUIRE=(".playable-no-harness" "standby.log" "inv %s threads")
+    ;;
+  runtimelog)
+    # sleepdiag plus the runtime log, its watchdog and the stall recorder.
+    FORBIDDEN=("badjump.txt" "smchisto.txt" "irqchk.txt" "home_stall_frame")
+    REQUIRE=(".playable-no-harness" "standby.log" "inv %s threads"
+             "runtime.log" "stall.txt" "gpsp_rtw" "exit_cb in=%u"
+             "%s thr %s id=0x%X st=%X>%X")
     ;;
   diagnostic)
     # The instruments are the point; assert they are really in.

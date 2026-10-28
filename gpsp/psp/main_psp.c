@@ -87,6 +87,11 @@
 #include "me_host.h"
 #include "home_host.h"
 #include "sleep_q.h"
+#include "rt_log.h"       /* RT_NOTE / RT_IO: empty without GPSP_RUNTIME_LOG */
+#ifdef GPSP_RUNTIME_LOG
+#include "rt_watch.h"     /* the runtime watchdog's decision (pure C) */
+#include <pspge.h>        /* sceGeDrawSync(1): the stall record's GE peek */
+#endif
 #include "me/me_mbox.h"   /* me_render_desc, ME_UNCACHED — for the render bench */
 #include "config_psp.h"
 #include "video_prof.h"   /* ADR-0034 renderer path profile (core-side) */
@@ -368,6 +373,73 @@ static volatile int      g_loop_phase;
 #define LOOP_PHASE(p)   do { } while (0)
 #endif
 
+/* ---- GPSP_RUNTIME_LOG: the words the runtime watchdog reads ---------------
+ * (rtw_thread below; log/runtime.log, psp/rt_log.h).  Every one is a plain
+ * store on the thread it describes -- no I/O, no lock -- so the per-frame
+ * cost is a few instructions; the watchdog thread does all of the reading
+ * and the writing.  The main loop's own counter is the stall recorder's
+ * g_loop_iter (LOOP_TOP), which this build requires: the stall record it
+ * writes is that recorder's stall_line, not a second copy of it. */
+#ifdef GPSP_RUNTIME_LOG
+#if defined(GPSP_PLAYABLE) && !defined(GPSP_KEEP_TELEMETRY) && \
+    !defined(GPSP_STALL_RECORDER)
+#error "GPSP_RUNTIME_LOG reuses the stall recorder: add -DGPSP_STALL_RECORDER (tools/build.sh runtimelog)."
+#endif
+static volatile unsigned g_rtw_beat_audio;   /* ++ per audio output chunk  */
+static volatile unsigned g_rtw_beat_io;      /* ++ per writer wait          */
+static volatile unsigned g_rtw_sav_blocks;   /* .sav blocks the writer wrote */
+static volatile unsigned g_rtw_sav_runs;     /* passes that wrote any       */
+/* The exit callback (cb_thread): entered / returned, and what the loop was
+ * doing then.  Written there, reported by the watchdog (rtw_kick). */
+static volatile unsigned g_rtw_exit_in, g_rtw_exit_out, g_rtw_exit_us;
+static volatile unsigned g_rtw_exit_iter;
+static volatile int      g_rtw_exit_phase;
+/* The power callback's last flag word, when, how many; the last wake. */
+static volatile unsigned g_rtw_pwr_flags, g_rtw_pwr_us, g_rtw_pwr_n;
+static volatile unsigned g_rtw_wake_us;
+static SceUID g_rtw_main_thid = -1, g_rtw_cb_thid = -1, g_rtw_thid = -1;
+static void rtw_kick(void);                   /* wake the watchdog now */
+#define RTW_BEAT(n)   (g_rtw_beat_##n++)
+#define RTW_SAV(x)    rtw_sav(x)
+static inline void rtw_sav(int n)
+{
+   if (n > 0)
+   {
+      g_rtw_sav_blocks += (unsigned)n;
+      g_rtw_sav_runs++;
+   }
+}
+#define RTW_EXIT_IN()  (g_rtw_exit_us = (unsigned)sceKernelGetSystemTimeLow(), \
+                        g_rtw_exit_iter = g_loop_iter,                       \
+                        g_rtw_exit_phase = g_loop_phase, g_rtw_exit_in++)
+#define RTW_EXIT_OUT() (g_rtw_exit_out++, rtw_kick())
+#define RTW_PWR(f)     (g_rtw_pwr_flags = (unsigned)(f),                     \
+                        g_rtw_pwr_us = (unsigned)sceKernelGetSystemTimeLow(),  \
+                        g_rtw_pwr_n++,                                        \
+                        ((f) & PSP_POWER_CB_RESUME_COMPLETE)                  \
+                           ? (void)(g_rtw_wake_us = g_rtw_pwr_us | 1u)        \
+                           : (void)0)
+#else
+#define RTW_BEAT(n)    ((void)0)
+#define RTW_SAV(x)     ((void)(x))
+#define RTW_EXIT_IN()  ((void)0)
+#define RTW_EXIT_OUT() ((void)0)
+#define RTW_PWR(f)     ((void)0)
+#endif
+
+/* Events worth a runtime.log line, from the MAIN thread only: the same
+ * function can run on the power callback's thread (me_rend_teardown from
+ * me_standby_down), which must never wait on a file. */
+#ifdef GPSP_RUNTIME_LOG
+#define RT_MAIN_NOTE(...) do { if (sceKernelGetThreadId() == g_rtw_main_thid) \
+                                  rt_note(__VA_ARGS__); } while (0)
+static void rtw_stop(const char *why);
+#define RTW_STOP(why)  rtw_stop(why)
+#else
+#define RT_MAIN_NOTE(...) ((void)0)
+#define RTW_STOP(why)  ((void)0)
+#endif
+
 /* --- fast-forward state --------------------------------------------------
  * 3x batches three emulated frames and presents the final capture.
  * Unlimited and Unlimited Smooth run without vblank pacing and DRAW at most
@@ -401,8 +473,14 @@ static unsigned g_ffw_drawn, g_ffw_gated;
 static int exit_cb(int arg1, int arg2, void *common)
 {
    (void)arg1; (void)arg2; (void)common;
+   /* GPSP_RUNTIME_LOG: stamped here, WRITTEN by the watchdog, which this
+    * wakes.  Never a file write on this thread: it also delivers the power
+    * callback, and a write that waits on a held FAT lock would take both
+    * the exit and the sleep with it. */
+   RTW_EXIT_IN();
    /* Main loop notices, flushes SRAM, logs EVT exit, then exits the game. */
    g_running = 0;
+   RTW_EXIT_OUT();
    return 0;
 }
 
@@ -494,6 +572,9 @@ static void setup_exit_callback(void)
                                     THREAD_ATTR_USER, NULL);
    if (thid >= 0)
       sceKernelStartThread(thid, 0, NULL);
+#ifdef GPSP_RUNTIME_LOG
+   g_rtw_cb_thid = thid;
+#endif
 }
 
 /* ------------------------------------------------- ms0 writer thread ----
@@ -551,17 +632,40 @@ static void io_yield(void)
 
 static const fe_host_io g_io_iface = { io_wake, io_yield };
 
+#ifdef GPSP_RUNTIME_LOG
+/* "INSIDE sceIo SINCE t", one word per thread (rt_log.h rt_io_mark): set
+ * around the .sav writer's pass, standby_note and runtime.log's own writes,
+ * so a stall record says who was in the file system, and for how long, when
+ * everything stopped.  0 = not inside. */
+enum { RTIO_MAIN, RTIO_IO, RTIO_CB, RTIO_WD, RTIO_OTHER, RTIO_N };
+static volatile unsigned g_rt_io_since[RTIO_N];
+void rt_io_mark(int on)
+{
+   SceUID me = sceKernelGetThreadId();
+   int k = me == g_rtw_main_thid ? RTIO_MAIN
+         : me == g_io_thid       ? RTIO_IO
+         : me == g_rtw_cb_thid   ? RTIO_CB
+         : me == g_rtw_thid      ? RTIO_WD : RTIO_OTHER;
+   g_rt_io_since[k] = on ? ((unsigned)sceKernelGetSystemTimeLow() | 1u) : 0u;
+}
+#endif
+
 static int io_thread(SceSize args, void *argp)
 {
    (void)args; (void)argp;
    while (g_io_run)
    {
       SceUInt tmo = IO_WAIT_US;
+      RTW_BEAT(io);
       sceKernelWaitSema(g_io_sema, 1, &tmo);
       if (g_pcfg.log_thread)
          fe_evt_service();
       if (g_pcfg.sram_thread)
-         fe_host_sram_service_io();
+      {
+         RT_IO(1);
+         RTW_SAV(fe_host_sram_service_io());
+         RT_IO(0);
+      }
    }
    /* The other service can still belong to the main thread. A logging-only
     * worker must never become a second consumer of the SRAM block queue. */
@@ -886,6 +990,7 @@ static int audio_thread(SceSize args, void *argp)
    while (audio_running)
    {
       int i;
+      RTW_BEAT(audio);
       /* ADR-0027: re-read once per chunk (~23 ms), not per sample — the pace
        * target moves at most once a second and a chunk boundary is the
        * natural place to take the step change. */
@@ -1842,6 +1947,7 @@ static void me_video_teardown(const char *why, int permanent)
    g_me_video = 0;
    if (permanent)
       g_me_video_cfg = 0;
+   RT_MAIN_NOTE("me_video off why=%s permanent=%d", why, permanent);
    /* No gba_screen_pixels to restore — ADR-0080e never reassigns it. */
    g_me_stage_ready = g_me_stage_pending = -1;
    g_me_vmiss = 0;
@@ -2250,6 +2356,7 @@ void psp_clock_apply(const char *why)
 static int power_cb(int unknown, int pwrflags, void *common)
 {
    (void)unknown; (void)common;
+   RTW_PWR(pwrflags);           /* GPSP_RUNTIME_LOG: two stores, no I/O */
    /* Log the raw flag word, before any delay or teardown, while the writer
     * can still get it to the stick.  A manual slide can arrive as
     * POWER_SWITCH without SUSPENDING (the later SUSPENDING must not tear
@@ -2535,7 +2642,8 @@ static void pwr_release_all(void)
  * relaunch_eboot and sceKernelExitGame drop every hold first.  (A macro's own
  * name is not re-expanded inside it, so these call the real functions.) */
 #define handoff_run(code, why) (pwr_release_all(), LAB_HANDOFF((code), (why), handoff_run))
-#define sceKernelExitGame() (pwr_release_all(), sceKernelExitGame())
+#define sceKernelExitGame() (pwr_release_all(), RTW_STOP("exit_game"), \
+                             sceKernelExitGame())
 
 #ifdef GPSP_PERF_RIG
 /* ---- THE SLEEP SIMULATOR (harness only) -----------------------------------
@@ -3258,6 +3366,8 @@ static void me_rend_teardown(const char *why)
    g_mer_pending = g_mer_ready = g_mer_last_presented = -1;
    fe_evt("me_rend off reason=%s frames=%u drops=%u", why,
           g_mer_frames, g_mer_drops);
+   RT_MAIN_NOTE("me_rend off why=%s frames=%u drops=%u", why,
+                (unsigned)g_mer_frames, (unsigned)g_mer_drops);
 }
 
 static int me_rend_init(void);   /* defined below */
@@ -3496,11 +3606,16 @@ static void standby_note(const char *fmt, ...)
       }
    }
    snprintf(path, sizeof(path), "%s/log/standby.log", g_dir_base);
+   RT_IO(1);
    fh = fopen(path, "a");
    if (!fh)
+   {
+      RT_IO(0);
       return;
+   }
    fprintf(fh, "%u %s\n", (unsigned)sceKernelGetSystemTimeLow(), line);
    fclose(fh);                        /* the close IS the commit */
+   RT_IO(0);
 #endif
 }
 
@@ -3999,12 +4114,14 @@ static void sleep_inventory(const char *tag)
 #undef INV_ADD
 
    snprintf(path, sizeof(path), "%s/log/standby.log", g_dir_base);
+   RT_IO(1);
    fh = fopen(path, "a");
    if (fh)
    {
       fputs(text, fh);
       fclose(fh);
    }
+   RT_IO(0);
 }
 #endif
 
@@ -4191,8 +4308,11 @@ static void me_rend_resume(void)
       g_mer_heap_pending_drain = 0;
    }
    if (g_me_rend_cfg && !g_me_rend && me_host_up())
+   {
       if (me_rend_init() != 0)
          fe_evt("me_rend resume_failed (CPU rendering)");
+      RT_MAIN_NOTE("me_rend resume on=%d vmem=%d", g_me_rend, g_mer_vmem);
+   }
 }
 
 static int me_rend_init(void)
@@ -5264,7 +5384,17 @@ static int state_save_slot(const char *slot1_path, unsigned slot)
     * sequence: loaded later, it would finish that over a newer save). */
    (void)psp_rewind_land("state_save", 0);
 #endif
+#ifdef GPSP_RUNTIME_LOG
+   {
+      unsigned rt_t0 = (unsigned)sceKernelGetSystemTimeLow();
+      rt_note("state_save begin slot=%u", slot);
+      rc = state_save_slot_io(slot1_path, slot);
+      rt_note("state_save end slot=%u rc=%d ms=%u", slot, rc,
+              ((unsigned)sceKernelGetSystemTimeLow() - rt_t0) / 1000u);
+   }
+#else
    rc = state_save_slot_io(slot1_path, slot);
+#endif
    pwr_release();
    return rc;
 }
@@ -7069,6 +7199,7 @@ static const char *inproc_refusal(int have_variant)
 static void relaunch_eboot(int gamelist)
 {
    pwr_release_all();
+   RTW_STOP("relaunch");
    char eboot[160 + sizeof(RELAUNCH_ARGV1)];
    size_t n;
    struct SceKernelLoadExecVSHParam param;
@@ -9896,12 +10027,15 @@ static int stall_refer(SceUID thid, SceKernelThreadInfo *ti)
    return thid < 0 ? -1 : sceKernelReferThreadStatus(thid, ti);
 }
 
-static void stall_record(unsigned iter)
+/* The stall record's line: the main thread sampled twice 100 ms apart (is it
+ * running: run+), the phase, the ME mailbox, the guest's pc/lr, audio and io.
+ * Also the runtime watchdog's (rtw_record): one format, two files.  *pri0 gets
+ * the main thread's priority as sampled (-1 if it could not be). */
+static int stall_line(char *line, size_t cap, unsigned iter, int *pri0)
 {
    SceKernelThreadInfo m0, m1, au, io;
-   char line[512], path[176];
    unsigned cs = 0, ds = 0, is = 0, b0 = 0, b1 = 0;
-   int n, fd, rm0, rm1, rau, rio;
+   int n, rm0, rm1, rau, rio;
 
    me_host_diag(&cs, &ds, &is, &b0);
    rm0 = stall_refer(g_emu_thid, &m0);
@@ -9910,7 +10044,8 @@ static void stall_record(unsigned iter)
    rm1 = stall_refer(g_emu_thid, &m1);
    rau = stall_refer(audio_thid, &au);
    rio = stall_refer(g_io_thid, &io);
-   n = snprintf(line, sizeof(line),
+   *pri0 = rm1 >= 0 ? m1.currentPriority : -1;
+   n = snprintf(line, cap,
                 "stall t=%u iter=%u phase=%d frame=%u rend=%d "
                 "me_cmd=%u me_done=%u me_input=%u me_beat=%u->%u "
                 "ring=%u pc=%08x lr=%08x "
@@ -9925,30 +10060,52 @@ static void stall_record(unsigned iter)
                    ? (unsigned)(m1.runClocks.low - m0.runClocks.low) : 0u,
                 rau, au.status, au.waitType, rio, io.status, io.waitType);
    if (n <= 0)
-      return;
-   if (n >= (int)sizeof(line))
-      n = (int)sizeof(line) - 1;
+      return 0;
+   if (n >= (int)cap)
+      n = (int)cap - 1;
 #ifdef GBA_LINK
    /* the machine pair's position, appended to the same line */
-   if (n > 0 && line[n - 1] == '\n' && n < (int)sizeof(line) - 2)
+   if (n > 0 && line[n - 1] == '\n' && n < (int)cap - 2)
    {
       int k;
       line[n - 1] = ' ';
-      k = fe_gbadual_probe(line + n, sizeof(line) - (size_t)n - 1);
+      k = fe_gbadual_probe(line + n, cap - (size_t)n - 1);
       if (k > 0)
-         n += (k < (int)sizeof(line) - n - 1) ? k : (int)sizeof(line) - n - 2;
+         n += (k < (int)cap - n - 1) ? k : (int)cap - n - 2;
       line[n++] = '\n';
    }
 #endif
-   /* A main thread SPINNING at 0x20 starves the io thread (0x22), which may
-    * be parked inside the FAT driver holding its lock -- and then our own
-    * sceIoOpen below would block and read as "no file = CPU halted".  Drop
-    * main below io for the write (this also lets the writer drain the event
-    * ring into frontend.log), then put it back in case this was a false
-    * alarm. */
-   if (rm1 >= 0 && m1.currentPriority < 0x30)
+   return n;
+}
+
+/* A main thread SPINNING at 0x20 starves the io thread (0x22), which may be
+ * parked inside the FAT driver holding its lock -- and then our own sceIoOpen
+ * would block and read as "no file = CPU halted".  Drop main below io for the
+ * write (this also lets the writer drain the event ring into frontend.log),
+ * then put it back in case this was a false alarm.  pri0 < 0: not sampled,
+ * leave it alone. */
+static void stall_main_drop(int pri0)
+{
+   if (pri0 >= 0 && pri0 < 0x30)
       sceKernelChangeThreadPriority(g_emu_thid, 0x30);
    sceKernelDelayThread(300000);
+}
+
+static void stall_main_restore(int pri0)
+{
+   if (pri0 >= 0 && pri0 < 0x30)
+      sceKernelChangeThreadPriority(g_emu_thid, pri0);
+}
+
+static void stall_record(unsigned iter)
+{
+   char line[512], path[176];
+   int n, fd, pri0;
+
+   n = stall_line(line, sizeof(line), iter, &pri0);
+   if (n <= 0)
+      return;
+   stall_main_drop(pri0);
    snprintf(path, sizeof(path), "%s/stall.txt", LOG_DIR);
    fd = sceIoOpen(path, PSP_O_WRONLY | PSP_O_CREAT | PSP_O_APPEND, 0777);
    if (fd >= 0)
@@ -9956,8 +10113,7 @@ static void stall_record(unsigned iter)
       sceIoWrite(fd, line, (SceSize)n);
       sceIoClose(fd);
    }
-   if (rm1 >= 0 && m1.currentPriority < 0x30)
-      sceKernelChangeThreadPriority(g_emu_thid, m1.currentPriority);
+   stall_main_restore(pri0);
 }
 
 #ifdef GPSP_PERF_RIG
@@ -10114,6 +10270,477 @@ static void stall_watch_stop(void)
 #else
 #define stall_watch_start() do { } while (0)
 #define stall_watch_stop()  do { } while (0)
+#endif
+
+#ifdef GPSP_RUNTIME_LOG
+/* ---- THE RUNTIME WATCHDOG (GPSP_RUNTIME_LOG; log/runtime.log) -------------
+ *
+ * 2026-10-27: a PSP-3001 froze in Fire Emblem right after a BetterBright
+ * brightness change; HOME still opened, "exit to XMB" hung, and nothing was
+ * on the card -- standby.log covers only sleep/wake.  This thread exists so
+ * the NEXT hang during play leaves "which thread stopped, where, and on
+ * what" on the stick.
+ *
+ * ONE THREAD at 0x10, the stall recorder's priority: it must outrank the
+ * emulation thread (0x2B in a player's build), or a spinning main loop would
+ * starve the very thing watching it.  It costs nothing while things move: it
+ * waits on its semaphore a second at a time, compares five counters, and
+ * writes nothing.  Each tick (rtw_step, psp/rt_watch.c) asks which counter
+ * has been still for > 2 s while it is expected to move (rtw_expect):
+ *   main   g_loop_iter (LOOP_TOP; a teardown step bumps it too)
+ *   audio  the worker's chunk loop     io    the writer's wait loop
+ *   me     the ME dispatcher's own heartbeat (mailbox)
+ *   home   the HOME module's poll (Menu = HOME only)
+ * ONCE per episode it writes the full record (rtw_record): which slots, the
+ * stall recorder's own stall_line, four threads sampled twice 100 ms apart
+ * (status / wait type and object / priority / run time), the ME mailbox
+ * twice, the GE and present words, the power handshake, who is inside
+ * sceIo, then -- after that block is on the stick -- the display's own
+ * answers.  Then one line per slot that joins, and one when it clears.
+ *
+ * SLEEP.  It never blocks a sleep: it holds nothing the power callback or the
+ * park waits for, it does no I/O while any phase of a sleep is in force
+ * (RTW_QUIET: sleep pending, park asked / acknowledged / parked, quiesce
+ * down), and it re-primes after one rather than reading the gap as a stall.
+ * The callback sets g_pwr_sleep_pending first and then spends >= 140 ms
+ * (its 60 + 80 ms delays) before the suspend can land, so a line this thread
+ * was already writing has finished before the kernel takes the stick.
+ * EXIT.  It keeps watching the teardown (each step is a line and a beat) and
+ * is stopped and joined by every exit of the process (RTW_STOP in the
+ * sceKernelExitGame wrapper and relaunch_eboot), bounded at 1.5 s, then
+ * terminated.
+ * ITS OWN OPEN CAN BLOCK on a FAT lock held by a thread that cannot run --
+ * the drop of main below io (stall_main_drop, as stall_record does) is there
+ * for exactly that, and a missing record after a hang means it did not help,
+ * not that nothing stalled. */
+enum { RTW_MODE_BOOT, RTW_MODE_BROWSER, RTW_MODE_LOAD, RTW_MODE_GAME,
+       RTW_MODE_EXIT };
+static const char *const k_rtw_mode[] = { "boot", "browser", "load", "game",
+                                          "exit" };
+static volatile int g_rtw_mode;
+static const char *volatile g_rtw_step = "-";
+static volatile int g_rtw_menu;
+static volatile int g_rtw_run;
+static SceUID g_rtw_sema = -1;
+static rtw_state g_rtw;
+static unsigned long long g_rtw_t;
+static int g_rtw_quiet;
+#define RTW_TICK_US  1000000u
+#define RTW_LATE_MS  3000u
+#define RTW_QUIET    0x80000000u      /* rtw_expect: a sleep, touch nothing */
+#define RTW_MODE(m)  (g_rtw_mode = RTW_MODE_##m)
+
+/* WHICH COUNTERS MUST BE MOVING NOW.  RTW_QUIET while any phase of a sleep is
+ * in force -- from the callback's first flag to the quiesce coming back up --
+ * the watchdog then reads and writes nothing.  Main only in play (not under
+ * the wake overlay, whose loop is nested in one iteration) and in the
+ * teardown; the in-game menu is drawn by the game loop's own iterations, so
+ * it beats and needs no exception.  The others while their thread runs. */
+static unsigned rtw_expect(void)
+{
+   unsigned m = 0;
+   if (g_pwr_sleep_pending || g_pwr_park_req || g_pwr_park_ack ||
+       g_pwr_parked || g_sq.down)
+      return RTW_QUIET;
+   if ((g_rtw_mode == RTW_MODE_GAME && !g_wake_hold) ||
+       g_rtw_mode == RTW_MODE_EXIT)
+      m |= RTW_BIT(RTW_MAIN);
+   if (audio_thid >= 0 && audio_running)
+      m |= RTW_BIT(RTW_AUDIO);
+   if (g_io_thid >= 0 && g_io_run)
+      m |= RTW_BIT(RTW_IO);
+   if (!g_pwr_slept && me_host_up())
+      m |= RTW_BIT(RTW_ME);
+   if (home_host_loaded())
+      m |= RTW_BIT(RTW_HOME);
+   return m;
+}
+
+/* The counters.  ME and HOME are read only while expected (a module that
+ * is down has no mailbox / link block worth touching); otherwise the last
+ * value stands, which rtw_step reads as "not moving, not expected". */
+static void rtw_sample(unsigned now[RTW_SLOTS], unsigned expect)
+{
+   now[RTW_MAIN]  = g_loop_iter;
+   now[RTW_AUDIO] = g_rtw_beat_audio;
+   now[RTW_IO]    = g_rtw_beat_io;
+   now[RTW_ME]    = g_rtw.last[RTW_ME];
+   now[RTW_HOME]  = g_rtw.last[RTW_HOME];
+   if (expect & RTW_BIT(RTW_ME))
+      me_host_diag(NULL, NULL, NULL, &now[RTW_ME]);
+   if (expect & RTW_BIT(RTW_HOME))
+      home_host_diag(&now[RTW_HOME], NULL, NULL, NULL);
+}
+
+/* ms since a SystemTimeLow|1 stamp; 0 for "never". */
+static unsigned rtw_ago(unsigned stamp, unsigned now)
+{
+   return stamp ? (now - stamp) / 1000u : 0u;
+}
+
+/* waitType (pspthreadman: 1 sleep 2 delay 3 sema 4 event flag 5 mbox 6 vpl
+ * 7 fpl 8 msgpipe 9 thread end 10 event handler 11 callback 12 mutex 13 lw
+ * mutex), and the object's name where the SDK can ask for it. */
+static void rtw_wait_name(int wt, SceUID wid, char *d, size_t n)
+{
+   static const char *const k_wt[] = { "-", "sleep", "delay", "sema", "evf",
+      "mbox", "vpl", "fpl", "mpipe", "thend", "evh", "cb", "mutex", "lwmutex" };
+   const char *w = wt >= 0 && wt < 14 ? k_wt[wt] : "?";
+   if (wt == 3)
+   {
+      SceKernelSemaInfo si;
+      memset(&si, 0, sizeof(si));
+      si.size = sizeof(si);
+      if (sceKernelReferSemaStatus(wid, &si) >= 0)
+      {
+         snprintf(d, n, "sema:%.24s/%d", si.name, si.currentCount);
+         return;
+      }
+   }
+   else if (wt == 4)
+   {
+      SceKernelEventFlagInfo ei;
+      memset(&ei, 0, sizeof(ei));
+      ei.size = sizeof(ei);
+      if (sceKernelReferEventFlagStatus(wid, &ei) >= 0)
+      {
+         snprintf(d, n, "evf:%.24s/%08X", ei.name, (unsigned)ei.currentPattern);
+         return;
+      }
+   }
+   snprintf(d, n, "%s", w);
+}
+
+/* Four of our threads, twice, 100 ms apart: spinning (status RUNNING/READY
+ * and run time growing) or blocked (WAITING, on what). */
+#define RTW_THREADS 4
+static int rtw_threads(char *d, size_t n, const char *tag, unsigned *me_a,
+                       unsigned *me_b)
+{
+   static SceKernelThreadInfo a[RTW_THREADS], b[RTW_THREADS];
+   static const char *const names[RTW_THREADS] = { "main", "audio", "io",
+                                                   "cb" };
+   SceUID ids[RTW_THREADS];
+   int ra[RTW_THREADS], rb[RTW_THREADS], i, len = 0;
+
+   ids[0] = g_rtw_main_thid;
+   ids[1] = audio_thid;
+   ids[2] = g_io_thid;
+   ids[3] = g_rtw_cb_thid;
+   if (me_a)
+      me_host_diag(&me_a[0], &me_a[1], &me_a[2], &me_a[3]);
+   for (i = 0; i < RTW_THREADS; i++)
+      ra[i] = stall_refer(ids[i], &a[i]);
+   sceKernelDelayThread(100000);
+   if (me_b)
+      me_host_diag(&me_b[0], &me_b[1], &me_b[2], &me_b[3]);
+   for (i = 0; i < RTW_THREADS; i++)
+      rb[i] = stall_refer(ids[i], &b[i]);
+   for (i = 0; i < RTW_THREADS && (size_t)len < n; i++)
+   {
+      char wn[48];
+      if (ra[i] < 0 || rb[i] < 0)
+      {
+         len += rt_line(d + len, n - (size_t)len, "%s thr %s id=0x%X rc=%d/%d",
+                        tag, names[i], (unsigned)ids[i], ra[i], rb[i]);
+         continue;
+      }
+      rtw_wait_name(b[i].waitType, b[i].waitId, wn, sizeof(wn));
+      len += rt_line(d + len, n - (size_t)len,
+                     "%s thr %s id=0x%X st=%X>%X wt=%d>%d wid=0x%X>0x%X(%s) "
+                     "pri=0x%X>0x%X run+%uus intr=%u>%u",
+                     tag, names[i], (unsigned)ids[i], (unsigned)a[i].status,
+                     (unsigned)b[i].status, a[i].waitType, b[i].waitType,
+                     (unsigned)a[i].waitId, (unsigned)b[i].waitId, wn,
+                     (unsigned)a[i].currentPriority,
+                     (unsigned)b[i].currentPriority,
+                     (unsigned)(b[i].runClocks.low - a[i].runClocks.low),
+                     (unsigned)a[i].intrPreemptCount,
+                     (unsigned)b[i].intrPreemptCount);
+   }
+   return len;
+}
+
+/* THE RECORD, once per episode.  Everything that needs no hooked call is
+ * sampled first and written as one block with main dropped below io; only
+ * then the display and GE driver are asked, in a second line, so a call
+ * that hangs (a display hook) cannot take the first block with it. */
+static void rtw_record(unsigned ev)
+{
+   static char buf[3584], sl[512];
+   char slots[48], held[16];
+   unsigned me_a[4] = { 0 }, me_b[4] = { 0 }, now;
+   unsigned hk = 0, hb = 0, hpop = 0, hfb = 0;
+   int len = 0, n, pri0 = -1;
+   size_t cap = sizeof(buf);
+   vid_rt_info v;
+   const char *tag = ev == RTW_EV_STALL ? "stall" : "stall_more";
+   char t[24];
+
+   snprintf(t, sizeof(t), "%s#%u", tag, g_rtw.episodes);
+   rtw_mask_names(slots, sizeof(slots), g_rtw.fresh);
+   now = (unsigned)sceKernelGetSystemTimeLow();
+   len += rt_line(buf + len, cap - (size_t)len,
+                  "%s slots=%s age_ms=main:%u,audio:%u,io:%u,me:%u,home:%u "
+                  "mode=%s step=%s running=%d menu=%d wake_hold=%d "
+                  "felp=%u frame=%u hold=%d/%s exit_cb=%u/%u",
+                  t, slots, g_rtw.age_ms[RTW_MAIN], g_rtw.age_ms[RTW_AUDIO],
+                  g_rtw.age_ms[RTW_IO], g_rtw.age_ms[RTW_ME],
+                  g_rtw.age_ms[RTW_HOME], k_rtw_mode[g_rtw_mode], g_rtw_step,
+                  g_running, g_rtw_menu, g_wake_hold,
+                  (unsigned)fe_lp_phase, (unsigned)fe_host_frame_count(),
+                  g_pwr_hold, g_pwr_hold > 0 ? g_pwr_hold_why : "-",
+                  g_rtw_exit_in, g_rtw_exit_out);
+   len += rtw_threads(buf + len, cap - (size_t)len, t, me_a, me_b);
+   n = stall_line(sl, sizeof(sl), g_loop_iter, &pri0);
+   if (n > 0)
+   {
+      if (sl[n - 1] == '\n')
+         sl[n - 1] = '\0';
+      len += rt_line(buf + len, cap - (size_t)len, "%s %s", t, sl);
+   }
+   len += rt_line(buf + len, cap - (size_t)len,
+                  "%s me up=%d loaded=%d dead=%d rend=%d video=%d vmem=%d "
+                  "pend=%d ready=%d shown=%d cmd=%u>%u done=%u>%u input=%u>%u "
+                  "beat=%u>%u", t, me_host_up(), me_host_loaded(),
+                  me_host_was_dead(), g_me_rend, g_me_video, g_mer_vmem,
+                  g_mer_pending, g_mer_ready, g_mer_last_presented,
+                  me_a[0], me_b[0], me_a[1], me_b[1], me_a[2], me_b[2],
+                  me_a[3], me_b[3]);
+   vid_rt_diag(&v);
+   now = (unsigned)sceKernelGetSystemTimeLow();
+   len += rt_line(buf + len, cap - (size_t)len,
+                  "%s present gu_queued=%d gusync_in_ms=%u gusync_out_ms=%u "
+                  "in_gusync=%d swap_ms=%u swaps=%u swap_fails=%u swap_rc=0x%X "
+                  "fb_cur=%u", t, v.gu_queued, rtw_ago(v.gusync_in, now),
+                  rtw_ago(v.gusync_out, now),
+                  v.gusync_in && (int)(v.gusync_in - v.gusync_out) > 0,
+                  rtw_ago(v.swap_us, now), v.swaps, v.swap_fails,
+                  (unsigned)v.swap_rc, v.fb_cur);
+   len += rt_line(buf + len, cap - (size_t)len,
+                  "%s pwr flags=0x%08X ms=%u n=%u park_req=%d ack=%d parked=%d "
+                  "pending=%d slept=%d rebuild=%d sq_down=%d since_wake_ms=%u "
+                  "play_lock=%d", t, g_rtw_pwr_flags,
+                  rtw_ago(g_rtw_pwr_us | (g_rtw_pwr_n ? 1u : 0u), now),
+                  g_rtw_pwr_n, g_pwr_park_req, g_pwr_park_ack, g_pwr_parked,
+                  g_pwr_sleep_pending, g_pwr_slept, g_pwr_rebuild, g_sq.down,
+                  rtw_ago(g_rtw_wake_us, now), (int)g_pwr_play_lock);
+   if (home_host_loaded())
+      home_host_diag(&hk, &hb, &hpop, &hfb);
+   snprintf(held, sizeof(held), "%d", home_host_loaded());
+   len += rt_line(buf + len, cap - (size_t)len,
+                  "%s io_in_ms main=%u io=%u cb=%u wd=%u other=%u "
+                  "sav_runs=%u sav_blocks=%u home=%s kbeat=%u beat=%u "
+                  "popup_off=%u fallbacks=%u ctr main=%u audio=%u io=%u",
+                  t, rtw_ago(g_rt_io_since[RTIO_MAIN], now),
+                  rtw_ago(g_rt_io_since[RTIO_IO], now),
+                  rtw_ago(g_rt_io_since[RTIO_CB], now),
+                  rtw_ago(g_rt_io_since[RTIO_WD], now),
+                  rtw_ago(g_rt_io_since[RTIO_OTHER], now),
+                  g_rtw_sav_runs, g_rtw_sav_blocks, held, hk, hb, hpop, hfb,
+                  g_loop_iter, g_rtw_beat_audio, g_rtw_beat_io);
+   /* pri0 < 0 (g_emu_thid not set yet: before the game's boot) leaves the
+    * main thread's priority alone. */
+   stall_main_drop(pri0);
+   rt_write(buf, len);
+   stall_main_restore(pri0);
+
+   /* The display and GE drivers, after the block is committed. */
+   {
+      void *fa = NULL, *fb = NULL;
+      int wa = 0, pa = 0, wb = 0, pb = 0, ra, rb, mode = 0, mw = 0, mh = 0;
+      unsigned vc0, vc1;
+      int ge;
+      vc0 = sceDisplayGetVcount();
+      ra = sceDisplayGetFrameBuf(&fa, &wa, &pa, PSP_DISPLAY_SETBUF_IMMEDIATE);
+      rb = sceDisplayGetFrameBuf(&fb, &wb, &pb, PSP_DISPLAY_SETBUF_NEXTFRAME);
+      sceDisplayGetMode(&mode, &mw, &mh);
+      ge = sceGeDrawSync(1);
+      sceKernelDelayThread(50000);
+      vc1 = sceDisplayGetVcount();
+      rt_note("%s disp vcount=%u>%u fb_now=%p/%d/%d rc=%d fb_next=%p/%d/%d "
+              "rc=%d ours=%08X,%08X,%08X cur=%u mode=%d %dx%d ge_sync=%d "
+              "brightness=n/a(kernel-only)", t, vc0, vc1, fa, wa, pa, ra, fb,
+              wb, pb, rb, v.fb_addr[0], v.fb_addr[1], v.fb_addr[2],
+              v.fb_cur, mode, mw, mh, ge);
+   }
+}
+
+static void rtw_tick(void)
+{
+   static unsigned seen_exit, seen_sav, seen_pwr;
+   unsigned long long t = sceKernelGetSystemTimeWide();
+   unsigned dt = (unsigned)((t - g_rtw_t) / 1000ull);
+   unsigned expect, now[RTW_SLOTS], ev;
+   char m1[48], m2[48];
+
+   g_rtw_t = t;
+   expect = rtw_expect();
+   if (expect & RTW_QUIET)
+   {
+      g_rtw_quiet = 1;               /* asleep, or on the way: no I/O */
+      return;
+   }
+   if (g_rtw_quiet)
+   {
+      /* Back from a sleep's handshake: what was open is not a stall now,
+       * and the gap is not one either.  Start over. */
+      g_rtw_quiet = 0;
+      if (g_rtw.stalled)
+      {
+         rtw_mask_names(m1, sizeof(m1), g_rtw.stalled);
+         rt_note("stall_end#%u reason=sleep slots=%s", g_rtw.episodes, m1);
+      }
+      rtw_reset(&g_rtw);
+   }
+   else if (dt > RTW_LATE_MS)
+      rt_note("wd late ms=%u", dt);   /* held off: by what outranks 0x10 */
+
+   if (g_rtw_pwr_n != seen_pwr)
+   {
+      seen_pwr = g_rtw_pwr_n;
+      rt_note("pwr n=%u flags=0x%08X ms_ago=%u since_wake_ms=%u", seen_pwr,
+              g_rtw_pwr_flags,
+              rtw_ago(g_rtw_pwr_us | 1u, (unsigned)sceKernelGetSystemTimeLow()),
+              rtw_ago(g_rtw_wake_us, (unsigned)sceKernelGetSystemTimeLow()));
+   }
+   if (g_rtw_exit_in != seen_exit)
+   {
+      static char tb[1024];
+      unsigned nowl = (unsigned)sceKernelGetSystemTimeLow();
+      int len;
+      seen_exit = g_rtw_exit_in;
+      len = rt_line(tb, sizeof(tb), "exit_cb in=%u out=%u ms_ago=%u "
+                    "iter_at=%u phase_at=%d iter_now=%u phase_now=%d "
+                    "running=%d mode=%s step=%s stalled=%u", g_rtw_exit_in,
+                    g_rtw_exit_out, rtw_ago(g_rtw_exit_us | 1u, nowl),
+                    g_rtw_exit_iter, g_rtw_exit_phase, g_loop_iter,
+                    g_loop_phase, g_running, k_rtw_mode[g_rtw_mode],
+                    g_rtw_step, g_rtw.stalled);
+      /* Inside an episode, where the threads are NOW (the stall record was
+       * taken before HOME was pressed). */
+      if (g_rtw.stalled)
+         len += rtw_threads(tb + len, sizeof(tb) - (size_t)len, "exit_cb",
+                            NULL, NULL);
+      rt_write(tb, len);
+   }
+   if (g_rtw_sav_runs != seen_sav)
+   {
+      seen_sav = g_rtw_sav_runs;
+      rt_note("sav_io runs=%u blocks=%u", seen_sav, g_rtw_sav_blocks);
+   }
+
+   rtw_sample(now, expect);
+   ev = rtw_step(&g_rtw, now, expect, dt);
+   if (ev == RTW_EV_STALL)
+      rtw_record(ev);
+   else if (ev == RTW_EV_GROW)
+   {
+      rtw_mask_names(m1, sizeof(m1), g_rtw.fresh);
+      rtw_mask_names(m2, sizeof(m2), g_rtw.stalled);
+      rt_note("stall_grow#%u slots=+%s now=%s episode_ms=%u mode=%s step=%s",
+              g_rtw.episodes, m1, m2, g_rtw.episode_ms,
+              k_rtw_mode[g_rtw_mode], g_rtw_step);
+   }
+   else if (ev == RTW_EV_CLEAR)
+   {
+      rtw_mask_names(m1, sizeof(m1), g_rtw.moved & g_rtw.reported);
+      rtw_mask_names(m2, sizeof(m2), g_rtw.dropped);
+      rt_note("stall_clear#%u moved=%s dropped=%s episode_ms=%u mode=%s "
+              "step=%s ctr main=%u audio=%u io=%u me=%u home=%u",
+              g_rtw.episodes, m1, m2, g_rtw.episode_ms,
+              k_rtw_mode[g_rtw_mode], g_rtw_step, now[RTW_MAIN],
+              now[RTW_AUDIO], now[RTW_IO], now[RTW_ME], now[RTW_HOME]);
+   }
+}
+
+static int rtw_thread(SceSize args, void *argp)
+{
+   (void)args; (void)argp;
+   g_rtw_t = sceKernelGetSystemTimeWide();
+   while (g_rtw_run)
+   {
+      SceUInt tmo = RTW_TICK_US;
+      sceKernelWaitSema(g_rtw_sema, 1, &tmo);
+      if (!g_rtw_run)
+         break;
+      rtw_tick();
+   }
+   return 0;
+}
+
+static void rtw_kick(void)
+{
+   if (g_rtw_sema >= 0)
+      sceKernelSignalSema(g_rtw_sema, 1);
+}
+
+/* Main thread, at boot, once the paths are known. */
+static void rtw_start(void)
+{
+   g_rtw_main_thid = sceKernelGetThreadId();
+   rt_log_init(g_dir_base);
+   rtw_reset(&g_rtw);
+   g_rtw_sema = sceKernelCreateSema("gpsp_rtw", 0, 0, 4, NULL);
+   g_rtw_run = 1;
+   g_rtw_thid = g_rtw_sema >= 0
+              ? sceKernelCreateThread("gpsp_rtw", rtw_thread, 0x10, 0x4000,
+                                      THREAD_ATTR_USER, NULL)
+              : -1;
+   if (g_rtw_thid < 0 || sceKernelStartThread(g_rtw_thid, 0, NULL) < 0)
+   {
+      if (g_rtw_thid >= 0)
+         sceKernelDeleteThread(g_rtw_thid);
+      g_rtw_thid = -1;
+      g_rtw_run = 0;
+      rt_note("wd off reason=thread_failed sema=%d", (int)g_rtw_sema);
+      return;
+   }
+   rt_note("wd on prio=0x10 tick_ms=%u limit_ms=%u main=0x%X cb=0x%X wd=0x%X",
+           RTW_TICK_US / 1000u, RTW_LIMIT_MS, (unsigned)g_rtw_main_thid,
+           (unsigned)g_rtw_cb_thid, (unsigned)g_rtw_thid);
+}
+
+/* Every exit of the process (RTW_STOP).  Idempotent. */
+static void rtw_stop(const char *why)
+{
+   SceUInt tmo = 1500000;
+   if (g_rtw_thid < 0)
+      return;
+   rt_note("wd stop why=%s step=%s", why, g_rtw_step);
+   g_rtw_run = 0;
+   rtw_kick();
+   if (sceKernelWaitThreadEnd(g_rtw_thid, &tmo) < 0)
+      sceKernelTerminateDeleteThread(g_rtw_thid);
+   else
+      sceKernelDeleteThread(g_rtw_thid);
+   g_rtw_thid = -1;
+}
+
+/* A teardown step: its line, and a beat of the main counter so the watchdog
+ * times each step on its own. */
+static void rt_step(const char *what, const char *edge, int rc)
+{
+   g_rtw_step = what;
+   g_loop_iter++;
+   rt_note("exit %s %s rc=%d", what, edge, rc);
+}
+#define RTW_START()        rtw_start()
+#define RT_STEP_IN(w)      rt_step((w), "begin", 0)
+#define RT_STEP_OUT(w, rc) rt_step((w), "end", (rc))
+/* The menu's open/close edge, once a loop (a compare; a line on change). */
+#define RTW_MENU(active)   do { int a_ = (active);                          \
+                                if (a_ != g_rtw_menu) { g_rtw_menu = a_;    \
+                                   rt_note("menu %s frame=%u",             \
+                                           a_ ? "open" : "close",          \
+                                           (unsigned)fe_host_frame_count()); \
+                                } } while (0)
+#else
+#define RTW_START()        ((void)0)
+#define RTW_MODE(m)        ((void)0)
+#define RT_STEP_IN(w)      ((void)0)
+#define RT_STEP_OUT(w, rc) ((void)(rc))
+#define RTW_MENU(active)   ((void)0)
 #endif
 
 /* ---- DRPROF_HW: the dynarec time-split sampler (docs/DYNAREC-PROFILE.md) --
@@ -10563,7 +11190,17 @@ static int psp_state_load(const char *path, const char *why)
 #ifdef REWIND
    (void)psp_rewind_land("state_load", 0);   /* (a failed load goes on here) */
 #endif
+#ifdef GPSP_RUNTIME_LOG
+   {
+      unsigned rt_t0 = (unsigned)sceKernelGetSystemTimeLow();
+      rt_note("state_load begin why=%s", why);
+      rc = psp_state_load_io(path, why);
+      rt_note("state_load end why=%s rc=%d ms=%u", why, rc,
+              ((unsigned)sceKernelGetSystemTimeLow() - rt_t0) / 1000u);
+   }
+#else
    rc = psp_state_load_io(path, why);
+#endif
    pwr_release();
    return rc;
 }
@@ -13404,6 +14041,7 @@ int main(int argc, char *argv[])
    psp_clock_capture();
 
    init_paths(argc, argv);
+   RTW_START();                      /* GPSP_RUNTIME_LOG: runtime.log + watchdog */
 #ifdef GPSP_PERF_RIG
    boot_ballast_take();              /* first heap use of the process */
 #endif
@@ -14859,6 +15497,8 @@ session_top:
       int browser_state_slot = 0;
       fe_console_t selected_console = (fe_console_t)g_pcfg.console;
       int br;
+      RTW_MODE(BROWSER);
+      RT_NOTE("browser enter inproc_n=%d", inproc_n);
       if (!inproc_n)
       {
          boot_mark("browser");
@@ -15515,7 +16155,20 @@ session_top:
       fe_host_rewind_prepare(NULL);     /* off: the store paths carry no marks */
    psp_rom_pool_offer();
 #endif
+#ifdef GPSP_RUNTIME_LOG
+   RTW_MODE(LOAD);
+   unsigned rt_load_t0 = (unsigned)sceKernelGetSystemTimeLow();
+   {
+      const char *rb = strrchr(rom_path, '/');
+      rt_note("rom_load begin rom=%s console=%d inproc_n=%d",
+              rb ? rb + 1 : rom_path, g_pcfg.console, inproc_n);
+   }
+#endif
    int boot_rc = fe_host_boot(&cfg);
+#ifdef GPSP_RUNTIME_LOG
+   rt_note("rom_load end rc=%d ms=%u", boot_rc,
+           ((unsigned)sceKernelGetSystemTimeLow() - rt_load_t0) / 1000u);
+#endif
    gpsp_rom_load_progress = NULL;
 #ifdef REWIND
    if (boot_rc == 0 && g_rw_want && g_pcfg.console == FE_CONSOLE_GBA)
@@ -15623,6 +16276,8 @@ session_top:
                snap_pre.kfree -= kf - (unsigned)sceKernelTotalFreeMemSize();
                snap_pre.kmax  -= km - (unsigned)sceKernelMaxFreeMemSize();
             }
+            RT_NOTE("me_host init rc=%d up=%d rend_cfg=%d video=%d",
+                    me_rc, me_host_up(), g_me_rend_cfg, mev);
             if (me_rc < 0 && g_pcfg.standby)
             {
                /* The one failure a player must be TOLD about.  With standby on
@@ -15647,6 +16302,7 @@ session_top:
                    * back to CPU rendering, never breaks the app. */
                   if (me_rend_init() != 0)
                      g_me_rend_cfg = 0;
+                  RT_NOTE("me_rend boot on=%d vmem=%d", g_me_rend, g_mer_vmem);
                }
                else if (mev && gba_screen_pixels)
                {
@@ -15815,6 +16471,9 @@ session_top:
    rig_cfg_audit_report();   /* every harness key has been read by now */
 
    pwr_release();            /* the boot's hold: the loop can park from here */
+   RTW_MODE(GAME);
+   RT_NOTE("game loop enter frame=%u me_rend=%d", fe_host_frame_count(),
+           g_me_rend);
    ui_set_wake_yield(wake_overlay_yield);   /* the pause screen parks too */
    while (g_running)
    {
@@ -16418,6 +17077,7 @@ session_top:
          (void)psp_rewind_land(ui_active() ? "menu" : "pause", 0);
 #endif
 
+      RTW_MENU(ui_active());   /* GPSP_RUNTIME_LOG: a line on open / close */
       if (ui_active())
       {
          /* Core paused; wireless keeps pumping; UI draws + acts. */
@@ -17479,6 +18139,10 @@ session_top:
     * state it was written for.  The gameplay power lock is play's only. */
    ui_set_wake_yield(NULL);   /* no game loop: nothing to park */
    DIAG_WHERE("teardown");
+   RTW_MODE(EXIT);
+   RT_NOTE("loop_exit reason=%s code=%d relaunch=%d frame=%u exit_cb=%u",
+           exit_reason ? exit_reason : "-", exit_code, g_relaunch,
+           fe_host_frame_count(), g_rtw_exit_in);
    sleep_quiesce_up("loop_exit");
    play_lock_drop("loop_exit");
    pwr_hold("teardown");
@@ -17498,10 +18162,13 @@ session_top:
    stall_watch_stop();   /* a clean exit is not a stall */
    /* Menu = HOME: HOME goes back to the system FIRST, before anything below
     * can block -- the handoff screen, a slow SRAM flush, a relaunch. */
+   RT_STEP_IN("home_stop");
    home_host_stop();
+   RT_STEP_OUT("home_stop", home_host_loaded());
    drprof_stop(fe_host_frame_count());
    /* ADR-0080: stop the ME, then free our staging buffers (ADR-0080e: no
     * second core buffer to free; gba_screen_pixels was never reassigned). */
+   RT_STEP_IN("me_stop");
    me_rend_teardown("exit");
    me_video_teardown("exit", 1);
    /* THE IN-PROCESS RETURN KEEPS THE MODULE (docs/INPROC-RETURN.md, section
@@ -17515,16 +18182,28 @@ session_top:
    if (g_relaunch != RELAUNCH_GAMELIST || inproc_refusal(have_variant) ||
        INPROC_ME_UNLOAD_MUTANT() || !me_host_retain(50000u))
       me_host_shutdown();
+   /* rc: 1 the module is still loaded, +2 kept for the in-process return */
+   RT_STEP_OUT("me_stop", me_host_loaded() | me_host_retained() << 1);
    if (!me_host_loaded() || me_host_retained())
    {
       free(g_me_stage[0]);   g_me_stage[0] = NULL;
       free(g_me_stage[1]);   g_me_stage[1] = NULL;
    }
    ui_return_tick();   /* the hold's ring keeps moving (no-op otherwise) */
+   RT_STEP_IN("net_stop");
    net_teardown();
    mgift_stop(1);      /* drops the AP association and unloads the net modules */
+   RT_STEP_OUT("net_stop", g_net_up);
    emu_boost_stop();   /* ADR-0065: before anything else changes priority */
+   RT_STEP_IN("io_thread_stop");
+#ifdef GPSP_RUNTIME_LOG
+   {
+      int rt_io_rc = io_thread_stop();   /* ADR-0025 (below) */
+      RT_STEP_OUT("io_thread_stop", rt_io_rc);
+   }
+#else
    io_thread_stop();   /* ADR-0025: no other thread may touch the .sav */
+#endif
    ui_return_tick();
    /* The log's own loss, written SYNCHRONOUSLY now the writer is stopped, and
     * the liveness facts into RESULT.TXT, which is written with sceIo after the
@@ -17537,7 +18216,9 @@ session_top:
       handoff_set_extra(extra);
       fe_evt("evt_drop total=%u", fe_evt_drops());
    }
+   RT_STEP_IN("fe_host_shutdown");
    fe_host_shutdown();
+   RT_STEP_OUT("fe_host_shutdown", 0);
 #ifdef REWIND
    PSP_REWIND_GAME_OVER();   /* fe_host let go of the pool */
 #endif
@@ -17619,6 +18300,7 @@ session_top:
       {
          /* A fresh boot's per-game state, then the browser again. */
          fe_evt("inproc_return n=%d", inproc_n);
+         RT_NOTE("inproc_return n=%d", inproc_n);
          standby_note("inproc_return n=%d me_loaded=%d me_dead=%d vmem=%d "
                       "audio_thid=%d", inproc_n, me_host_loaded(),
                       me_host_was_dead(), me_rend_vmem_held(), (int)audio_thid);
@@ -17668,8 +18350,17 @@ session_top:
       g_relaunch = RELAUNCH_GAMELIST;
       me_host_shutdown();       /* kept for a return that is not happening */
    }
+   RT_STEP_IN("av_stop");
+#ifdef GPSP_RUNTIME_LOG
+   {
+      int rt_au_rc = audio_stop();
+      vid_term();
+      RT_STEP_OUT("av_stop", rt_au_rc);
+   }
+#else
    audio_stop();
    vid_term();
+#endif
    if (g_relaunch != RELAUNCH_GAMELIST)
       fe_evt("audio_hash %08x samples=%u", plat_audio_hash(),
              plat_audio_sample_count());
@@ -17701,7 +18392,9 @@ session_top:
       fe_evt("exit code=%d reason=%s", exit_code, exit_reason);
    else
       fe_evt("exit code=%d", exit_code);
+   RT_STEP_IN("evt_shutdown");
    evt_shutdown();
+   RT_STEP_OUT("evt_shutdown", 0);
    /* ADR-0053: last thing before the XMB.  Every ms0 writer is stopped and the
     * log is closed, so it is safe to hand the stick to the PC here and nowhere
     * earlier.  Does not return if the PC asks for another run. */
@@ -17716,6 +18409,7 @@ session_top:
    /* Returns only if it failed: fall through to the XMB rather than hang. */
    if (g_relaunch)
       relaunch_eboot(g_relaunch == RELAUNCH_GAMELIST);
+   RT_STEP_IN("exit_game");   /* the watchdog stops inside (RTW_STOP) */
    sceKernelExitGame();
    return 0;
 }

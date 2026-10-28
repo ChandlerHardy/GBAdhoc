@@ -333,6 +333,25 @@ int  vid_ambient_image(int x, int y, int w, int h, int alpha);
  * browser's Settings backdrop is put back to "nothing baked" on close. */
 void vid_ambient_drop(void);
 
+#ifdef GPSP_RUNTIME_LOG
+/* The runtime watchdog's view of the presenting path (main_psp.c rtw_*):
+ * plain words the emulation thread stores, read from the watchdog thread.
+ * Times are sceKernelGetSystemTimeLow | 1 (0 = never). */
+typedef struct vid_rt_info
+{
+   int      gu_queued;       /* finished lists not yet synced            */
+   unsigned gusync_in;       /* entering the last sceGuSync              */
+   unsigned gusync_out;      /* leaving it (in > out: still inside)      */
+   unsigned swap_us;         /* the last SetFrameBuf that succeeded      */
+   unsigned swaps;           /* successful vid_swap flips                */
+   unsigned swap_fails;      /* SetFrameBuf < 0                          */
+   int      swap_rc;         /* the last failure's rc                    */
+   unsigned fb_cur;          /* the buffer being DRAWN into              */
+   unsigned fb_addr[3];      /* the three display buffers' addresses     */
+} vid_rt_info;
+void vid_rt_diag(vid_rt_info *out);
+#endif
+
 #ifdef __cplusplus
 }
 #endif

@@ -44,6 +44,12 @@ int  home_host_take_press(void);
 /* Diagnostics: times a stalled loop gave HOME back, last impose rc. */
 unsigned home_host_fallbacks(void);
 int  home_host_imp_rc(void);
+#ifdef GPSP_RUNTIME_LOG
+/* The runtime watchdog (main_psp.c rtw_*): the module's poll counter, the
+ * EBOOT's beat, whether the popup is off, and the fallbacks. */
+void home_host_diag(unsigned *kbeat, unsigned *beat, unsigned *popup_off,
+                    unsigned *fallbacks);
+#endif
 
 #ifdef __cplusplus
 }

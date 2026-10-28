@@ -582,7 +582,9 @@ def suites(env: Env, baseline: Path | None):
           # sites that feed it, and mutants (diag/runtime-log).
           "python3 tools/tests/test_runtime_log.py && "
           # ...and the stall recorder's 6 s thread is not started there.
-          "python3 tools/tests/test_stall_recorder.py")
+          "python3 tools/tests/test_stall_recorder.py && "
+          # ...and the runtime.log writer's lock and rotation (psp/rt_log.c).
+          "python3 tools/tests/test_rt_log_writer.py")
          % (sdk, sdk, sdk)),
 
         ("perf_loop", False, lambda: None,

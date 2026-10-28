@@ -8,6 +8,7 @@
 #include <systemctrl.h>
 
 #include <stdarg.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -17,16 +18,25 @@ static char   g_rt_dir[160], g_rt_path[176], g_rt_old[180];
 static SceUID g_rt_sema = -1;
 static int    g_rt_on;
 
-/* The lock keeps two threads' lines from landing on the same offset.  It is
- * best effort by design: a thread that cannot have it within half a second
- * (the holder stuck inside the FAT driver -- the very case being recorded)
- * writes anyway, rather than losing the line or joining the hang. */
-static int rt_lock(void)
+/* The lock keeps two threads' lines from landing on the same offset, and
+ * two rotations from deleting runtime.log.1 between them.  A thread that
+ * cannot have it within half a second (the holder stuck inside the FAT
+ * driver -- the very case being recorded) does NOT write without it: two
+ * unlocked appends at one offset overwrite each other (MAGI f-015).  It
+ * counts the line as dropped instead, and the next line that is written
+ * says how many were.  No lock at all (the semaphore was refused): write. */
+static volatile unsigned g_rt_dropped;
+
+static int rt_lock(int *held)
 {
    SceUInt tmo = 500000;
+   *held = 0;
    if (g_rt_sema < 0)
+      return 1;
+   if (sceKernelWaitSema(g_rt_sema, 1, &tmo) < 0)
       return 0;
-   return sceKernelWaitSema(g_rt_sema, 1, &tmo) >= 0;
+   *held = 1;
+   return 1;
 }
 
 static void rt_unlock(int held)
@@ -37,29 +47,48 @@ static void rt_unlock(int held)
 
 void rt_write(const char *text, int n)
 {
-   int held, size;
+   char pre[64];
+   int held, size, pn = 0;
    SceUID fd;
 
    if (!g_rt_on || n <= 0)
       return;
-   held = rt_lock();
+   if (!rt_lock(&held))
+   {
+      g_rt_dropped++;
+      return;
+   }
+   if (g_rt_dropped)
+   {
+      pn = rt_line(pre, sizeof(pre), "rt_dropped n=%u (lock timeouts)",
+                   g_rt_dropped);
+      g_rt_dropped = 0;
+   }
    rt_io_mark(1);
    fd = sceIoOpen(g_rt_path, PSP_O_WRONLY | PSP_O_CREAT | PSP_O_APPEND, 0777);
    if (fd >= 0)
    {
       size = sceIoLseek32(fd, 0, PSP_SEEK_END);
-      if (size > 0 && (unsigned)size + (unsigned)n > RT_LOG_CAP)
+      if (size > 0 && (unsigned)size + (unsigned)(n + pn) > RT_LOG_CAP)
       {
          /* One generation: never ask the FAT driver to rename onto an
-          * existing file (fe_util.c's atomic-replace note). */
+          * existing file (fe_util.c's atomic-replace note).  Truncate only
+          * once the old lines are safely runtime.log.1 (MAGI f-016); a
+          * rename that failed leaves them where they are, and this line is
+          * appended to them. */
          sceIoClose(fd);
          sceIoRemove(g_rt_old);
-         sceIoRename(g_rt_path, g_rt_old);
-         fd = sceIoOpen(g_rt_path, PSP_O_WRONLY | PSP_O_CREAT | PSP_O_TRUNC,
-                        0777);
+         if (sceIoRename(g_rt_path, g_rt_old) >= 0)
+            fd = sceIoOpen(g_rt_path,
+                           PSP_O_WRONLY | PSP_O_CREAT | PSP_O_TRUNC, 0777);
+         else
+            fd = sceIoOpen(g_rt_path,
+                           PSP_O_WRONLY | PSP_O_CREAT | PSP_O_APPEND, 0777);
       }
       if (fd >= 0)
       {
+         if (pn > 0)
+            sceIoWrite(fd, pre, (SceSize)pn);
          sceIoWrite(fd, text, (SceSize)n);
          sceIoClose(fd);              /* the close IS the commit */
       }
@@ -140,8 +169,8 @@ static void rt_plugins(void)
    fn = sctrlHENFindFunction("sceDisplay_Service", "sceDisplay", 0x289D82FE);
    if (fn >= 0x88000000u && fn < 0x8A000000u && !(fn & 3u))
    {
-      w0 = kuKernelPeekw((void *)fn);
-      w1 = kuKernelPeekw((void *)(fn + 4u));
+      w0 = kuKernelPeekw((void *)(uintptr_t)fn);
+      w1 = kuKernelPeekw((void *)(uintptr_t)(fn + 4u));
    }
    rt_note("plugins %s setframebuf=0x%08X w0=%08X w1=%08X j_at_entry=%d",
            len ? line : "-", (unsigned)fn, w0, w1,

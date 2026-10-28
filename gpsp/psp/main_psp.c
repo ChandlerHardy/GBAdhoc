@@ -16465,9 +16465,15 @@ session_top:
    if (g_stall_exit_s > 0)
       fe_evt("stall_exit on s=%d hard=%d", g_stall_exit_s, g_stall_exit_hard);
 #endif
-#ifdef GPSP_STALL_RECORDER
+#if defined(GPSP_STALL_RECORDER) && !defined(GPSP_RUNTIME_LOG)
    /* The release-layout stall recorder (a hard-freeze bisect arm): always on,
-    * 6 s, and nothing is written unless the main loop really stops. */
+    * 6 s, and nothing is written unless the main loop really stops.
+    * NOT with GPSP_RUNTIME_LOG (MAGI f-005): its thread reads only
+    * g_loop_iter, so the wake overlay and the SELECT+TRIANGLE pause screen
+    * (modal inside one loop iteration) read as a stall after 6 s, and after 8
+    * such records it is dead for the session.  The runtime watchdog, which
+    * reads the wake and sleep words, uses the recorder's loop words and its
+    * stall_line instead; this thread is not started. */
    if (g_stall_s <= 0)
       g_stall_s = 6;
    sceIoMkdir(LOG_DIR, 0777);

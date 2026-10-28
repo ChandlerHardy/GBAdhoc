@@ -190,8 +190,9 @@ profile_flags() {   # sets CORE_FLAGS, FE_DEFS, TITLE, KIND
       # sleepdiag, plus a trail of the RUN and a watchdog (2026-10-28): the
       # PSP-3001 froze in play after a BetterBright brightness change, HOME
       # still opened, "exit to XMB" hung, and nothing was on the card.
-      #   GPSP_STALL_RECORDER  the loop's iteration/phase words and its 6 s
-      #                        log/stall.txt record (the watchdog reuses it)
+      #   GPSP_STALL_RECORDER  the loop's iteration/phase words and its
+      #                        stall_line, which the watchdog reuses; its own
+      #                        6 s thread is NOT started here (MAGI f-005)
       #   GPSP_RUNTIME_LOG     log/runtime.log: boot (wall clock, plugins),
       #                        ROM load, states, menu, ME, display, every
       #                        teardown step, and the 1 s / 2 s watchdog's

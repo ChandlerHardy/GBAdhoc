@@ -580,7 +580,9 @@ def suites(env: Env, baseline: Path | None):
           # GPSP_RUNTIME_LOG: the watchdog's decision (psp/rt_watch.c), its
           # suppression from the real sleep handshake (main_psp.c), the call
           # sites that feed it, and mutants (diag/runtime-log).
-          "python3 tools/tests/test_runtime_log.py")
+          "python3 tools/tests/test_runtime_log.py && "
+          # ...and the stall recorder's 6 s thread is not started there.
+          "python3 tools/tests/test_stall_recorder.py")
          % (sdk, sdk, sdk)),
 
         ("perf_loop", False, lambda: None,

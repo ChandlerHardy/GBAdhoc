@@ -10701,7 +10701,9 @@ static void rt_step(const char *what, const char *edge, int rc)
 #define RTW_START()        ((void)0)
 #define RTW_MODE(m)        ((void)0)
 #define RT_STEP_IN(w)      ((void)0)
-#define RT_STEP_OUT(w, rc) ((void)(rc))
+/* NOT ((void)(rc)): an rc that is a call (home_host_loaded()) would still
+ * be made, and the build without the define would no longer be sleepdiag's. */
+#define RT_STEP_OUT(w, rc) ((void)0)
 #define RTW_MENU(active)   ((void)0)
 #endif
 

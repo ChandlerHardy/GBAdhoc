@@ -10530,7 +10530,7 @@ static void rtw_record(unsigned ev)
 
 static void rtw_tick(void)
 {
-   static unsigned seen_exit, seen_sav, seen_pwr;
+   static unsigned seen_exit, seen_pwr;
    unsigned long long t = sceKernelGetSystemTimeWide();
    unsigned dt = (unsigned)((t - g_rtw_t) / 1000ull);
    unsigned expect, now[RTW_SLOTS], ev;
@@ -10558,13 +10558,25 @@ static void rtw_tick(void)
    else if (dt > RTW_LATE_MS)
       rt_note("wd late ms=%u", dt);   /* held off: by what outranks 0x10 */
 
+   /* STEADY STATE WRITES NOTHING.  A tick in which nothing stalled and no
+    * sleep, wake or exit happened opens no file: this thread outranks every
+    * other writer of the stick, and contention on it is one of the things
+    * being looked for.  So the power callback's battery / AC chatter is
+    * only counted (the stall record's pwr line has it), and the .sav
+    * writer's passes only counted (stall record, stall_clear, exit_cb). */
    if (g_rtw_pwr_n != seen_pwr)
    {
       seen_pwr = g_rtw_pwr_n;
-      rt_note("pwr n=%u flags=0x%08X ms_ago=%u since_wake_ms=%u", seen_pwr,
-              g_rtw_pwr_flags,
-              rtw_ago(g_rtw_pwr_us | 1u, (unsigned)sceKernelGetSystemTimeLow()),
-              rtw_ago(g_rtw_wake_us, (unsigned)sceKernelGetSystemTimeLow()));
+      if (g_rtw_pwr_flags & (PSP_POWER_CB_POWER_SWITCH |
+                             PSP_POWER_CB_SUSPENDING |
+                             PSP_POWER_CB_RESUMING |
+                             PSP_POWER_CB_RESUME_COMPLETE))
+            rt_note("pwr n=%u flags=0x%08X ms_ago=%u since_wake_ms=%u",
+                 seen_pwr, g_rtw_pwr_flags,
+                 rtw_ago(g_rtw_pwr_us | 1u,
+                         (unsigned)sceKernelGetSystemTimeLow()),
+                 rtw_ago(g_rtw_wake_us,
+                         (unsigned)sceKernelGetSystemTimeLow()));
    }
    if (g_rtw_exit_in != seen_exit)
    {
@@ -10574,11 +10586,13 @@ static void rtw_tick(void)
       seen_exit = g_rtw_exit_in;
       len = rt_line(tb, sizeof(tb), "exit_cb in=%u out=%u ms_ago=%u "
                     "iter_at=%u phase_at=%d iter_now=%u phase_now=%d "
-                    "running=%d mode=%s step=%s stalled=%u", g_rtw_exit_in,
+                    "running=%d mode=%s step=%s stalled=%u sav_runs=%u "
+                    "sav_blocks=%u", g_rtw_exit_in,
                     g_rtw_exit_out, rtw_ago(g_rtw_exit_us | 1u, nowl),
                     g_rtw_exit_iter, g_rtw_exit_phase, g_loop_iter,
                     g_loop_phase, g_running, k_rtw_mode[g_rtw_mode],
-                    g_rtw_step, g_rtw.stalled);
+                    g_rtw_step, g_rtw.stalled, g_rtw_sav_runs,
+                    g_rtw_sav_blocks);
       /* Inside an episode, where the threads are NOW (the stall record was
        * taken before HOME was pressed). */
       if (g_rtw.stalled)
@@ -10586,12 +10600,6 @@ static void rtw_tick(void)
                             NULL, NULL);
       rt_write(tb, len);
    }
-   if (g_rtw_sav_runs != seen_sav)
-   {
-      seen_sav = g_rtw_sav_runs;
-      rt_note("sav_io runs=%u blocks=%u", seen_sav, g_rtw_sav_blocks);
-   }
-
    rtw_sample(now, expect);
    ev = rtw_step(&g_rtw, now, expect, dt);
    if (ev == RTW_EV_STALL)
@@ -10609,10 +10617,12 @@ static void rtw_tick(void)
       rtw_mask_names(m1, sizeof(m1), g_rtw.moved & g_rtw.reported);
       rtw_mask_names(m2, sizeof(m2), g_rtw.dropped);
       rt_note("stall_clear#%u moved=%s dropped=%s episode_ms=%u mode=%s "
-              "step=%s ctr main=%u audio=%u io=%u me=%u home=%u",
+              "step=%s ctr main=%u audio=%u io=%u me=%u home=%u "
+              "sav_runs=%u sav_blocks=%u",
               g_rtw.episodes, m1, m2, g_rtw.episode_ms,
               k_rtw_mode[g_rtw_mode], g_rtw_step, now[RTW_MAIN],
-              now[RTW_AUDIO], now[RTW_IO], now[RTW_ME], now[RTW_HOME]);
+              now[RTW_AUDIO], now[RTW_IO], now[RTW_ME], now[RTW_HOME],
+              g_rtw_sav_runs, g_rtw_sav_blocks);
    }
 }
 

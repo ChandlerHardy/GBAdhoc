@@ -25,6 +25,9 @@ import subprocess
 import sys
 import tempfile
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import rtlog_paths  # noqa: E402  (the MAGI-review harnesses)
+
 ROOT = Path(__file__).resolve().parents[2]
 MAIN = (ROOT / "psp/main_psp.c").read_text(encoding="utf-8")
 WATCH_C = ROOT / "psp/rt_watch.c"
@@ -202,6 +205,7 @@ def watchdog_production(src):
              line(src, r"^#define RTW_LATE_MS .*$"),
              line(src, r"^#define RTW_QUIET .*$"),
              line(src, r"^#define g_wake_hold .*$"),
+             fn(src, "rtw_busy_now"),
              fn(src, "rtw_expect"), fn(src, "rtw_sample"), fn(src, "rtw_ago"),
              fn(src, "rtw_tick")]
     return "\n\n".join(parts)
@@ -236,6 +240,9 @@ static const char *volatile g_rtw_step = "-";
 static rtw_state g_rtw;
 static unsigned long long g_rtw_t;
 static int g_rtw_quiet;
+static const char *volatile g_rtw_busy_why;   /* a busy span (pwr_hold) */
+static volatile unsigned g_rtw_busy_us, g_rtw_busy_ms;
+static int g_rtw_rec_aborted;
 static int me_up, home_up;
 static unsigned me_beat, home_kbeat;
 static int me_host_up(void) { return me_up; }
@@ -395,6 +402,36 @@ int main(void)
    play(1); tick();
    CHECK(strstr(last, "stall_clear#1") != NULL && strstr(last, "sav_runs=600 sav_blocks=4200") != NULL);
 
+   /* i. A BUSY SPAN (Host/Join's bring-up, pwr_hold "net"): a main loop
+    *    inside one long iteration is not a stall -- until the span's own
+    *    bound, after which the watch resumes. */
+   fresh();
+   g_rtw_busy_why = "net"; g_rtw_busy_us = (unsigned)clk_us;
+   g_rtw_busy_ms = 30000;
+   CHECK(!(rtw_expect() & RTW_BIT(RTW_MAIN)) && (rtw_expect() & RTW_BIT(RTW_AUDIO)));
+   for (i = 0; i < 20; i++) { play(0); tick(); }
+   CHECK(records == 0 && writes == 0);
+   for (i = 0; i < 14; i++) { play(0); tick(); }
+   CHECK(records == 1);                       /* 30 s bound + 3 s */
+   g_rtw_busy_why = NULL;
+   /*    ...and the other threads are still watched inside it. */
+   fresh();
+   g_rtw_busy_why = "state_save"; g_rtw_busy_us = (unsigned)clk_us;
+   g_rtw_busy_ms = 15000;
+   for (i = 0; i < 4; i++) { g_loop_iter++; g_rtw_beat_io++; me_beat++; home_kbeat++; tick(); }
+   CHECK(records == 1 && last_record_fresh == (int)RTW_BIT(RTW_AUDIO));
+   g_rtw_busy_why = NULL;
+
+   /* j. a record a sleep cut short ends as such once the sleep is over. */
+   fresh();
+   for (i = 0; i < 3; i++) { play(0); tick(); }
+   CHECK(records == 1);
+   g_rtw_rec_aborted = 1;                     /* as rtw_record leaves it */
+   g_pwr_sleep_pending = 1; play(0); tick(); g_pwr_sleep_pending = 0;
+   play(1); tick();
+   CHECK(strstr(last, "stall_end#1 reason=sleep slots=main record=aborted") != NULL);
+   CHECK(g_rtw_rec_aborted == 0);
+
    /* g. a late watchdog says so, and the gap is capped. */
    fresh();
    play(1); clk_us += 9000000ull; tick();
@@ -402,6 +439,30 @@ int main(void)
    DONE("rtw_expect/rtw_tick (production)");
 }
 '''
+
+# ------------------------------------------------------------- 2b ------
+def record_production(src):
+    return "\n\n".join([
+        line(src, r"^enum \{ RTW_MODE_BOOT.*\n.*\};$"),
+        between(src, "static const char *const k_rtw_mode[]", "};"),
+        line(src, r"^#define RTW_QUIET .*$"),
+        line(src, r"^#define g_wake_hold .*$"),
+        fn(src, "rtw_busy_now"), fn(src, "rtw_expect"), fn(src, "rtw_ago"),
+        fn(src, "stall_main_drop"), fn(src, "stall_main_restore"),
+        fn(src, "rtw_record")])
+
+
+BUSY_HEAD = "/* ---- RTW BUSY SPANS"
+BUSY_TAIL = "/* ---- end RTW BUSY SPANS */"
+
+
+def busy_production(src):
+    blk = between(src, BUSY_HEAD, BUSY_TAIL)
+    ph = re.search(r"^void pwr_hold\(const char \*why\)\n\{.*?\n\}\n", src, re.S | re.M)
+    pr = re.search(r"^void pwr_release\(void\)\n\{.*?\n\}\n", src, re.S | re.M)
+    assert ph and pr, "pwr_hold / pwr_release not found"
+    return "\n\n".join([blk, ph.group(0), pr.group(0), fn(src, "pwr_release_all")])
+
 
 # ---------------------------------------------------------------- 3 ------
 EARLY_HEAD = "/* ---- GPSP_RUNTIME_LOG: the words the runtime watchdog reads"
@@ -553,7 +614,7 @@ def structure(src):
     post = src[i + len(body):]
     out.append(("RTW_MODE(EXIT) set at the teardown",
                 post.find("   RTW_MODE(EXIT);\n") >= 0 and
-                post.find("   RTW_MODE(EXIT);\n") < post.find("RT_STEP_IN(\"home_stop\")")))
+                post.find("   RTW_MODE(EXIT);\n") < post.find("   home_host_stop();\n")))
     # the menu's edge is tracked every iteration, outside the menu branch
     out.append(("RTW_MENU ahead of the menu branch",
                 "      RTW_MENU(ui_active());   /* GPSP_RUNTIME_LOG: a line on open / close */\n"
@@ -566,9 +627,16 @@ def structure(src):
     # every teardown step that begins also ends
     ins = re.findall(r'RT_STEP_IN\("([a-z_]+)"\)', src)
     outs = set(re.findall(r'RT_STEP_OUT\("([a-z_]+)"', src))
-    want = {"home_stop", "me_stop", "net_stop", "io_thread_stop",
+    want = {"me_stop", "net_stop", "io_thread_stop",
             "fe_host_shutdown", "av_stop", "evt_shutdown", "exit_game"}
-    out.append(("teardown steps present", want <= set(ins)))
+    out.append(("teardown steps present", want <= set(ins) and "home_stop" in outs))
+    # HOME goes back to the system FIRST: no runtime.log write on main
+    # between the loop's end and home_host_stop() (MAGI f-013)
+    k = src.find("   RTW_MODE(EXIT);\n")
+    h = src.find("   home_host_stop();\n", k)
+    span = src[k:h] if 0 <= k < h else ""
+    out.append(("no log write before home_host_stop",
+                bool(span) and not re.search(r"\bRT_(NOTE|STEP_IN|STEP_OUT)\(|\brt_note\(", span)))
     out.append(("every step but the exit ends",
                 all(s in outs for s in ins if s != "exit_game")))
     # every process exit stops the watchdog
@@ -603,7 +671,13 @@ def run_all(src, expect=True):
             ("tick", TICK.replace("@PRODUCTION@", watchdog_production(src)),
              [WATCH_C], []),
             ("sites", sites_production(src), [],
-             ["-DGPSP_RUNTIME_LOG", "-DGPSP_PLAYABLE", "-DGPSP_STALL_RECORDER"])):
+             ["-DGPSP_RUNTIME_LOG", "-DGPSP_PLAYABLE", "-DGPSP_STALL_RECORDER"]),
+            ("record", CHECK + rtlog_paths.RECORD.replace(
+                "@PRODUCTION@", record_production(src)), [WATCH_C], []),
+            ("stop", CHECK + rtlog_paths.STOP.replace(
+                "@PRODUCTION@", fn(src, "rtw_stop")), [], []),
+            ("busy", CHECK + rtlog_paths.BUSY.replace(
+                "@PRODUCTION@", busy_production(src)), [], ["-DGPSP_RUNTIME_LOG"])):
         try:
             build_run(text, name, True, extra, defs)
         except AssertionError as e:
@@ -653,8 +727,8 @@ def main():
          "       g_pwr_parked || g_sq.down)\n      return RTW_QUIET;",
          "       g_pwr_parked)\n      return RTW_QUIET;"),
         ("main expected under the wake overlay", MAIN,
-         "   if ((g_rtw_mode == RTW_MODE_GAME && !g_wake_hold) ||",
-         "   if ((g_rtw_mode == RTW_MODE_GAME) ||"),
+         "   if (((g_rtw_mode == RTW_MODE_GAME && !g_wake_hold) ||",
+         "   if (((g_rtw_mode == RTW_MODE_GAME) ||"),
         ("the tick writes while quiet", MAIN,
          "      g_rtw_quiet = 1;               /* asleep, or on the way: no I/O */\n      return;\n",
          "      g_rtw_quiet = 1;               /* asleep, or on the way: no I/O */\n"),
@@ -669,13 +743,37 @@ def main():
         ("battery callbacks written", MAIN,
          "      if (g_rtw_pwr_flags & (PSP_POWER_CB_POWER_SWITCH |",
          "      if (1 || g_rtw_pwr_flags & (PSP_POWER_CB_POWER_SWITCH |"),
+        ("the record ignores a sleep begun while it samples", MAIN,
+         "   if (rtw_expect() & RTW_QUIET)      /* sampled into a sleep */\n"
+         "   {\n      g_rtw_rec_aborted = 1;\n      return;\n   }\n", ""),
+        ("the record writes into a sleep begun during the drop", MAIN,
+         "   if (rtw_expect() & RTW_QUIET)      /* slid during the drop */\n"
+         "   {\n      stall_main_restore(pri0);\n      g_rtw_rec_aborted = 1;\n"
+         "      return;\n   }\n", ""),
+        ("the display is asked after a sleep began", MAIN,
+         "   if (rtw_expect() & RTW_QUIET)      /* the display can wait */\n"
+         "   {\n      g_rtw_rec_aborted = 1;\n      return;\n   }\n", ""),
+        ("rtw_stop writes before the join", MAIN,
+         "   g_rtw_run = 0;\n   rtw_kick();\n",
+         "   rt_note(\"wd stop why=%s\", why);\n   g_rtw_run = 0;\n   rtw_kick();\n"),
+        ("loop_exit written before HOME is handed back", MAIN,
+         "   DIAG_WHERE(\"teardown\");\n   RTW_MODE(EXIT);\n",
+         "   DIAG_WHERE(\"teardown\");\n   RTW_MODE(EXIT);\n   RT_NOTE(\"loop_exit\");\n"),
+        ("main expected inside a busy span", MAIN,
+         "        g_rtw_mode == RTW_MODE_EXIT) && !rtw_busy_now())",
+         "        g_rtw_mode == RTW_MODE_EXIT))"),
+        ("pwr_hold marks no busy span", MAIN,
+         "   RTW_BUSY_PUSH(g_pwr_hold, why);\n", ""),
+        ("a busy span never ends", MAIN,
+         "   RTW_BUSY_POP(g_pwr_hold - 1);\n", ""),
         ("the game loop does not count", MAIN,
          "      LOOP_TOP();\n      FE_LP_SET(FELP_L_TOP);",
          "      FE_LP_SET(FELP_L_TOP);"),
         ("play never marked as play", MAIN,
          "   RTW_MODE(GAME);\n   RT_NOTE(\"game loop enter", "   RT_NOTE(\"game loop enter"),
         ("teardown not marked", MAIN,
-         "   RTW_MODE(EXIT);\n   RT_NOTE(\"loop_exit", "   RT_NOTE(\"loop_exit"),
+         "   RTW_MODE(EXIT);\n   sleep_quiesce_up(\"loop_exit\");",
+         "   sleep_quiesce_up(\"loop_exit\");"),
         ("exit callback does not wake the watchdog", MAIN,
          "   g_running = 0;\n   RTW_EXIT_OUT();\n", "   g_running = 0;\n"),
         ("power stamp moved off power_cb's entry", MAIN,

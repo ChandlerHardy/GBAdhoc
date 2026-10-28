@@ -107,6 +107,10 @@ STUB = r'''
 #define fe_evt(...) ((void)0)
 #define SLEEP_SIM_ASLEEP() 0
 #define ROM_DIR "roms"
+/* SLEEPDIAG's breadcrumbs (main_psp.c DIAG_WHERE / sleep_inventory). */
+#define DIAG_WHERE(s) ((void)(s))
+#define DIAG_INVENTORY(t) ((void)(t))
+static int inproc_n;
 static struct { int standby; } g_pcfg = { 1 };
 static volatile int g_running = 1;
 static volatile int g_pwr_slept, g_pwr_rebuild, g_pwr_park_req, g_pwr_parked;

@@ -178,9 +178,15 @@ profile_flags() {   # sets CORE_FLAGS, FE_DEFS, TITLE, KIND
       # log/standby.log trail of the sleep path, here with a census at each
       # power callback and the main thread's whereabouts (diag/A2+B2-notes).
       # For a PSP-3001 that rarely cold-boots after a sleep from the game
-      # list.  Build it as the release is built (tools/release.sh; a beta
-      # sets RFU_SCHED=1):
-      #   RFU_SCHED=1 bash tools/build.sh sleepdiag
+      # list.  Build it as the release is built -- beta 2's official EBOOT
+      # (GBAdhoc-4.6.0-beta.2.zip, sha256 1df74acb...) is reproduced byte for
+      # byte at v4.6.0-beta.2 by `tools/release.sh 4.6.0-beta.2`, which is
+      #   RFU_SCHED=1 bash tools/build.sh release
+      # with nothing else in the environment (a beta ships the adapter ticks);
+      # so, with the same switch:
+      #   RFU_SCHED=1 GPSP_EBOOT_TITLE="GBAdhoc SLEEPDIAG LINK" \
+      #   bash tools/build.sh sleepdiag
+      # (the title only: without it RFU_SCHED=1 appends " TICKS").
       CORE_FLAGS="GPSP_PROFILE=release"
       FE_DEFS="-DGPSP_PLAYABLE -DGPSP_PROFILE_RELEASE=1 -DGPSP_STANDBY_NOTES"
       TITLE="GBAdhoc SLEEPDIAG"
@@ -198,8 +204,9 @@ profile_flags() {   # sets CORE_FLAGS, FE_DEFS, TITLE, KIND
       #                        teardown step, and the 1 s / 2 s watchdog's
       #                        once-per-episode stall record (psp/rt_log.h)
       # Without both it IS the sleepdiag build, byte for byte.  Build it as
-      # the release is built (tools/release.sh; a beta sets RFU_SCHED=1):
-      #   RFU_SCHED=1 bash tools/build.sh runtimelog
+      # the release is built (beta 2's switch, as for sleepdiag above):
+      #   RFU_SCHED=1 GPSP_EBOOT_TITLE="GBAdhoc RUNTIMELOG LINK" \
+      #   bash tools/build.sh runtimelog
       CORE_FLAGS="GPSP_PROFILE=release"
       FE_DEFS="-DGPSP_PLAYABLE -DGPSP_PROFILE_RELEASE=1 -DGPSP_STANDBY_NOTES
 -DGPSP_STALL_RECORDER -DGPSP_RUNTIME_LOG"

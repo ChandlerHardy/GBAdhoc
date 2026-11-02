@@ -556,6 +556,14 @@ def suites(env: Env, baseline: Path | None):
          ("gcc -std=gnu99 -w -DGPSP_PLAYABLE -ffunction-sections -fdata-sections "
           "-I%s -Ifrontend-common -Ipsp tools/test_video_buffers.c "
           "-Wl,--gc-sections -o /tmp/t_vb && /tmp/t_vb && "
+          # ...and the same swap test through vid_swap's GPSP_RUNTIME_LOG
+          # branch (diag/runtime-log), which must keep the off branch's
+          # SetFrameBuf-failure contract (4.5.0: return 0, keep the frame).
+          "gcc -std=gnu99 -w -DGPSP_PLAYABLE -DGPSP_RUNTIME_LOG "
+          "-ffunction-sections -fdata-sections "
+          "-I%s -Ifrontend-common -Ipsp tools/test_video_buffers.c "
+          "tools/tests/rt_note_stub.c "
+          "-Wl,--gc-sections -o /tmp/t_vb_rt && /tmp/t_vb_rt && "
           "gcc -std=gnu99 -w -DGPSP_PLAYABLE -ffunction-sections -fdata-sections "
           "-I%s -Ifrontend-common -Ipsp tools/test_video_geometry.c "
           "-Wl,--gc-sections -o /tmp/t_vgeo && /tmp/t_vgeo && "
@@ -585,7 +593,7 @@ def suites(env: Env, baseline: Path | None):
           "python3 tools/tests/test_stall_recorder.py && "
           # ...and the runtime.log writer's lock and rotation (psp/rt_log.c).
           "python3 tools/tests/test_rt_log_writer.py")
-         % (sdk, sdk, sdk)),
+         % (sdk, sdk, sdk, sdk)),
 
         ("perf_loop", False, lambda: None,
          "python3 tools/test_perf_loop.py"),

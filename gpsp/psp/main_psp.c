@@ -18319,9 +18319,13 @@ session_top:
          /* A fresh boot's per-game state, then the browser again. */
          fe_evt("inproc_return n=%d", inproc_n);
          RT_NOTE("inproc_return n=%d", inproc_n);
+#if !defined(GPSP_NO_TELEMETRY) || defined(GPSP_STANDBY_NOTES)
+         /* Only where the trail is written: standby_note is a function, so
+          * a player build would still make the two me_host_* calls. */
          standby_note("inproc_return n=%d me_loaded=%d me_dead=%d vmem=%d "
                       "audio_thid=%d", inproc_n, me_host_loaded(),
                       me_host_was_dead(), me_rend_vmem_held(), (int)audio_thid);
+#endif
          inproc_n++;
          /* The list and the next game run at the setting's clock, whatever
           * the teardown met (a wake in the list itself is answered by the

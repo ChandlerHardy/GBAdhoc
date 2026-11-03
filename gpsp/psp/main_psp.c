@@ -10945,6 +10945,87 @@ static void rt_step(const char *what, const char *edge, int rc)
                                            a_ ? "open" : "close",          \
                                            (unsigned)fe_host_frame_count()); \
                                 } } while (0)
+
+/* ---- RTW XLAT FAULTS: the emulation-fault reset and the lazy fourth try
+ * (issue #10; xlat_fault_note.h).  "Emulation fault - game was reset" is
+ * BADJUMP_SAFE's reset, made between frames (fe_host_guest_fault_check); the
+ * core's XLAT_FAULT_NOTE (this profile's core switch) says why: the guest pc,
+ * ARM / Thumb, which path (no code can be at the pc / four failed tries /
+ * VRAM), the tries, and how full the translation caches and the ROM cache
+ * were.  And whether XLAT_LAST_TRY_LAZY's lazy fourth try -- beta 2's fix
+ * for TMGC -- was used, and whether it saved the lookup.  Weak: NULL when the
+ * core was built without the switch, and the line says so.  Steady play pays
+ * one compare a frame; a line only on a change, and the lazy try's own lines
+ * are bounded (RTW_XFN_*), so a game that takes it all the time cannot push
+ * the stall records out of the file. */
+#include "../xlat_fault_note.h"
+extern xlat_fault_note xlat_fault_notes __attribute__((weak));
+extern u32 badjump_last_pc __attribute__((weak));
+#define RTW_XFN_FREE   16u          /* lines before the rate limit applies */
+#define RTW_XFN_GAP_US 60000000u    /* then at most one a minute */
+static const char *rtw_xfn_why(unsigned w)
+{
+   return w == XFN_WHY_UNMAPPABLE ? "unmappable" :
+          w == XFN_WHY_EXHAUSTED  ? "exhausted"  :
+          w == XFN_WHY_VRAM       ? "vram"       : "other";
+}
+static const char *rtw_xfn_mode(unsigned thumb)
+{
+   return thumb == 0 ? "arm" : thumb == 1 ? "thumb" : "?";
+}
+
+/* After the reset (main thread, the frame it happened in). */
+static void rtw_fault_note(unsigned n)
+{
+   const xlat_fault_note *x = &xlat_fault_notes;
+   if (!x)
+   {
+      rt_note("guest_fault n=%u pc=%08X action=reset notes=none frame=%u", n,
+              &badjump_last_pc ? (unsigned)badjump_last_pc : 0u,
+              (unsigned)fe_host_frame_count());
+      return;
+   }
+   rt_note("guest_fault n=%u pc=%08X mode=%s why=%s tries=%u action=reset "
+           "lazy=%u lazy_failed=%u resets=%u ram_fill=%u/%u rom_fill=%u/%u "
+           "rom_cache blocks=%u resident=%u rom_kb=%u page_loads=%u frame=%u",
+           n, (unsigned)x->reset_pc, rtw_xfn_mode(x->reset_thumb),
+           rtw_xfn_why(x->reset_why), (unsigned)x->reset_tries,
+           (unsigned)x->lazy, (unsigned)x->lazy_failed, (unsigned)x->resets,
+           (unsigned)x->reset_ram_fill, (unsigned)ram_translation_cache_size,
+           (unsigned)x->reset_rom_fill, (unsigned)rom_translation_cache_size,
+           (unsigned)gamepak_buffer_count, (unsigned)gamepak_resident_got,
+           (unsigned)(gamepak_size >> 10), (unsigned)x->reset_page_loads,
+           (unsigned)fe_host_frame_count());
+}
+
+/* Once a frame: the lazy fourth try was used since the last look (three
+ * translations of one pc had failed), and how many of those still failed. */
+static void rtw_xlat_poll(void)
+{
+   static unsigned seen_lazy, seen_failed, lines, last_us;
+   const xlat_fault_note *x = &xlat_fault_notes;
+   unsigned now;
+   if (!x || x->lazy == seen_lazy)
+      return;
+   now = (unsigned)sceKernelGetSystemTimeLow();
+   if (lines >= RTW_XFN_FREE && now - last_us < RTW_XFN_GAP_US)
+      return;                         /* counted; said in the next line */
+   rt_note("xlat_lazy n=%u (+%u) failed=%u (+%u) last pc=%08X mode=%s "
+           "ram_fill=%u/%u rom_fill=%u/%u page_loads=%u frame=%u",
+           (unsigned)x->lazy, (unsigned)x->lazy - seen_lazy,
+           (unsigned)x->lazy_failed, (unsigned)x->lazy_failed - seen_failed,
+           (unsigned)x->lazy_pc, rtw_xfn_mode(x->lazy_thumb),
+           (unsigned)x->lazy_ram_fill, (unsigned)ram_translation_cache_size,
+           (unsigned)x->lazy_rom_fill, (unsigned)rom_translation_cache_size,
+           (unsigned)gamepak_page_loads, (unsigned)fe_host_frame_count());
+   seen_lazy = x->lazy;
+   seen_failed = x->lazy_failed;
+   lines++;
+   last_us = now;
+}
+#define RTW_FAULT_NOTE(n)  rtw_fault_note(n)
+#define RTW_XLAT_POLL()    rtw_xlat_poll()
+/* ---- end RTW XLAT FAULTS */
 #else
 #define RTW_START()        ((void)0)
 #define RTW_MODE(m)        ((void)0)
@@ -10953,6 +11034,8 @@ static void rt_step(const char *what, const char *edge, int rc)
  * be made, and the build without the define would no longer be sleepdiag's. */
 #define RT_STEP_OUT(w, rc) ((void)0)
 #define RTW_MENU(active)   ((void)0)
+#define RTW_FAULT_NOTE(n)  ((void)0)
+#define RTW_XLAT_POLL()    ((void)0)
 #endif
 
 /* ---- DRPROF_HW: the dynarec time-split sampler (docs/DYNAREC-PROFILE.md) --
@@ -17769,8 +17852,10 @@ session_top:
          if (faults != faults_seen)
          {
             faults_seen = faults;
+            RTW_FAULT_NOTE(faults);   /* GPSP_RUNTIME_LOG: why, and how full */
             osd_toast("Emulation fault - game was reset");
          }
+         RTW_XLAT_POLL();             /* GPSP_RUNTIME_LOG: a compare a frame */
       }
       LOOP_PHASE(3);
       preempt_mark(1);           /* ADR-0064: close `core`, open `post` */

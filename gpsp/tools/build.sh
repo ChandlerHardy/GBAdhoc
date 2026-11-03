@@ -203,11 +203,15 @@ profile_flags() {   # sets CORE_FLAGS, FE_DEFS, TITLE, KIND
       #                        ROM load, states, menu, ME, display, every
       #                        teardown step, and the 1 s / 2 s watchdog's
       #                        once-per-episode stall record (psp/rt_log.h)
-      # Without both it IS the sleepdiag build, byte for byte.  Build it as
+      #   XLAT_FAULT_NOTE      (core) why BADJUMP_SAFE reset the game, and
+      #                        when the lazy 4th translation try was used
+      #                        (xlat_fault_note.h), which runtime.log
+      #                        reports; cold paths only, no I/O in the core
+      # Without all three it IS the sleepdiag build, byte for byte.  Build it as
       # the release is built (beta 2's switch, as for sleepdiag above):
       #   RFU_SCHED=1 GPSP_EBOOT_TITLE="GBAdhoc RUNTIMELOG LINK" \
       #   bash tools/build.sh runtimelog
-      CORE_FLAGS="GPSP_PROFILE=release"
+      CORE_FLAGS="GPSP_PROFILE=release XLAT_FAULT_NOTE=1"
       FE_DEFS="-DGPSP_PLAYABLE -DGPSP_PROFILE_RELEASE=1 -DGPSP_STANDBY_NOTES
 -DGPSP_STALL_RECORDER -DGPSP_RUNTIME_LOG"
       TITLE="GBAdhoc RUNTIMELOG"
@@ -527,7 +531,8 @@ case "$KIND" in
   release)
     FORBIDDEN=("badjump.txt" "smchisto.txt" "irqchk.txt"
                "home_stall_frame"    # Menu = HOME stall rig: GPSP_PERF_RIG only
-               "runtime.log" "stall.txt")   # GPSP_RUNTIME_LOG / _STALL_RECORDER
+               "runtime.log" "stall.txt"    # GPSP_RUNTIME_LOG / _STALL_RECORDER
+               "xfn_take")                  # XLAT_FAULT_NOTE (core)
     # ADR-0067: proof the harness ini was pointed at an impossible path, so a
     # leftover .gpsp-harness.ini on a player's card cannot drive their console.
     REQUIRE=(".playable-no-harness")
@@ -541,7 +546,7 @@ case "$KIND" in
   sleepdiag)
     # A release plus the standby trail, and nothing else that writes.
     FORBIDDEN=("badjump.txt" "smchisto.txt" "irqchk.txt" "home_stall_frame"
-               "runtime.log" "stall.txt")
+               "runtime.log" "stall.txt" "xfn_take")
     REQUIRE=(".playable-no-harness" "standby.log" "inv %s threads")
     ;;
   runtimelog)
@@ -549,7 +554,10 @@ case "$KIND" in
     FORBIDDEN=("badjump.txt" "smchisto.txt" "irqchk.txt" "home_stall_frame")
     REQUIRE=(".playable-no-harness" "standby.log" "inv %s threads"
              "runtime.log" "stall.txt" "gpsp_rtw" "exit_cb in=%u"
-             "%s thr %s id=0x%X st=%X>%X")
+             "%s thr %s id=0x%X st=%X>%X"
+             "%s census rc=%d n=%d" "io_wakes=%u"    # beta 2 port
+             "guest_fault n=%u pc=%08X mode=%s" "xlat_lazy n=%u"
+             "xfn_take")                            # the core's XLAT_FAULT_NOTE
     ;;
   diagnostic)
     # The instruments are the point; assert they are really in.

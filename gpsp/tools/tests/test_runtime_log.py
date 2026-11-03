@@ -230,6 +230,9 @@ static volatile int g_loop_phase;
 static SceUID audio_thid = -1, g_io_thid = -1;
 static volatile int audio_running, g_io_run;
 static volatile unsigned g_rtw_beat_audio, g_rtw_beat_io;
+static volatile unsigned g_rtw_io_wakes, g_rtw_io_taken;   /* work queued */
+enum { RTIO_MAIN, RTIO_IO, RTIO_CB, RTIO_WD, RTIO_OTHER, RTIO_N };
+static volatile unsigned g_rt_io_since[RTIO_N];
 static volatile unsigned g_rtw_sav_blocks, g_rtw_sav_runs;
 static volatile unsigned g_rtw_exit_in, g_rtw_exit_out, g_rtw_exit_us;
 static volatile unsigned g_rtw_exit_iter;
@@ -281,6 +284,8 @@ static void fresh(void)
    g_pwr_sleep_pending = g_pwr_park_req = g_pwr_park_ack = g_pwr_parked = 0;
    g_pwr_slept = g_pwr_rebuild = g_wake_menu = 0;
    g_pwr_req_signal = 0;
+   g_rtw_io_wakes = g_rtw_io_taken = 0;
+   g_rt_io_since[RTIO_IO] = 0;
    g_sq.down = 0;
    g_rtw_mode = RTW_MODE_GAME;
    audio_thid = 0x100; audio_running = 1; g_io_thid = 0x200; g_io_run = 1;
@@ -298,7 +303,12 @@ int main(void)
    /* rtw_expect, from the real words */
    fresh();
    m = rtw_expect();
-   CHECK(m == RTW_ALL);
+   CHECK(m == (RTW_ALL & ~RTW_BIT(RTW_IO)));      /* an idle writer: not */
+   g_rtw_io_wakes = 1;      CHECK(rtw_expect() == RTW_ALL);   /* work queued */
+   g_rtw_io_taken = 1;      CHECK(!(rtw_expect() & RTW_BIT(RTW_IO)));
+   g_rt_io_since[RTIO_IO] = 7; CHECK(rtw_expect() & RTW_BIT(RTW_IO)); /* in a pass */
+   g_rt_io_since[RTIO_IO] = 0;
+   g_rtw_io_wakes = 2;
    g_rtw_mode = RTW_MODE_BROWSER; CHECK(!(rtw_expect() & RTW_BIT(RTW_MAIN)));
    g_rtw_mode = RTW_MODE_EXIT;    CHECK(rtw_expect() & RTW_BIT(RTW_MAIN));
    g_rtw_mode = RTW_MODE_GAME;
@@ -310,6 +320,7 @@ int main(void)
    audio_running = 0; CHECK(!(rtw_expect() & RTW_BIT(RTW_AUDIO))); audio_running = 1;
    audio_thid = -1;   CHECK(!(rtw_expect() & RTW_BIT(RTW_AUDIO))); audio_thid = 0x100;
    g_io_run = 0;      CHECK(!(rtw_expect() & RTW_BIT(RTW_IO)));    g_io_run = 1;
+   g_rtw_io_wakes = g_rtw_io_taken = 0;
    me_up = 0;         CHECK(!(rtw_expect() & RTW_BIT(RTW_ME)));    me_up = 1;
    home_up = 0;       CHECK(!(rtw_expect() & RTW_BIT(RTW_HOME)));  home_up = 1;
    g_pwr_sleep_pending = 1; CHECK(rtw_expect() == RTW_QUIET); g_pwr_sleep_pending = 0;
@@ -435,6 +446,21 @@ int main(void)
    CHECK(strstr(last, "stall_end#1 reason=sleep slots=main record=aborted") != NULL);
    CHECK(g_rtw_rec_aborted == 0);
 
+   /* k. THE WRITER IDLE BEHIND A BUSY MAIN LOOP (TMGC, 4.5.0 runtimelog,
+    *    PSP-3001, 2026-11-03: "stall#1 slots=io age_ms=...io:3000" with
+    *    main, audio, me and home all live and no save pending).  Its beat
+    *    stands still for a minute: nothing.  A save queued that it does not
+    *    take up for > 2 s: one record, slots=io; taken: cleared. */
+   fresh();
+   for (i = 0; i < 60; i++) { g_loop_iter++; g_rtw_beat_audio += 40; me_beat += 1000; home_kbeat += 60; tick(); }
+   CHECK(records == 0 && writes == 0);
+   g_rtw_io_wakes++;                          /* a .sav write is queued */
+   for (i = 0; i < 3; i++) { g_loop_iter++; g_rtw_beat_audio += 40; me_beat += 1000; home_kbeat += 60; tick(); }
+   CHECK(records == 1 && last_record_fresh == (int)RTW_BIT(RTW_IO));
+   g_rtw_io_taken = g_rtw_io_wakes; g_rtw_beat_io++;   /* the writer runs */
+   play(1); tick();
+   CHECK(strstr(last, "stall_clear#1 moved=io") != NULL);
+
    /* g. a late watchdog says so, and the gap is capped. */
    fresh();
    play(1); clk_us += 9000000ull; tick();
@@ -519,7 +545,8 @@ static int sceAudioOutputBlocking(int ch, int vol, void *buf)
 static SceUID g_io_thid = 0x200, g_io_sema = 7;
 static volatile int g_io_run;
 static struct { int log_thread, sram_thread; } g_pcfg;
-static int waits, wait_limit, evt_runs, sav_calls, inside_at_sav;
+static int waits, wait_limit, evt_runs, sav_calls, inside_at_sav, signals;
+static int sceKernelSignalSema(SceUID id, int n) { (void)id; (void)n; signals++; return 0; }
 static int sceKernelWaitSema(SceUID id, int n, SceUInt *t)
 { (void)id; (void)n; (void)t; if (++waits >= wait_limit) g_io_run = 0; return 0; }
 static void fe_evt_service(void) { evt_runs++; }
@@ -541,11 +568,15 @@ int main(void)
    audio_thread(0, NULL);
    CHECK(chunks == 7 && g_rtw_beat_audio == 7);
 
+   /* io_wake counts the work it queues; the writer takes it up */
+   io_wake(); io_wake();
+   CHECK(signals == 2 && g_rtw_io_wakes == 2 && g_rtw_io_taken == 0);
    /* the writer: one beat per wait, the .sav pass counted and fenced */
    g_io_run = 1; wait_limit = 4; g_pcfg.log_thread = 1; g_pcfg.sram_thread = 1;
    self_id = g_io_thid;
    io_thread(0, NULL);
    CHECK(waits == 4 && g_rtw_beat_io == 4);
+   CHECK(g_rtw_io_taken == 2);                /* nothing left queued */
    /* 4 loop passes + the last pass after the loop (not counted) */
    CHECK(sav_calls == 5);
    CHECK(g_rtw_sav_runs == 3 && g_rtw_sav_blocks == 9);   /* pass 2 wrote 0 */
@@ -574,8 +605,8 @@ def sites_production(src):
     mark = between(src, "enum { RTIO_MAIN, RTIO_IO, RTIO_CB, RTIO_WD, RTIO_OTHER, RTIO_N };",
                    "g_rt_io_since[k] = on ? ((unsigned)sceKernelGetSystemTimeLow() | 1u) : 0u;\n}")
     mark += ("\n#define RT_IO(on) rt_io_mark(on)\n")
-    funcs = "\n\n".join([fn(src, "audio_thread"), fn(src, "io_thread"),
-                         fn(src, "exit_cb")])
+    funcs = "\n\n".join([fn(src, "audio_thread"), fn(src, "io_wake"),
+                         fn(src, "io_thread"), fn(src, "exit_cb")])
     return (SITES.replace("@LOOP@", loop_macros(src))
                  .replace("@EARLY@", early_block(src))
                  .replace("@MARK@", mark)
@@ -723,6 +754,17 @@ def main():
         ("the .sav pass is not fenced", MAIN,
          "      {\n         RT_IO(1);\n         RTW_SAV(fe_host_sram_service_io());\n",
          "      {\n         RTW_SAV(fe_host_sram_service_io());\n"),
+        ("the writer expected while idle", MAIN,
+         "   if (g_io_thid >= 0 && g_io_run &&\n"
+         "       (g_rtw_io_wakes != g_rtw_io_taken || g_rt_io_since[RTIO_IO]))\n",
+         "   if (g_io_thid >= 0 && g_io_run)\n"),
+        ("the writer not expected inside its .sav pass", MAIN,
+         "       (g_rtw_io_wakes != g_rtw_io_taken || g_rt_io_since[RTIO_IO]))\n",
+         "       (g_rtw_io_wakes != g_rtw_io_taken))\n"),
+        ("io_wake does not count the work", MAIN,
+         "   RTW_IO_WAKE();                /* GPSP_RUNTIME_LOG: work is queued */\n", ""),
+        ("the writer never takes the work up", MAIN,
+         "      RTW_IO_TAKE();             /* what was queued until now is this pass's */\n", ""),
         ("suppression ignores a pending sleep", MAIN,
          "   if (g_pwr_sleep_pending || g_pwr_req_signal || g_pwr_park_req ||\n",
          "   if (g_pwr_req_signal || g_pwr_park_req ||\n"),

@@ -46,6 +46,8 @@ typedef unsigned SceUInt;
 /* GPSP_RUNTIME_LOG's beats and marks, off as in every other build
  * (test_runtime_log.py runs them on). */
 #define RTW_BEAT(n) ((void)0)
+#define RTW_IO_WAKE() ((void)0)
+#define RTW_IO_TAKE() ((void)0)
 #define RTW_SAV(x) ((void)(x))
 #define RT_IO(on) ((void)0)
 static struct { int log_thread, sram_thread, standby; } g_pcfg;

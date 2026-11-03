@@ -387,6 +387,14 @@ static volatile int      g_loop_phase;
 #endif
 static volatile unsigned g_rtw_beat_audio;   /* ++ per audio output chunk  */
 static volatile unsigned g_rtw_beat_io;      /* ++ per writer wait          */
+/* WORK QUEUED FOR THE WRITER.  io_wake counts every request (a .sav scan or
+ * write, a GB save, a flush); the writer copies the count when it wakes.  It
+ * is expected to beat only while they differ, or while it is inside its .sav
+ * pass: an idle writer at 0x2C, READY behind a main loop that runs ~97% of
+ * each frame (TMGC, 4.5.0 runtimelog on a PSP-3001, 2026-11-03), is not a
+ * stall -- one with a save waiting is. */
+static volatile unsigned g_rtw_io_wakes;     /* ++ per io_wake               */
+static volatile unsigned g_rtw_io_taken;     /* the count at its last wake-up */
 static volatile unsigned g_rtw_sav_blocks;   /* .sav blocks the writer wrote */
 static volatile unsigned g_rtw_sav_runs;     /* passes that wrote any       */
 /* The exit callback (cb_thread): entered / returned, and what the loop was
@@ -400,6 +408,8 @@ static volatile unsigned g_rtw_wake_us;
 static SceUID g_rtw_main_thid = -1, g_rtw_cb_thid = -1, g_rtw_thid = -1;
 static void rtw_kick(void);                   /* wake the watchdog now */
 #define RTW_BEAT(n)   (g_rtw_beat_##n++)
+#define RTW_IO_WAKE() (g_rtw_io_wakes++)
+#define RTW_IO_TAKE() (g_rtw_io_taken = g_rtw_io_wakes)
 #define RTW_SAV(x)    rtw_sav(x)
 static inline void rtw_sav(int n)
 {
@@ -421,6 +431,8 @@ static inline void rtw_sav(int n)
                            : (void)0)
 #else
 #define RTW_BEAT(n)    ((void)0)
+#define RTW_IO_WAKE()  ((void)0)
+#define RTW_IO_TAKE()  ((void)0)
 #define RTW_SAV(x)     ((void)(x))
 #define RTW_EXIT_IN()  ((void)0)
 #define RTW_EXIT_OUT() ((void)0)
@@ -618,6 +630,7 @@ static int g_io_prio = IO_PRIO;
 
 static void io_wake(void)
 {
+   RTW_IO_WAKE();                /* GPSP_RUNTIME_LOG: work is queued */
    if (g_io_sema >= 0)
       sceKernelSignalSema(g_io_sema, 1);
 }
@@ -658,6 +671,7 @@ static int io_thread(SceSize args, void *argp)
       SceUInt tmo = IO_WAIT_US;
       RTW_BEAT(io);
       sceKernelWaitSema(g_io_sema, 1, &tmo);
+      RTW_IO_TAKE();             /* what was queued until now is this pass's */
       if (g_pcfg.log_thread)
          fe_evt_service();
       if (g_pcfg.sram_thread)
@@ -10466,7 +10480,9 @@ static unsigned rtw_expect(void)
       m |= RTW_BIT(RTW_MAIN);
    if (audio_thid >= 0 && audio_running)
       m |= RTW_BIT(RTW_AUDIO);
-   if (g_io_thid >= 0 && g_io_run)
+   /* the writer: only with work queued for it, or inside its .sav pass */
+   if (g_io_thid >= 0 && g_io_run &&
+       (g_rtw_io_wakes != g_rtw_io_taken || g_rt_io_since[RTIO_IO]))
       m |= RTW_BIT(RTW_IO);
    if (!g_pwr_slept && me_host_up())
       m |= RTW_BIT(RTW_ME);
@@ -10711,14 +10727,16 @@ static void rtw_record(unsigned ev)
    len += rt_line(buf + len, cap - (size_t)len,
                   "%s io_in_ms main=%u io=%u cb=%u wd=%u other=%u "
                   "sav_runs=%u sav_blocks=%u home=%s kbeat=%u beat=%u "
-                  "popup_off=%u fallbacks=%u ctr main=%u audio=%u io=%u",
+                  "popup_off=%u fallbacks=%u ctr main=%u audio=%u io=%u "
+                  "io_wakes=%u io_taken=%u",
                   t, rtw_ago(g_rt_io_since[RTIO_MAIN], now),
                   rtw_ago(g_rt_io_since[RTIO_IO], now),
                   rtw_ago(g_rt_io_since[RTIO_CB], now),
                   rtw_ago(g_rt_io_since[RTIO_WD], now),
                   rtw_ago(g_rt_io_since[RTIO_OTHER], now),
                   g_rtw_sav_runs, g_rtw_sav_blocks, held, hk, hb, hpop, hfb,
-                  g_loop_iter, g_rtw_beat_audio, g_rtw_beat_io);
+                  g_loop_iter, g_rtw_beat_audio, g_rtw_beat_io,
+                  g_rtw_io_wakes, g_rtw_io_taken);
    /* A SLEEP THAT BEGAN WHILE THIS RAN (MAGI f-009/f-010).  The tick checked
     * the sleep words once; the sampling above took ~200 ms and the drop
     * below takes 300 more.  So look again before main is dropped, before the

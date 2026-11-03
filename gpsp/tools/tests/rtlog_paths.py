@@ -37,6 +37,7 @@ static int scePowerGetBusClockFrequency(void) { return 166; }
 static volatile int g_running = 1, g_rtw_mode, g_rtw_menu;
 static const char *volatile g_rtw_step = "-";
 static volatile unsigned g_loop_iter, g_rtw_beat_audio, g_rtw_beat_io;
+static volatile unsigned g_rtw_io_wakes, g_rtw_io_taken;
 static volatile unsigned g_rtw_sav_runs, g_rtw_sav_blocks, g_rtw_exit_in, g_rtw_exit_out;
 static volatile unsigned g_rtw_pwr_flags, g_rtw_pwr_us, g_rtw_pwr_n, g_rtw_wake_us;
 static const char *volatile g_rtw_busy_why;

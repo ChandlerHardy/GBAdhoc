@@ -4278,6 +4278,97 @@ void badjump_report(u32 pc)
   fclose(f);
 }
 #endif
+/* XLAT_FAULT_NOTE (the runtimelog profile only; xlat_fault_note.h): what the
+ * frontend's log/runtime.log says about BADJUMP_SAFE's reset and the lazy
+ * fourth try of XLAT_LAST_TRY_LAZY (issue #10: "Emulation fault, game was
+ * reset" twice in TMGC's first combat, and nothing in the log said why).
+ *
+ * NOTHING IN THE PINNED HOT ORDER CHANGES.  block_lookup_address_* and
+ * block_lookup_translate_* are in psp/layout/hot_order.txt, so a hook there
+ * would move the hot core of this build away from the release's.  So:
+ *  - the reset is described in the cold paths it already takes:
+ *    vram_or_badjump_* (every BADJUMP_SAFE reset of the lookups goes through
+ *    it with VRAM_EXEC, and it knows ARM / Thumb) and badjump_recover;
+ *  - why is the pc's own class, which is what decided it: block_lookup_
+ *    translate answers the unmappable sentinel for a region it has no code
+ *    in (BIOS_BOUND_FIX: region 0 above the BIOS) on the FIRST try, the same
+ *    on every try; any other pc reached the reset by failing all four
+ *    tries; a VRAM pc by failing its own four;
+ *  - the lazy try is seen where translate_block_* starts (the end of the hot
+ *    order, the compile path), once per try: xlat_lazy_links goes 1 -> 2,
+ *    which links just as lazily.
+ * Translation retries other than the lazy one are not counted: the only
+ * place that sees them is the lookup's loop.  Without the switch none of
+ * this is compiled. */
+#ifdef XLAT_FAULT_NOTE
+#include "xlat_fault_note.h"
+xlat_fault_note xlat_fault_notes = { .arm_thumb = 2 };
+#define XFN_RAM_FILL() ((u32)(ram_translation_ptr - ram_translation_cache))
+#define XFN_ROM_FILL() ((u32)(rom_translation_ptr - rom_translation_cache))
+#ifdef XLAT_LAST_TRY_LAZY
+/* translate_block_*: the lookup's fourth try, lazily linked, has begun. */
+static void __attribute__((noinline, cold)) xfn_lazy(u32 pc, u32 thumb)
+{
+  xlat_fault_note *n = &xlat_fault_notes;
+  xlat_lazy_links = 2;              /* once per try; still lazy */
+  n->lazy++;
+  n->lazy_pc = pc;
+  n->lazy_thumb = thumb;
+  n->lazy_ram_fill = XFN_RAM_FILL();
+  n->lazy_rom_fill = XFN_ROM_FILL();
+}
+#define XFN_LAZY_ENTRY(pc, thumb)                                             \
+  do { if (xlat_lazy_links == 1) xfn_lazy((pc), (thumb)); } while (0)
+#else
+#define XFN_LAZY_ENTRY(pc, thumb)    do { } while (0)
+#endif
+/* badjump_recover: the reset, before it flushes anything. */
+static void __attribute__((noinline, cold)) xfn_take(u32 pc)
+{
+  xlat_fault_note *n = &xlat_fault_notes;
+  u32 region = GBA_PC(pc) >> 24;
+  n->resets++;
+  n->reset_pc = pc;
+  if (n->arm_why == XFN_WHY_VRAM)
+  {
+    n->reset_why = XFN_WHY_VRAM;
+    n->reset_tries = 4;
+  }
+  else if (
+#ifdef BIOS_BOUND_FIX
+           (region == 0 && pc >= 0x4000) ||
+#endif
+           !(region == 0 || region == 2 || region == 3 ||
+             (region >= 8 && region <= 0xD)))
+  {
+    n->reset_why = XFN_WHY_UNMAPPABLE;
+    n->reset_tries = 1;
+  }
+  else
+  {
+    n->reset_why = XFN_WHY_EXHAUSTED;
+    n->reset_tries = 4;
+#ifdef XLAT_LAST_TRY_LAZY
+    n->lazy_failed++;               /* the lazy try did not save it */
+#endif
+  }
+  n->reset_thumb = n->arm_thumb;
+  n->reset_ram_fill = XFN_RAM_FILL();
+  n->reset_rom_fill = XFN_ROM_FILL();
+  n->reset_page_loads = gamepak_page_loads;
+  n->arm_why = XFN_WHY_OTHER;
+  n->arm_thumb = 2;                 /* unknown until a lookup says */
+}
+#define XFN_MODE(thumb)  (xlat_fault_notes.arm_thumb = (thumb))
+#define XFN_VRAM()       (xlat_fault_notes.arm_why = XFN_WHY_VRAM)
+#define XFN_TAKE(pc)     xfn_take(pc)
+#else
+#define XFN_LAZY_ENTRY(pc, thumb)    do { } while (0)
+#define XFN_MODE(thumb)              ((void)0)
+#define XFN_VRAM()                   ((void)0)
+#define XFN_TAKE(pc)                 ((void)0)
+#endif
+
 /* BADJUMP_SAFE: an unmappable guest pc must never reach `jr $v0`.
  *
  * block_lookup_translate returns (u8*)(~0) when the pc is outside every
@@ -4322,6 +4413,7 @@ static u8 *badjump_recover(u32 pc)
   badjump_recoveries++;
   badjump_last_pc = pc;
   badjump_reset_pending = 1;
+  XFN_TAKE(pc);                      /* XLAT_FAULT_NOTE only */
 #ifdef BADJUMP_REPORT
   /* The EXECUTED fault: full context (bypasses the routine-report cap) and,
    * for the first two, the guest RAM exactly as the faulting code saw it --
@@ -4387,6 +4479,7 @@ static u8 *badjump_recover(u32 pc)
 static u8 * __attribute__((noinline)) vram_or_badjump_##type(u32 pc)          \
 {                                                                             \
   unsigned i;                                                                 \
+  XFN_MODE(thumb);                   /* XLAT_FAULT_NOTE only */               \
   if ((GBA_PC(pc) >> 24) != 6)                                                \
     return badjump_recover(pc);                                               \
   for (i = 0; i < 4; i++) {                                                   \
@@ -4397,6 +4490,7 @@ static u8 * __attribute__((noinline)) vram_or_badjump_##type(u32 pc)          \
       return ret;                                                             \
     }                                                                         \
   }                                                                           \
+  XFN_VRAM();                        /* XLAT_FAULT_NOTE only */               \
   return badjump_recover(pc);                                                 \
 }
 vram_or_badjump_builder(arm, 0)
@@ -8081,6 +8175,7 @@ bool translate_block_arm(u32 pc, bool ram_region)
 #endif
   generate_block_extra_vars_arm();
   arm_fix_pc();
+  XFN_LAZY_ENTRY(pc, 0);             /* XLAT_FAULT_NOTE only */
 #ifdef SMC_IMM_PATCH
   immp_npend = 0;
   immp_blk_on = 0;
@@ -8506,6 +8601,7 @@ bool translate_block_thumb(u32 pc, bool ram_region)
 #endif
   generate_block_extra_vars_thumb();
   thumb_fix_pc();
+  XFN_LAZY_ENTRY(pc, 1);             /* XLAT_FAULT_NOTE only */
 #ifdef SMC_IMM_PATCH
   immp_blk_on = 0;
 #endif

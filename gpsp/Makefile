@@ -923,6 +923,16 @@ else ifeq ($(platform), psp1)
 	ifeq ($(BADJUMP_REPORT),1)
 	CFLAGS += -DBADJUMP_REPORT=1
 	endif
+	# XLAT_FAULT_NOTE=1: DIAGNOSTIC, the `runtimelog` profile's only core
+	# switch.  Records what BADJUMP_SAFE's reset found -- pc, why, tries,
+	# ARM/Thumb, translation-cache and ROM-cache use -- and each use of
+	# XLAT_LAST_TRY_LAZY's lazy 4th try, in xlat_fault_notes
+	# (xlat_fault_note.h), which the frontend writes to log/runtime.log.
+	# Plain stores in cold paths only (nothing in the pinned hot order
+	# changes); no I/O.
+	ifeq ($(XLAT_FAULT_NOTE),1)
+	CFLAGS += -DXLAT_FAULT_NOTE=1
+	endif
 	# GPSP_PROFILE=release|harness|diagnostic.  Names the build so
 	# gpsp_profile.h can reject combinations that are silently wrong (a
 	# release with telemetry, two SMC rules where one shadows the other).

@@ -592,7 +592,10 @@ def suites(env: Env, baseline: Path | None):
           # ...and the stall recorder's 6 s thread is not started there.
           "python3 tools/tests/test_stall_recorder.py && "
           # ...and the runtime.log writer's lock and rotation (psp/rt_log.c).
-          "python3 tools/tests/test_rt_log_writer.py")
+          "python3 tools/tests/test_rt_log_writer.py && "
+          # ...and the emulation-fault reset / translation retries it
+          # reports (XLAT_FAULT_NOTE, cpu_threaded.c + main_psp.c), mutants.
+          "python3 tools/tests/test_xlat_fault_note.py")
          % (sdk, sdk, sdk, sdk)),
 
         ("perf_loop", False, lambda: None,

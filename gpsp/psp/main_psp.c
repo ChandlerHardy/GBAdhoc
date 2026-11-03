@@ -2351,6 +2351,10 @@ void psp_clock_apply(const char *why)
              scePowerGetCpuClockFrequency() != mode);
    FE_EVT_ONLY(cpu0); FE_EVT_ONLY(bus0); FE_EVT_ONLY(rc); FE_EVT_ONLY(why);
    FE_EVT_ONLY(call);
+   RT_MAIN_NOTE("clock why=%s mode=%d was=%d/%d now=%d/%d entry=%d/%d call=%d "
+                "rc=%d", why, mode, cpu0, bus0, scePowerGetCpuClockFrequency(),
+                scePowerGetBusClockFrequency(), g_clk_sys_cpu, g_clk_sys_bus,
+                call, rc);
 }
 
 static int power_cb(int unknown, int pwrflags, void *common)
@@ -3970,6 +3974,8 @@ static void power_request_poll(void)
    g_pwr_req_fires++;
    standby_note("deferred request fires=%d", g_pwr_req_fires);
    fe_evt("power deferred_request fires=%d", g_pwr_req_fires);
+   RT_MAIN_NOTE("pwr deferred_request fires=%d frame=%u", g_pwr_req_fires,
+                fe_host_frame_count());
    g_pwr_req_signal = 1;
    sceKernelWakeupThread(g_cb_thid);
 }
@@ -4141,10 +4147,13 @@ static void sleep_inventory(const char *tag)
 #endif
    INV_ADD("%u inv %s where=%s park_req=%d ack=%d parked=%d cb_done=%d "
            "pending=%d slept=%d rebuild=%d sq_down=%d stopped=0x%X "
-           "park_browser=%d\n",
+           "park_browser=%d req_signal=%d req_fires=%d me_kept=%d "
+           "me_handed_back=%d\n",
            now, tag, g_diag_where, g_pwr_park_req, g_pwr_park_ack,
            g_pwr_parked, g_pwr_cb_done, g_pwr_sleep_pending, g_pwr_slept,
-           g_pwr_rebuild, g_sq.down, g_sq.stopped, g_pwr_park_browser);
+           g_pwr_rebuild, g_sq.down, g_sq.stopped, g_pwr_park_browser,
+           (int)g_pwr_req_signal, g_pwr_req_fires, me_host_retained(),
+           me_host_handed_back());
    INV_ADD("%u inv %s audio_thid=%d audio_run=%d audio_ch=%d io_thid=%d "
            "rom_open=%d evt_open=%d home_mod=%d me_loaded=%d me_up=%d "
            "me_dead=%d me_rend=%d mer_vmem=%d vm_locked=%d rw_pool=%d "
@@ -10446,8 +10455,11 @@ static int g_rtw_rec_aborted;
 static unsigned rtw_expect(void)
 {
    unsigned m = 0;
-   if (g_pwr_sleep_pending || g_pwr_park_req || g_pwr_park_ack ||
-       g_pwr_parked || g_sq.down)
+   /* (beta 2) g_pwr_req_signal: power_request_poll has asked cb_thread to run
+    * the callback for a suspend the gameplay lock was holding off -- a sleep
+    * from the moment it is asked for, as a switch is from its first flag. */
+   if (g_pwr_sleep_pending || g_pwr_req_signal || g_pwr_park_req ||
+       g_pwr_park_ack || g_pwr_parked || g_sq.down)
       return RTW_QUIET;
    if (((g_rtw_mode == RTW_MODE_GAME && !g_wake_hold) ||
         g_rtw_mode == RTW_MODE_EXIT) && !rtw_busy_now())
@@ -10568,6 +10580,58 @@ static int rtw_threads(char *d, size_t n, const char *tag, unsigned *me_a,
    return len;
 }
 
+/* (beta 2) The adapter's frame schedule (RFU_SCHED, rfu_sched.h) runs on the
+ * main thread -- no thread of its own -- and gates frames: -1 not built, else
+ * D*10 + active (D 0 = off for this run). */
+#ifdef RFU_SCHED
+#define RTW_RFU_SCHED_STATE() ((int)rfu_sched_d * 10 + rfu_sched_active())
+#else
+#define RTW_RFU_SCHED_STATE() (-1)
+#endif
+
+/* Every thread of the process, one sample: name:status/waitType/priority
+ * (status 1 run 2 ready 4 wait 8 susp 16 dormant; waitType as rtw_wait_name).
+ * The stall record's second block, written on its own. */
+static void rtw_census(const char *t)
+{
+   static SceUID ids[96];
+   static char cb[2048];
+   static SceKernelThreadInfo ti;
+   int cnt = 0, rc, i, len, line0;
+
+   rc = sceKernelGetThreadmanIdList(SCE_KERNEL_TMID_Thread, ids, 96, &cnt);
+   len = rt_line(cb, sizeof(cb), "%s census rc=%d n=%d", t, rc, cnt);
+   if (cnt > 96)
+      cnt = 96;
+   line0 = len;
+   /* (room for the line's head, one entry and its '\n' each pass) */
+   for (i = 0; rc >= 0 && i < cnt && len < (int)sizeof(cb) - 96; i++)
+   {
+      int w, room;
+      if (len == line0)
+         len += rt_line(cb + len, sizeof(cb) - (size_t)len, "%s thr", t) - 1;
+      room = (int)sizeof(cb) - len - 1;          /* keep one for the '\n' */
+      memset(&ti, 0, sizeof(ti));
+      ti.size = sizeof(ti);
+      if (sceKernelReferThreadStatus(ids[i], &ti) >= 0)
+         w = snprintf(cb + len, (size_t)room, " %.24s:%X/%d/%X", ti.name,
+                      (unsigned)ti.status, ti.waitType,
+                      (unsigned)ti.currentPriority);
+      else
+         w = snprintf(cb + len, (size_t)room, " 0x%X:?", (unsigned)ids[i]);
+      if (w > 0)
+         len += w < room ? w : room - 1;
+      if (len - line0 > 160)
+      {
+         cb[len++] = '\n';
+         line0 = len;
+      }
+   }
+   if (len > 0 && cb[len - 1] != '\n')
+      cb[len++] = '\n';
+   rt_write(cb, len);
+}
+
 /* THE RECORD, once per episode.  Everything that needs no hooked call is
  * sampled first and written as one block with main dropped below io; only
  * then the display and GE driver are asked, in a second line, so a call
@@ -10609,10 +10673,12 @@ static void rtw_record(unsigned ev)
       len += rt_line(buf + len, cap - (size_t)len, "%s %s", t, sl);
    }
    len += rt_line(buf + len, cap - (size_t)len,
-                  "%s me up=%d loaded=%d dead=%d rend=%d video=%d vmem=%d "
+                  "%s me up=%d loaded=%d dead=%d kept=%d handed_back=%d "
+                  "rend=%d video=%d vmem=%d "
                   "pend=%d ready=%d shown=%d cmd=%u>%u done=%u>%u input=%u>%u "
                   "beat=%u>%u", t, me_host_up(), me_host_loaded(),
-                  me_host_was_dead(), g_me_rend, g_me_video, g_mer_vmem,
+                  me_host_was_dead(), me_host_retained(), me_host_handed_back(),
+                  g_me_rend, g_me_video, g_mer_vmem,
                   g_mer_pending, g_mer_ready, g_mer_last_presented,
                   me_a[0], me_b[0], me_a[1], me_b[1], me_a[2], me_b[2],
                   me_a[3], me_b[3]);
@@ -10629,11 +10695,16 @@ static void rtw_record(unsigned ev)
    len += rt_line(buf + len, cap - (size_t)len,
                   "%s pwr flags=0x%08X ms=%u n=%u park_req=%d ack=%d parked=%d "
                   "pending=%d slept=%d rebuild=%d sq_down=%d since_wake_ms=%u "
-                  "play_lock=%d", t, g_rtw_pwr_flags,
+                  "play_lock=%d req_signal=%d req_fires=%d park_browser=%d "
+                  "clock_mode=%d net_up=%d rfu_sched=%d",
+                  t, g_rtw_pwr_flags,
                   rtw_ago(g_rtw_pwr_us | (g_rtw_pwr_n ? 1u : 0u), now),
                   g_rtw_pwr_n, g_pwr_park_req, g_pwr_park_ack, g_pwr_parked,
                   g_pwr_sleep_pending, g_pwr_slept, g_pwr_rebuild, g_sq.down,
-                  rtw_ago(g_rtw_wake_us, now), (int)g_pwr_play_lock);
+                  rtw_ago(g_rtw_wake_us, now), (int)g_pwr_play_lock,
+                  (int)g_pwr_req_signal, g_pwr_req_fires,
+                  (int)g_pwr_park_browser, psp_clock_mode(), g_net_up,
+                  RTW_RFU_SCHED_STATE());
    if (home_host_loaded())
       home_host_diag(&hk, &hb, &hpop, &hfb);
    snprintf(held, sizeof(held), "%d", home_host_loaded());
@@ -10676,6 +10747,17 @@ static void rtw_record(unsigned ev)
       return;
    }
 
+   /* EVERY THREAD BY NAME (beta 2): the four above are ours; this names the
+    * rest -- the HOME module's poll, the adapter's rx / tx, the boost warden,
+    * firmware threads -- with state / wait / priority, so a stall caused by
+    * a thread nobody expected is named.  Its own write, after the record. */
+   rtw_census(t);
+   if (rtw_expect() & RTW_QUIET)
+   {
+      g_rtw_rec_aborted = 1;
+      return;
+   }
+
    /* The display and GE drivers, after the block is committed. */
    {
       void *fa = NULL, *fb = NULL;
@@ -10691,9 +10773,10 @@ static void rtw_record(unsigned ev)
       vc1 = sceDisplayGetVcount();
       rt_note("%s disp vcount=%u>%u fb_now=%p/%d/%d rc=%d fb_next=%p/%d/%d "
               "rc=%d ours=%08X,%08X,%08X cur=%u mode=%d %dx%d ge_sync=%d "
-              "brightness=n/a(kernel-only)", t, vc0, vc1, fa, wa, pa, ra, fb,
-              wb, pb, rb, v.fb_addr[0], v.fb_addr[1], v.fb_addr[2],
-              v.fb_cur, mode, mw, mh, ge);
+              "brightness=n/a(kernel-only) cpu=%d bus=%d", t, vc0, vc1, fa, wa,
+              pa, ra, fb, wb, pb, rb, v.fb_addr[0], v.fb_addr[1],
+              v.fb_addr[2], v.fb_cur, mode, mw, mh, ge,
+              scePowerGetCpuClockFrequency(), scePowerGetBusClockFrequency());
    }
 }
 
@@ -18456,7 +18539,8 @@ session_top:
       {
          /* A fresh boot's per-game state, then the browser again. */
          fe_evt("inproc_return n=%d", inproc_n);
-         RT_NOTE("inproc_return n=%d", inproc_n);
+         RT_NOTE("inproc_return n=%d me_kept=%d me_loaded=%d", inproc_n,
+                 me_host_retained(), me_host_loaded());
 #if !defined(GPSP_NO_TELEMETRY) || defined(GPSP_STANDBY_NOTES)
          /* Only where the trail is written: standby_note is a function, so
           * a player build would still make the two me_host_* calls. */
@@ -18507,6 +18591,7 @@ session_top:
       }
       fe_evt("inproc_refused why=%s", why);
       standby_note("inproc_refused why=%s", why);
+      RT_NOTE("inproc_refused why=%s me_kept=%d", why, me_host_retained());
       g_relaunch = RELAUNCH_GAMELIST;
       me_host_shutdown();       /* kept for a return that is not happening */
    }

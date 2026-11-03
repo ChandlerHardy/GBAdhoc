@@ -24,6 +24,16 @@ static volatile int g_pwr_parked, g_pwr_slept, g_pwr_rebuild, g_wake_menu;
 static struct { int down; } g_sq;
 static volatile int g_pwr_play_lock, g_pwr_hold;
 static const char *g_pwr_hold_why = "-";
+/* beta 2: the deferred-request path, the list's park, the clock, the kept
+ * ME module, the adapter's frame schedule */
+static volatile int g_pwr_req_signal, g_pwr_park_browser;
+static int g_pwr_req_fires, g_net_up;
+static int psp_clock_mode(void) { return 333; }
+static int me_host_retained(void) { return 0; }
+static int me_host_handed_back(void) { return 0; }
+#define RTW_RFU_SCHED_STATE() (-1)
+static int scePowerGetCpuClockFrequency(void) { return 333; }
+static int scePowerGetBusClockFrequency(void) { return 166; }
 static volatile int g_running = 1, g_rtw_mode, g_rtw_menu;
 static const char *volatile g_rtw_step = "-";
 static volatile unsigned g_loop_iter, g_rtw_beat_audio, g_rtw_beat_io;
@@ -61,6 +71,10 @@ static int rt_line(char *d, size_t n, const char *fmt, ...)
   return k < 0 ? 0 : (size_t)k < n ? k : (int)n - 1; }
 static int rtw_threads(char *d, size_t n, const char *tag, unsigned *a, unsigned *b)
 { (void)a; (void)b; sceKernelDelayThread(100000); return rt_line(d, n, "%s thr\n", tag); }
+/* the census of every thread: its own write; a sleep may begin during it */
+static int census_sleeps, censuses;
+static void rtw_census(const char *t)
+{ (void)t; censuses++; rt_write("census", 6); if (census_sleeps) g_pwr_sleep_pending = 1; }
 static int stall_line(char *l, size_t n, unsigned it, int *pri0)
 { (void)it; sceKernelDelayThread(100000); *pri0 = 0x2B; return snprintf(l, n, "stall t=1\n"); }
 static unsigned sceDisplayGetVcount(void) { disp_calls++; return 1; }
@@ -71,7 +85,7 @@ static int sceGeDrawSync(int s) { (void)s; disp_calls++; return 0; }
 @PRODUCTION@
 static void run(int at, int wsleep)
 {
-   delays = writes = disp_calls = prio_changes = 0;
+   delays = writes = disp_calls = prio_changes = censuses = 0;
    g_rtw_rec_aborted = 0;
    g_pwr_sleep_pending = 0;
    sleep_at = at;
@@ -83,9 +97,9 @@ static void run(int at, int wsleep)
 }
 int main(void)
 {
-   /* no sleep: one block, the display line after it, main put back */
+   /* no sleep: one block, the census, the display line, main put back */
    run(0, 0);
-   CHECK(writes == 2 && disp_calls >= 4 && prio_now == 0x2B && prio_changes == 2 && !g_rtw_rec_aborted);
+   CHECK(writes == 3 && censuses == 1 && disp_calls >= 4 && prio_now == 0x2B && prio_changes == 2 && !g_rtw_rec_aborted);
    /* the sleep begins while the threads / stall_line are sampled: nothing
     * written, main never dropped, the display not asked */
    run(2, 0);
@@ -95,7 +109,12 @@ int main(void)
    CHECK(writes == 0 && disp_calls == 0 && prio_now == 0x2B && g_rtw_rec_aborted);
    /* ...right after the block landed: the display is not asked */
    run(0, 1);
-   CHECK(writes == 1 && disp_calls == 0 && prio_now == 0x2B && g_rtw_rec_aborted);
+   CHECK(writes == 1 && censuses == 0 && disp_calls == 0 && prio_now == 0x2B && g_rtw_rec_aborted);
+   /* ...during the census of every thread (beta 2): the display waits */
+   census_sleeps = 1;
+   run(0, 0);
+   census_sleeps = 0;
+   CHECK(writes == 2 && censuses == 1 && disp_calls == 0 && g_rtw_rec_aborted);
    DONE("rtw_record sleep re-checks (production)");
 }
 '''
@@ -143,6 +162,10 @@ static int g_pwr_hold;
 static const char *g_pwr_hold_why = "";
 static unsigned g_pwr_hold_t0;
 static int locks;
+/* beta 2: pwr_release_all stops a module the in-process return kept */
+static int me_kept, me_stops;
+static int me_host_retained(void) { return me_kept; }
+static void me_host_shutdown(void) { me_kept = 0; me_stops++; }
 static int scePowerLock(int u) { (void)u; locks++; return 0; }
 static int scePowerUnlock(int u) { (void)u; locks--; return 0; }
 static void sleep_sim_window_enter(const char *w) { (void)w; }

@@ -222,6 +222,7 @@ typedef int SceUID;
 /* the real words, as main_psp.c declares them */
 static volatile int g_pwr_sleep_pending, g_pwr_park_req, g_pwr_park_ack;
 static volatile int g_pwr_parked, g_pwr_slept, g_pwr_rebuild, g_wake_menu;
+static volatile int g_pwr_req_signal;       /* beta 2: power_request_poll */
 static struct { int down; } g_sq;
 static volatile int g_running = 1;
 static volatile unsigned g_loop_iter;
@@ -279,6 +280,7 @@ static void fresh(void)
    g_rtw_quiet = 0;
    g_pwr_sleep_pending = g_pwr_park_req = g_pwr_park_ack = g_pwr_parked = 0;
    g_pwr_slept = g_pwr_rebuild = g_wake_menu = 0;
+   g_pwr_req_signal = 0;
    g_sq.down = 0;
    g_rtw_mode = RTW_MODE_GAME;
    audio_thid = 0x100; audio_running = 1; g_io_thid = 0x200; g_io_run = 1;
@@ -311,6 +313,7 @@ int main(void)
    me_up = 0;         CHECK(!(rtw_expect() & RTW_BIT(RTW_ME)));    me_up = 1;
    home_up = 0;       CHECK(!(rtw_expect() & RTW_BIT(RTW_HOME)));  home_up = 1;
    g_pwr_sleep_pending = 1; CHECK(rtw_expect() == RTW_QUIET); g_pwr_sleep_pending = 0;
+   g_pwr_req_signal = 1;    CHECK(rtw_expect() == RTW_QUIET); g_pwr_req_signal = 0;
    g_pwr_park_req = 1;      CHECK(rtw_expect() == RTW_QUIET); g_pwr_park_req = 0;
    g_pwr_park_ack = 1;      CHECK(rtw_expect() == RTW_QUIET); g_pwr_park_ack = 0;
    g_pwr_parked = 1;        CHECK(rtw_expect() == RTW_QUIET); g_pwr_parked = 0;
@@ -721,11 +724,18 @@ def main():
          "      {\n         RT_IO(1);\n         RTW_SAV(fe_host_sram_service_io());\n",
          "      {\n         RTW_SAV(fe_host_sram_service_io());\n"),
         ("suppression ignores a pending sleep", MAIN,
-         "   if (g_pwr_sleep_pending || g_pwr_park_req || g_pwr_park_ack ||\n",
-         "   if (g_pwr_park_req || g_pwr_park_ack ||\n"),
+         "   if (g_pwr_sleep_pending || g_pwr_req_signal || g_pwr_park_req ||\n",
+         "   if (g_pwr_req_signal || g_pwr_park_req ||\n"),
+        ("suppression ignores beta 2's deferred request", MAIN,
+         "   if (g_pwr_sleep_pending || g_pwr_req_signal || g_pwr_park_req ||\n",
+         "   if (g_pwr_sleep_pending || g_pwr_park_req ||\n"),
+        ("the display is asked after a sleep began in the census", MAIN,
+         "   rtw_census(t);\n   if (rtw_expect() & RTW_QUIET)\n"
+         "   {\n      g_rtw_rec_aborted = 1;\n      return;\n   }\n",
+         "   rtw_census(t);\n"),
         ("suppression ignores the quiesce", MAIN,
-         "       g_pwr_parked || g_sq.down)\n      return RTW_QUIET;",
-         "       g_pwr_parked)\n      return RTW_QUIET;"),
+         "       g_pwr_park_ack || g_pwr_parked || g_sq.down)\n      return RTW_QUIET;",
+         "       g_pwr_park_ack || g_pwr_parked)\n      return RTW_QUIET;"),
         ("main expected under the wake overlay", MAIN,
          "   if (((g_rtw_mode == RTW_MODE_GAME && !g_wake_hold) ||",
          "   if (((g_rtw_mode == RTW_MODE_GAME) ||"),

@@ -284,6 +284,7 @@ poll_stub = r'''
 #include <stdio.h>
 #define fe_evt(...) ((void)0)
 #define standby_note(...) ((void)0)
+#define RT_MAIN_NOTE(...) ((void)0)   /* GPSP_RUNTIME_LOG's line: empty off */
 @LIMIT@
 static int g_pwr_play_lock = 1, g_pwr_sleep_pending, g_pwr_hold, g_pwr_req_fires;
 static int g_pwr_req_signal, g_cb_thid = 7;

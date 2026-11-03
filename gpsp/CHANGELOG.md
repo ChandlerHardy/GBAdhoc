@@ -12,6 +12,9 @@ separately and are intended for upstream.
 
 ## [Unreleased]
 
+- Ten save-state slots per game instead of five, `.st0` … `.st9` (`.gb.st0` …, `.gbc.st0` …
+  likewise). Existing states keep their slots; the Save States page and the game list's
+  state shelf show five at a time and scroll. Share game data still offers slots 1-5.
 - Loading a state asks first, on the Save States page and from the Select + R quick load:
   "Load Slot n? Unsaved progress is lost." ✕ loads; any other button keeps the game you are
   playing. The quick load's question can be turned off under Settings -> Quick load asks

@@ -40,6 +40,8 @@
 #include "transport_adhoc.h"
 #include "ambient_look.h"
 #include <psppower.h>   /* the header battery (ov_battery) */
+#include <psprtc.h>               /* the header clock (clock_text) */
+#include <psputility_sysparam.h>  /* ... in the XMB's 12/24-hour form */
 #include "room_label.h"
 #include "link_games.h"
 #include "fe_linkmode.h"
@@ -1501,7 +1503,43 @@ static int ov_battery(int xr, int y, int x_min)
  * the raw group id on a line under it in Settings and Wireless: the same
  * text twice).  Without a battery reading the room is on the top line, as
  * in 3.5.0. */
-static int g_ov_room2_w;   /* > 0: the room is on line 2 and this wide */
+/* THE HEADER CLOCK: the console's local time on line 2, right-aligned under
+ * the battery, in the 12/24-hour form the XMB is set to ("2:07 PM" /
+ * "14:07").  Read at most once a second; a failed reading draws nothing, as
+ * the battery does.  The time format is re-read with it, so a change made in
+ * the XMB while the game is suspended shows on the next look. */
+#define CLOCK_GAP     14                /* clock to the room on line 2 */
+static struct { unsigned t_us; char txt[12]; } g_clock;
+
+static const char *clock_text(void)
+{
+   unsigned now = (unsigned)sceKernelGetSystemTimeLow();
+   ScePspDateTime dt;
+   int fmt = PSP_SYSTEMPARAM_TIME_FORMAT_24HR, h;
+   if (g_clock.t_us && now - g_clock.t_us < 1000000u)
+      return g_clock.txt;
+   g_clock.t_us = now ? now : 1;
+   g_clock.txt[0] = '\0';
+   if (sceRtcGetCurrentClockLocalTime(&dt) < 0 || dt.hour > 23 ||
+       dt.minute > 59)
+      return g_clock.txt;
+   if (sceUtilityGetSystemParamInt(PSP_SYSTEMPARAM_ID_INT_TIME_FORMAT,
+                                   &fmt) < 0)
+      fmt = PSP_SYSTEMPARAM_TIME_FORMAT_24HR;
+   if (fmt == PSP_SYSTEMPARAM_TIME_FORMAT_12HR)
+   {
+      h = dt.hour % 12;
+      snprintf(g_clock.txt, sizeof(g_clock.txt), "%d:%02d %s",
+               h ? h : 12, dt.minute, dt.hour < 12 ? "AM" : "PM");
+   }
+   else
+      snprintf(g_clock.txt, sizeof(g_clock.txt), "%02d:%02d",
+               dt.hour, dt.minute);
+   return g_clock.txt;
+}
+
+static int g_ov_room2_w;   /* > 0: line 2's right-hand text (the clock and/or
+                            * the room) is there and this wide */
 /* With the battery in the room's old place the room is only shown where it
  * means something: on the wireless screens (and LINKING), and everywhere
  * while a session is up (LINKED / HOSTING).  The menu, save states,
@@ -1527,7 +1565,8 @@ static int ov_cluster_text(const char *room)
 {
    const ui_skin *s = skin_of(g_pcfg.console);
    const int y = 19;
-   int x = 460, bw, k, room_w = vid_text_w(room), room_x;
+   int x = 460, bw, k, room_w = vid_text_w(room), room_x, line2 = 0;
+   const char *clk = clock_text();
    /* The badge is placed from the room's width whether or not the room is
     * drawn beside it: it must not move when the battery takes that slot. */
    x -= room_w;
@@ -1535,16 +1574,27 @@ static int ov_cluster_text(const char *room)
    x -= 12;
    bw = 8 + vid_text_w(s->id) + 8;
    x -= bw;
+   /* Line 2, right to left: the clock, then the room where it is shown. */
+   if (clk[0])
+   {
+      line2 = vid_text_w(clk);
+      vid_text(460 - line2, BATT_ROOM_Y, clk, C_VALUE);
+   }
    if (ov_battery(460, y, x + bw + 4))
    {
       if (g_ov_room_show)
-         vid_text(460 - room_w, BATT_ROOM_Y, room, C_DIM);
-      g_ov_room2_w = g_ov_room_show ? room_w : 0;
+      {
+         if (line2)
+            line2 += CLOCK_GAP;
+         line2 += room_w;
+         vid_text(460 - line2, BATT_ROOM_Y, room, C_DIM);
+      }
+      g_ov_room2_w = line2;
    }
    else
    {
       vid_text(room_x, y + 2, room, C_DIM);
-      g_ov_room2_w = 0;
+      g_ov_room2_w = line2;
    }
    vid_rect(x, y, bw, 20, C_CON, g_pcfg.theme == 1 ? 36 : 48);
    for (k = 0; k < s->pal_n; k++)
